@@ -1,0 +1,20 @@
+{
+    "Plugin Name": "icici",
+    "Plugin URI": "https://www.icicidirect.com/futures-and-options/api/breeze",
+    "Description": "ICICI Direct Breeze OpenAlgo Plugin",
+    "Version": "1.1.1",
+    "Author": "OpenAlgo Community",
+    "Author URI": "https://openalgo.in",
+    "broker_name": "icici",
+    "broker_type": "IN_stock",
+    "leverage_config": false,
+    "supported_exchanges": [
+        "NSE",
+        "BSE",
+        "NFO",
+        "BFO",
+        "MCX",
+        "NSE_INDEX",
+        "BSE_INDEX"
+    ]
+}

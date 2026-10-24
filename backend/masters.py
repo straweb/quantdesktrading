@@ -83,15 +83,18 @@ async def sync_account(account: dict, trigger: str = "manual", adapter=None) -> 
     if adapter is None:
         adapter = hub.adapters.get(int(account["id"]))
     if adapter is None:
-        spec = REGISTRY.get(broker)
-        if not spec:
-            return {"account": account.get("label"), "broker": broker,
-                    "error": f"unknown broker {broker}"}
         try:
             creds = json.loads(account.get("credentials") or "{}")
         except Exception:
             creds = {}
-        adapter = spec["adapter"](dict(account), creds)
+        # Round-27: get_adapter covers native REGISTRY + the 37 openalgo
+        # plugins (oa-<name>) through one code path
+        from backend.brokers.registry import get_adapter
+        try:
+            adapter = get_adapter(dict(account), creds)
+        except Exception as e:
+            return {"account": account.get("label"), "broker": broker,
+                    "error": f"unknown broker {broker}: {e}"}
     t0 = time.time()
     try:
         result = await adapter.sync_master()

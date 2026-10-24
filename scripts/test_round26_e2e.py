@@ -48,12 +48,13 @@ code, fs = req("GET", "/feed/status", token=TOKEN)
 check("feed_status liveOnly=True", fs.get("liveOnly") is True, str(fs.get("liveOnly")))
 check("no ticks cached under LIVE-ONLY", fs.get("symbols") == 0, str(fs.get("symbols")))
 
-# 4. picking sim as source while LIVE-ONLY: allowed at the API, but the hub
-#    honest-downs it — noSource stays true and NO ticks may ever flow
+# 4. picking sim as source while LIVE mode: round-27 REFUSES it at the API
+#    (LIVE = real accounts only — sim is a plain account, never a LIVE source)
 code, body = req("POST", "/feed", {"source": "sim"}, TOKEN)
-check("sim source pick under LIVE-ONLY succeeds (guided, not 400)", code == 200, f"{code} {body}")
+check("sim source pick under LIVE mode refused with 400", code == 400,
+      f"{code} {str(body)[:120]}")
 code, fs = req("GET", "/feed/status", token=TOKEN)
-check("LIVE-ONLY + sim source => liveOnly + zero ticks", fs.get("liveOnly") is True
+check("LIVE mode => liveOnly + zero ticks", fs.get("liveOnly") is True
       and fs.get("symbols") == 0, str({k: fs.get(k) for k in ("symbols", "liveOnly", "noSource")}))
 
 # 5. turn LIVE-ONLY off -> sim self-heals on next subscribe

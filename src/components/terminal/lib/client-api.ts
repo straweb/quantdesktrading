@@ -31,6 +31,26 @@ export interface AccountRow extends AccountSnapshot {
   modeLabel: string | null
 }
 
+/** Round-27 — /pyapi/brokers catalog entry (native + openalgo plugins) */
+export interface BrokerCatalogField {
+  key: string
+  label: string
+  secret?: boolean
+  hint?: string
+  sample?: string
+}
+export interface BrokerCatalogEntry {
+  broker: string // registry name: sim | dhan | shoonya | breeze | oa-<plugin>
+  label: string
+  kind: 'native' | 'openalgo'
+  fields: BrokerCatalogField[]
+  login_url_template: string | null
+  auth_params: string[]
+}
+export interface BrokerCatalog {
+  brokers: BrokerCatalogEntry[]
+}
+
 export interface AggPosition extends PositionRecord {
   accountId: string
   accountLabel: string
@@ -252,13 +272,17 @@ export const api = {
       .catch(() => ({ user: null, feed: 'ok' })),
 
   feedSource: () =>
-    fetchJson<{ source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }>('/feed'),
+    fetchJson<{ source: string; simDisabled?: boolean; tradingMode?: string; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }>('/feed'),
   feedStatus: () =>
     fetchJson<FeedStatusResp>('/feed/status'),
   setFeedSource: (source: string) =>
     fetchJson<{ ok: boolean; source: string }>('/feed', { method: 'POST', body: JSON.stringify({ source }) }),
   setSimDisabled: (simDisabled: boolean) =>
     fetchJson<{ ok: boolean; simDisabled: boolean }>('/feed', { method: 'POST', body: JSON.stringify({ simDisabled }) }),
+  setTradingMode: (mode: 'live' | 'sandbox' | 'simulation') =>
+    fetchJson<{ mode: string }>('/settings/mode', { method: 'POST', body: JSON.stringify({ mode }) }),
+  brokers: () =>
+    fetchJson<BrokerCatalog>('/brokers'),
 
   accounts: () => fetchJson<{ accounts: AccountRow[] }>('/accounts'),
   createAccount: (body: Record<string, unknown>) =>

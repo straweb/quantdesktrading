@@ -44,18 +44,18 @@ SEGMENTS = ("EQ_INTRADAY", "EQ_DELIVERY", "FUT", "OPT")
 CHARGES_AS_OF = "2026-10-24"
 CHARGES_SOURCES = {
     "sim":          {"name": "Simulated Feed",
-                     "note": "mirrors the Dhan/₹20 flat-fee schedule so paper P&L ≈ real P&L",
+                     "note": "paper-trading reference schedule — ₹20 flat F&O so paper P&L ≈ typical discount-broker costs",
                      "links": []},
     "ICICI_BREEZE": {"name": "ICICI Direct (Breeze)",
-                     "note": "₹20 flat brokerage; statutory taxes identical for all brokers",
-                     "links": ["https://www.icicidirect.com/calculators/brokerage-calculator",
-                               "https://www.icicidirect.com/brokerage"]},
+                     "note": "ICICI's own rates: ₹20 per order for intraday + F&O (₹20/order across brokerage plans); equity delivery is plan-dependent (0.55% modelled); statutory taxes identical for all brokers",
+                     "links": ["https://www.icicidirect.com/brokerage",
+                               "https://www.icicidirect.com/calculators/brokerage-calculator"]},
     "DHAN":         {"name": "Dhan",
-                     "note": "₹20 flat brokerage (₹0 delivery); statutory taxes identical for all brokers",
+                     "note": "Dhan's own rates (verified from dhan.co/pricing): ₹20 per executed order for F&O + intraday equity (₹0 delivery); statutory taxes identical for all brokers",
                      "links": ["https://dhan.co/pricing/",
                                "https://dhan.co/calculators/brokerage-calculator/"]},
     "SHOONYA":      {"name": "Shoonya (Finvasia)",
-                     "note": "₹0 brokerage across segments; statutory taxes identical for all brokers",
+                     "note": "Shoonya's own rates (verified from shoonya.com/pricing): ₹5 per executed order (or 0.03%, whichever is lower) for intraday + F&O; ₹0 delivery; NOT zero-brokerage any more (pricing revised, transaction charges from 1-Mar-2026)",
                      "links": ["https://shoonya.com/pricing",
                                "https://shoonya.com/calculators/brokerage-calculator"]},
 }
@@ -67,22 +67,37 @@ def charges_source(broker: str) -> dict:
     return {"name": src["name"], "note": src["note"], "links": src["links"], "asOf": CHARGES_AS_OF}
 
 # Broker-flavoured brokerage defaults (flat ₹ per order / pct of turnover).
+# brokerage = min(flat, value × pct) when pct > 0, else flat — so a huge flat
+# models a pure-% schedule (ICICI delivery 0.55%).
+# Verified 2026-10-24 from each broker's pricing page (round-27):
+#   ICICI  — ₹20/order intraday + F&O (icicidirect.com/brokerage)
+#   Dhan   — ₹20/order F&O + intraday, ₹0 delivery (dhan.co/pricing)
+#   Shoonya— ₹5/order (or 0.03%, lower) intraday + F&O, ₹0 delivery
+#            (shoonya.com/pricing — NOT zero-brokerage any more)
 BROKER_BROKERAGE = {
     "sim":         {"EQ_INTRADAY": (20, 0.0003), "EQ_DELIVERY": (0, 0.0),
                     "FUT": (20, 0.0003),          "OPT": (20, 0.0)},
-    "ICICI_BREEZE":{"EQ_INTRADAY": (20, 0.0003), "EQ_DELIVERY": (0, 0.0005),
+    "ICICI_BREEZE":{"EQ_INTRADAY": (20, 0.0003), "EQ_DELIVERY": (100000, 0.0055),
                     "FUT": (20, 0.0003),          "OPT": (20, 0.0)},
     "DHAN":        {"EQ_INTRADAY": (20, 0.0003), "EQ_DELIVERY": (0, 0.0),
                     "FUT": (20, 0.0003),          "OPT": (20, 0.0)},
-    "SHOONYA":     {"EQ_INTRADAY": (0, 0.0),     "EQ_DELIVERY": (0, 0.0),
-                    "FUT": (0, 0.0),              "OPT": (0, 0.0)},
+    "SHOONYA":     {"EQ_INTRADAY": (5, 0.0003),  "EQ_DELIVERY": (0, 0.0),
+                    "FUT": (5, 0.0003),           "OPT": (5, 0.0)},
+    # openalgo plugin brokers default to the ₹20-flat reference schedule
+    # (editable per account in Admin → Charges)
+    "OA_DEFAULT":  {"EQ_INTRADAY": (20, 0.0003), "EQ_DELIVERY": (100000, 0.0055),
+                    "FUT": (20, 0.0003),          "OPT": (20, 0.0)},
 }
 
 
 def default_schedule(broker: str = "") -> dict:
     """Full default schedule for a broker (today's market values)."""
-    bk = BROKER_BROKERAGE.get((broker or "").upper(),
-                               BROKER_BROKERAGE.get(broker, BROKER_BROKERAGE["sim"]))
+    b = (broker or "").upper()
+    bk = BROKER_BROKERAGE.get(b)
+    if bk is None and b.startswith("OA-"):
+        bk = BROKER_BROKERAGE["OA_DEFAULT"]
+    if bk is None:
+        bk = BROKER_BROKERAGE.get(broker, BROKER_BROKERAGE["sim"])
     out: dict[str, dict] = {}
     for seg in SEGMENTS:
         stt_b, stt_s, txn, sebi, stamp = STATUTORY[seg]

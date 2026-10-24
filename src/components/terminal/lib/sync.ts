@@ -225,7 +225,7 @@ export interface SyncAdmin {
     dropped?: number; dropReasons?: Record<string, number>
     epoch?: number; waiting?: boolean; noSource?: boolean; liveOnly?: boolean
   }
-  feedSource: { source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }
+  feedSource: { source: string; simDisabled?: boolean; tradingMode?: 'live' | 'sandbox' | 'simulation'; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }
   accountsMeta: { id: string; label: string; brokerType: string; isActive: boolean; hasCreds: boolean; hasSession?: boolean }[]
   brokerLogs: SyncAdminLogRow[]
   audit: { id: string; ts: string; source: string; action: string; masterSymbol: string; side: string; qty: number; status: string; message: string | null }[]

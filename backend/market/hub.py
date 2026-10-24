@@ -67,12 +67,16 @@ class Hub:
         self._dropped_ticks = 0                         # rejected by the source gate
         self._drop_reasons: dict[str, int] = defaultdict(int)
         self._sim_reconnecting = False
+        # Round-27: SANDBOX/SIMULATION paper-fill adapters per real account
+        self._paper_adapters: dict[int, Any] = {}
 
     # ------------------------------------------------------------------ source gate
     def _live_only(self) -> bool:
-        """True when no synthetic data may EVER reach the hub (admin toggle
-        or global live trading mode)."""
-        return self.sim_disabled() or self.trading_mode() == "live"
+        """Round-27 3-way mode: LIVE forbids ALL synthetic data and local fills;
+        SANDBOX (paper fills on live broker data) and SIMULATION (session
+        simulator) do not. The old sim_disabled flag is a mirrored legacy of
+        mode=='live'."""
+        return self.trading_mode() == "live"
 
     def feed_note(self, msg: str, level: str = "INFO") -> None:
         self._feed_log.appendleft(f"{time.strftime('%H:%M:%S')} {msg}")
@@ -82,12 +86,23 @@ class Hub:
 
     # ------------------------------------------------------------------ settings
     def trading_mode(self) -> str:
+        """'live' | 'sandbox' | 'simulation' (round-27). Legacy values map:
+        old sandbox-mode rows read as sandbox; sim_disabled was folded in."""
         row = db.core().one("SELECT value FROM settings WHERE key='trading_mode'")
-        return (row["value"] if row else config.DEFAULT_TRADING_MODE)
+        mode = (row["value"] if row else "") or ""
+        if mode not in ("live", "sandbox", "simulation"):
+            mode = config.DEFAULT_TRADING_MODE
+        return mode
 
     def set_trading_mode(self, mode: str) -> None:
+        if mode not in ("live", "sandbox", "simulation"):
+            raise ValueError(f"invalid trading mode '{mode}'")
         db.core().exec("INSERT INTO settings(key,value) VALUES('trading_mode',?) "
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (mode,))
+        # legacy mirror: LIVE-ONLY consumers (main.py boot) keep working
+        db.core().exec("INSERT INTO settings(key,value) VALUES('sim_disabled',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ("1" if mode == "live" else "0",))
         config.log("hub", f"trading mode set to {mode.upper()}")
         if self.loop:
             self.loop.call_soon_threadsafe(
@@ -95,27 +110,34 @@ class Hub:
 
     # ------------------------------------------------------------------ feed source
     def feed_source(self) -> str:
-        """Stored source (Round-26): returns the user's pick verbatim — a
+        """Stored source (Round-26/27): returns the user's pick verbatim — a
         disconnected/deleted source account no longer silently falls back to
-        sim; routing treats it as DOWN and the UI shows the exact error."""
+        sim; routing treats it as DOWN and the UI shows the exact error.
+        Round-27: sim is a PLAIN ACCOUNT — the legacy 'sim' value maps to the
+        sim account row's id; an empty/unset value means NO source picked."""
         row = db.core().one("SELECT value FROM settings WHERE key='feed_source'")
-        src = row["value"] if row else "sim"
-        if src != "sim" and not src.isdigit():
-            return "sim"
+        src = (row["value"] if row else "") or ""
+        if src == "sim":
+            row2 = db.core().one("SELECT id FROM accounts WHERE broker='sim' ORDER BY id LIMIT 1")
+            return str(row2["id"]) if row2 else ""
         return src
 
     def sim_disabled(self) -> bool:
-        row = db.core().one("SELECT value FROM settings WHERE key='sim_disabled'")
-        return (row["value"] if row else "0") == "1"
+        """Legacy LIVE-ONLY flag — now a mirror of trading_mode=='live'."""
+        return self.trading_mode() == "live"
 
     def set_sim_disabled(self, flag: bool) -> None:
+        """Legacy LIVE-ONLY toggle — Round-27: folds into the 3-way trading
+        mode (True → LIVE; False → back to SIMULATION when currently LIVE).
+        The actual engine stop/detach happens inside enforce_mode()."""
+        if flag:
+            self.set_trading_mode("live")
+        elif self.trading_mode() == "live":
+            self.set_trading_mode("simulation")
         db.core().exec("INSERT INTO settings(key,value) VALUES('sim_disabled',?) "
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        ("1" if flag else "0",))
-        config.log("hub", f"sim feed {'DISABLED (LIVE-ONLY)' if flag else 'enabled'}")
-        if flag:
-            self._purge_sim_data()
-            self._stop_sim_engine()
+        config.log("hub", f"sim feed {'DISABLED (LIVE mode)' if flag else 'enabled'}")
         if self.sio and self.loop:
             self.loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._broadcast("feed:source", {
@@ -186,9 +208,10 @@ class Hub:
             config.log("hub", f"sim disconnect failed: {e}", "WARN")
 
     def feed_sources(self) -> list[dict]:
-        out = [{"id": "sim", "label": "Sim Feed (built-in)", "brokerType": "SIMFEED",
-                "hasSession": not self.sim_disabled()}]
-        for acc in db.core().query("SELECT id,broker,label,mode,status FROM accounts WHERE broker<>'sim' ORDER BY id"):
+        """Round-27: EVERY account (sim included) is a plain selectable source —
+        no built-in sim entry, no fallback."""
+        out = []
+        for acc in db.core().query("SELECT id,broker,label,mode,status FROM accounts ORDER BY id"):
             sess = db.core().one("SELECT session_token FROM broker_sessions WHERE account_id=?", (acc["id"],))
             out.append({"id": str(acc["id"]), "label": acc["label"],
                         "brokerType": acc["broker"].upper(), "hasSession": bool(sess and sess["session_token"])})
@@ -207,19 +230,28 @@ class Hub:
                 lambda: asyncio.ensure_future(self._broadcast("feed:epoch", {"epoch": self.epoch})))
 
     async def set_feed_source(self, source: str) -> dict:
-        """Switch the market-data source. 'sim' or an account id string.
+        """Switch the market-data source — ALWAYS an account id (round-27: sim
+        is a plain account; the legacy 'sim' value resolves to its row).
         Round-26: the OLD source's stream subscriptions are released first —
         they used to keep ticking into the fresh epoch (sim leak)."""
-        if source != "sim":
-            try:
-                aid = int(source)
-            except ValueError:
-                raise ValueError("source must be 'sim' or an account id")
-            acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
-            if not acc:
-                raise ValueError(f"account {source} not found")
-            if self._live_only() and (acc["mode"] == "sandbox" or acc["broker"] == "sim"):
-                raise ValueError("Live-Only mode: sandbox accounts cannot be the data source — create a broker session in Admin → Session")
+        if source == "sim":  # legacy alias → the sim account row
+            row = db.core().one("SELECT id FROM accounts WHERE broker='sim' ORDER BY id LIMIT 1")
+            if not row:
+                raise ValueError("no sim account exists — add one in Admin → Broker Accounts")
+            source = str(row["id"])
+        try:
+            aid = int(source)
+        except ValueError:
+            raise ValueError("source must be an account id (or legacy 'sim')")
+        acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+        if not acc:
+            raise ValueError(f"account {source} not found")
+        if self._live_only() and (acc["mode"] == "sandbox" or acc["broker"] == "sim"):
+            raise ValueError("LIVE mode: sandbox/sim accounts cannot be the data source — pick a live broker account (Admin → Session)")
+        if aid not in self.adapters:
+            # round-27: picking the sim account reconnects it (no session needed)
+            if aid == self.sim_account_id and not self._live_only():
+                await self._reconnect_sim()
             if aid not in self.adapters:
                 raise ValueError("account is not connected — connect it first (Feed chip → link icon)")
         # release every subscription the OLD source still holds
@@ -243,10 +275,9 @@ class Hub:
         self._tick_count = 0
         self._dropped_ticks = 0
         self._drop_reasons.clear()
-        self._src_aid = None if source == "sim" else int(source)
-        label = "Sim Feed" if source == "sim" else \
-            (db.core().one("SELECT label FROM accounts WHERE id=?", (int(source),)) or {}).get("label", source)
-        self.feed_note(f"feed source → {label} ({source}) — all cached data purged")
+        self._src_aid = int(source)
+        label = (db.core().one("SELECT label FROM accounts WHERE id=?", (int(source),)) or {}).get("label", source)
+        self.feed_note(f"feed source → {label} (#{source}) — all cached data purged")
         # re-subscribe every watched symbol under the new source
         for sid, info in list(self.sockets.items()):
             for sym in list(info.get("symbols", set())):
@@ -260,30 +291,29 @@ class Hub:
 
     def feed_status(self) -> dict:
         src = self.feed_source()
-        is_live = src != "sim"
+        # round-27: a source is ALWAYS an account id ('' = nothing picked —
+        # the user must select one; there is no sim fallback)
+        is_live = bool(src and src.isdigit())
         broker_type = None
         connected = False
         session_present = False
         if is_live:
-            try:
-                aid = int(src)
-            except ValueError:
-                aid = None
-            acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid or 0,))
+            aid = int(src)
+            acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
             if acc:
                 broker_type = acc["broker"].upper()
                 session_present = bool(db.core().one(
                     "SELECT session_token FROM broker_sessions WHERE account_id=?", (aid,)))
-                adapter = self.adapters.get(aid or 0)
+                adapter = self.adapters.get(aid)
                 connected = bool(adapter and getattr(adapter, "connected", False))
         last = self._last_tick_ts
         fresh = bool(last and (time.time() - last) < 6)
         # Round-26: honest 'waiting' state — connected but the source sends
         # nothing (market closed / holiday / no matching subscription)
         waiting = bool(is_live and connected and not fresh)
-        no_source = bool(self._live_only() and src == "sim")
+        no_source = not is_live
         return {
-            "source": src, "brokerType": broker_type, "connected": connected if is_live else True,
+            "source": src, "brokerType": broker_type, "connected": connected,
             "lastTickTs": int(last * 1000) if last else None,
             "lastError": self._last_error, "errorTs": int(self._error_ts * 1000) if self._error_ts else None,
             "symbols": len(self.ticks), "polls": self._tick_count,
@@ -292,6 +322,7 @@ class Hub:
             "epoch": self.epoch,
             "waiting": waiting, "noSource": no_source,
             "liveOnly": self._live_only(),
+            "tradingMode": self.trading_mode(),
             "errors": 0,
             "startedAt": int(self._feed_started_at * 1000),
             "log": list(self._feed_log)[:25],
@@ -471,60 +502,62 @@ class Hub:
         return candles
 
     async def _ensure_source(self, symbol: str) -> None:
-        """Round-26 EXPLICIT-SOURCE discipline: exactly ONE source serves every
-        symbol — the user's pick (a live account, or sim).  There is NO
-        fallback to other connected accounts, sandbox, or sim: if the picked
+        """Round-26/27 EXPLICIT-SOURCE discipline: exactly ONE source serves
+        every symbol — the account the user picked (sim is a plain account;
+        the legacy 'sim' value resolved to its row id in feed_source()).
+        NO fallback to other connected accounts, sandbox, or sim: if the picked
         source cannot serve a symbol, the hub broadcasts feed:down with the
         exact reason and the UI shows the error + empty data."""
         from backend import fnosim
         # FNO session simulator serves its symbols itself (no broker stream);
-        # it is synthetic too — silenced under Live-Only
+        # it is synthetic too — silenced under LIVE mode
         if fnosim.SVC.serves(symbol):
             if self._live_only():
                 await self._broadcast("feed:down", {
                     "symbol": symbol,
-                    "reason": "Live-Only mode — the FNO session simulator is disabled; pick a live broker source"})
+                    "reason": "LIVE mode — the FNO session simulator is disabled; pick a live broker source"})
             return
         if symbol in self.symbol_source and self.symbol_source[symbol] in self.adapters:
             return
         src = self.feed_source()
-        if src == "sim":
-            if self._live_only():
-                await self._broadcast("feed:down", {
-                    "symbol": symbol,
-                    "reason": "Live-Only mode — sim feed disabled, no data source picked (FEED chip)"})
-                return
-            if self.sim_account_id and self.sim_account_id not in self.adapters:
-                await self._reconnect_sim()   # re-enabled after Live-Only — self-heal
-            if self.sim_account_id and self.sim_account_id in self.adapters:
-                token = self._token_for(self.sim_account_id, symbol)
-                if token is not None:
-                    ok = await self._stream_subscribe(
-                        self.streams[self.sim_account_id], self.sim_account_id, symbol, token)
-                    if ok:
-                        self.symbol_source[symbol] = self.sim_account_id
-                        return
+        if not src:
             await self._broadcast("feed:down", {
-                "symbol": symbol, "reason": f"no sim data for {symbol} — not in the sim universe"})
+                "symbol": symbol,
+                "reason": "no data source picked — click the FEED chip (link icon) and select an account"})
             return
-        # ---- explicit live source: THE only candidate, never a fallback ----
+        # ---- the picked account: THE only candidate, never a fallback ----
         try:
             aid = int(src)
         except ValueError:
             return
         if aid not in self.adapters:
-            await self._broadcast("feed:down", {
-                "symbol": symbol,
-                "reason": "feed account is not connected — connect it in the FEED chip (link icon)"})
-            return
+            if aid == self.sim_account_id and not self._live_only():
+                await self._reconnect_sim()   # re-enabled after LIVE — self-heal
+            if aid not in self.adapters:
+                await self._broadcast("feed:down", {
+                    "symbol": symbol,
+                    "reason": "feed account is not connected — connect it in the FEED chip (link icon)"})
+                return
         token = self._token_for(aid, symbol)
         if token is None:
             acc = db.core().one("SELECT broker FROM accounts WHERE id=?", (aid,))
             bname = (acc or {}).get("broker", "broker").upper()
-            await self._broadcast("feed:down", {
-                "symbol": symbol,
-                "reason": f"{bname} master has no mapping for {symbol} — run Master Sync (Admin → Master Contracts)"})
-            return
+            if aid == self.sim_account_id:
+                # Round-27: the sim account serves ANY parseable F&O symbol —
+                # auto-create the contract in the sim master (both rights) and
+                # retry; this kills the first-run 'not in the sim universe' FEED DOWN
+                if await self._sim_ensure_symbol(symbol):
+                    self._load_token_map(aid)
+                    token = self._token_for(aid, symbol)
+            if token is None:
+                if aid == self.sim_account_id:
+                    await self._broadcast("feed:down", {
+                        "symbol": symbol, "reason": f"no sim data for {symbol} — could not synthesize the contract"})
+                else:
+                    await self._broadcast("feed:down", {
+                        "symbol": symbol,
+                        "reason": f"{bname} master has no mapping for {symbol} — run Master Sync (Admin → Master Contracts)"})
+                return
         ok = await self._stream_subscribe(self.streams[aid], aid, symbol, token)
         if ok:
             self.symbol_source[symbol] = aid
@@ -569,6 +602,43 @@ class Hub:
             config.log("hub", f"subscribe {symbol} via account#{aid} failed: {e}", "WARN")
             return False
 
+    async def _sim_ensure_symbol(self, symbol: str) -> bool:
+        """Round-27: synthesize an F&O contract (both rights for options) in the
+        SIM master from a Dhan-style symbol, so the sim account can serve any
+        requested strike/expiry like a real broker's master would."""
+        import re as _re
+
+        s = (symbol or "").upper()
+        exch, _, s = s.partition(":") if ":" in s else ("NFO", "", s)
+        m = _re.match(r"^([A-Z][A-Z0-9&\-]*?)(\d{2})([A-Z]{3})(\d{2})(\d*\.?\d*)(CE|PE|FUT)$", s)
+        if not m:
+            return False
+        root, dd, mon, yy, strike, right = m.groups()
+        months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                  "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+        if mon not in months:
+            return False
+        exch = s.split(":")[0] if ":" in s else "NFO"
+        exp = f"20{yy}-{months.index(mon) + 1:02d}-{dd}"
+        try:
+            bdb = db.broker_db("sim")
+            if bdb.one("SELECT COUNT(*) c FROM master")["c"] == 0:
+                return False
+            lot = 75 if root == "NIFTY" else (20 if root == "SENSEX" else 35)
+            for r in (("CE", "PE") if right in ("CE", "PE") else (right,)):
+                sym = f"{exch}:{root}{dd}{mon}{yy}{strike}{r}"
+                if not bdb.one("SELECT token FROM master WHERE symbol=?", (sym,)):
+                    bdb.exec(
+                        "INSERT OR REPLACE INTO master(token,symbol,name,exchange,instrument,expiry,strike,right,lotsize) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (sym.split(":")[1], sym, f"{root} {exp} {strike} {r}", exch,
+                         "FUT" if r == "FUT" else "OPT", exp, float(strike or 0), r, lot))
+            config.log("hub", f"sim master: synthesized contract for {symbol}")
+            return True
+        except Exception as e:
+            config.log("hub", f"sim ensure {symbol} failed: {e}", "WARN")
+            return False
+
     async def _release_source(self, symbol: str) -> None:
         aid = self.symbol_source.pop(symbol, None)
         if aid is None or aid not in self.adapters:
@@ -602,25 +672,30 @@ class Hub:
                     return hist[-1000:]
             except Exception as e:
                 config.log("hub", f"broker history failed {symbol}: {e}", "WARN")
-            # Round-26: live source gave nothing (empty OR failed) — the chart
-            # stays EMPTY.  No session-aggregate fallback: partial/fabricated
-            # history under a live source is worse than an honest blank.
-            if self._src_aid is not None or self._live_only():
-                self.feed_note(f"history {symbol}: live source returned no candles "
+            # Round-26/27: a picked source gave nothing (empty OR failed) — the
+            # chart stays EMPTY.  No session-aggregate fallback: fabricated
+            # history under an explicit source is worse than an honest blank.
+            if self.feed_source():
+                self.feed_note(f"history {symbol}: source account returned no candles "
                                f"(market closed / holiday, or symbol not covered)", "WARN")
                 await self._broadcast("feed:down", {
                     "symbol": symbol,
-                    "reason": f"no chart data from the live source for {symbol} — market closed / holiday?"})
+                    "reason": f"no chart data from the source account for {symbol} — market closed / holiday?"})
                 return []
+        elif self.feed_source():
+            await self._broadcast("feed:down", {
+                "symbol": symbol,
+                "reason": "source account is not connected — connect it first (FEED chip)"})
+            return []
         return self.agg.history(symbol, tf_minutes)
 
     # ------------------------------------------------------------------ tick path (hot loop)
     def _on_broker_tick(self, tick: dict) -> None:
         """Called from broker stream clients (possibly other threads).
-        Round-26 HARD SOURCE GATE: only the ACTIVE feed source may push ticks
-        into the hub.  Sim ticks are dropped whenever Live-Only is on or an
-        explicit live source is selected; broker ticks from any OTHER account
-        are dropped (no cross-account fallback data, ever)."""
+        Round-26/27 HARD SOURCE GATE: only the account the user picked may
+        push ticks into the hub — sim included (it is a plain account whose
+        ticks count ONLY when it IS the picked source and mode != LIVE).
+        Ticks from any OTHER account are dropped (no fallback data, ever)."""
         symbol = tick.get("symbol")
         aid = tick.get("_aid")
         if not symbol:
@@ -628,35 +703,28 @@ class Hub:
                 symbol = self.token_map.get(aid, {}).get(str(tick.get("token", "")))
         if not symbol:
             return
-        src_is_sim = tick.get("source") == "sim" or (aid is not None and aid == self.sim_account_id)
         # lazy refresh of the explicit-source gate (2s TTL — boot/restore safe)
         now_s = time.time()
         if self._src_ts is None or now_s - self._src_ts > 2.0:
             src = self.feed_source()
-            if src == "sim":
-                self._src_aid = None
-            elif src.isdigit():
-                self._src_aid = int(src)
+            self._src_aid = int(src) if src.isdigit() else None
             self._src_ts = now_s
-        if src_is_sim:
-            # sim ticks die under Live-Only, live trading mode, or when an
-            # explicit live source is selected — no escape hatch
-            if self._live_only() or self._src_aid is not None:
-                self._dropped_ticks += 1
-                self._drop_reasons["sim-off"] += 1
-                return
-        else:
-            if self._src_aid is None:
-                # sim is the source — a stray broker tick is a fallback leak
-                self._dropped_ticks += 1
-                self._drop_reasons["not-source"] += 1
-                return
-            if aid is not None and int(aid) != self._src_aid:
-                # another connected account — NEVER its data (user rule:
-                # no fallback from other accounts)
-                self._dropped_ticks += 1
-                self._drop_reasons["cross-account"] += 1
-                return
+        if self._src_aid is None:
+            self._dropped_ticks += 1
+            self._drop_reasons["no-source"] += 1
+            return
+        if aid is not None and int(aid) != self._src_aid:
+            # another connected account — NEVER its data (user rule:
+            # no fallback from other accounts / sim / sandbox)
+            self._dropped_ticks += 1
+            self._drop_reasons["not-source" if aid == self.sim_account_id else "cross-account"] += 1
+            return
+        if int(aid or -1) == self._src_aid == self.sim_account_id and self._live_only():
+            # paranoia: LIVE mode never accepts sim-account ticks even if the
+            # stale pick still points at the sim row
+            self._dropped_ticks += 1
+            self._drop_reasons["sim-off"] += 1
+            return
         tick["symbol"] = symbol
         prev = self.ticks.get(symbol)
         tick["prev_close"] = tick.get("prev_close") or (prev or {}).get("prev_close")
@@ -778,6 +846,18 @@ class Hub:
     # ------------------------------------------------------------------ master-order fanout
     # (quantdesk parity: one request fans out to every order-enabled account
     #  with per-account capital sizing; legs recorded + audited)
+    def _paper_adapter(self, aid: int, acc: dict):
+        """Round-27: local-fill adapter used for SANDBOX/SIMULATION modes —
+        paper P&L against the hub's live tick cache; the real broker API is
+        never touched outside LIVE mode."""
+        pa = self._paper_adapters.get(aid)
+        if pa is None:
+            from backend.brokers.sim.broker import SimAdapter
+            pa = SimAdapter(dict(acc), {})
+            pa.connected = True
+            self._paper_adapters[aid] = pa
+        return pa
+
     async def place_master_order(self, body: dict) -> dict:
         symbol = (body.get("symbol") or "").upper()
         exchange = (body.get("exchange") or symbol.split(":")[0] or "NSE").upper()
@@ -796,7 +876,10 @@ class Hub:
         if body.get("legAccounts"):
             wanted = {str(a) for a in body["legAccounts"]}
             accs = [a for a in accs if str(a["id"]) in wanted]
-        if self.trading_mode() == "live" or self.sim_disabled():
+        # Round-27 3-way mode: LIVE orders route to real broker adapters only;
+        # SANDBOX / SIMULATION paper-fill EVERY account locally (sim accounts
+        # are ordinary members of the order-enabled set)
+        if self.trading_mode() == "live":
             accs = [a for a in accs if a["broker"] != "sim" and a["mode"] == "live"]
         if not accs:
             raise ValueError("no order-enabled account connected (check the capital chips)")
@@ -819,6 +902,10 @@ class Hub:
             if not adapter:
                 legs.append(self._leg(aid, acc, "REJECTED", message="account not connected"))
                 continue
+            # Round-27: SANDBOX / SIMULATION modes paper-fill locally — the
+            # real broker API is never touched outside LIVE mode
+            if self.trading_mode() != "live" and acc["broker"] != "sim":
+                adapter = self._paper_adapter(aid, acc)
             # ---- sizing (qty semantics: LOTS for FUT/OPT, units for EQ —
             #      positions are always stored in UNITS = lots x lotsize) ----
             is_fno = instrument in ("CE", "PE", "FUT") and lot_size > 1
@@ -965,7 +1052,7 @@ class Hub:
         return {"accountId": str(aid), "accountLabel": acc["label"],
                 "brokerType": acc["broker"].upper(), "brokerOrderId": broker_order_id,
                 "status": status, "qty": qty, "price": price, "message": message,
-                "sandbox": acc["mode"] != "live" or acc["broker"] == "sim"}
+                "sandbox": self.trading_mode() != "live"}
 
     def _usable_capital(self, acc: dict) -> float:
         """Deployable capital for sizing, per the account's house mode."""

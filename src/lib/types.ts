@@ -1,18 +1,21 @@
 // Shared domain types for the multi-broker trading terminal
 
-export type BrokerType = 'SIMFEED' | 'DHAN' | 'SHOONYA' | 'ICICI_BREEZE'
+export type NativeBrokerType = 'SIMFEED' | 'DHAN' | 'SHOONYA' | 'ICICI_BREEZE'
+/** Round-27: openalgo plugin accounts use 'oa-<plugin>' broker ids (string) */
+export type BrokerType = NativeBrokerType | (string & {})
 
 export const BROKER_TYPES: BrokerType[] = ['SIMFEED', 'DHAN', 'SHOONYA', 'ICICI_BREEZE']
 
-export const BROKER_META: Record<BrokerType, { name: string; apiName: string; doc: string }> = {
+export const BROKER_META: Record<NativeBrokerType, { name: string; apiName: string; doc: string }> = {
   SIMFEED: { name: 'Sim Feed', apiName: 'simfeed', doc: 'Built-in simulated broker & feed' },
   DHAN: { name: 'Dhan', apiName: 'dhan', doc: 'Dhan API v2 (REST + WebSocket feed)' },
   SHOONYA: { name: 'Shoonya (Finvasia)', apiName: 'shoonya', doc: 'Noren/Shoonya REST + WebSocket' },
   ICICI_BREEZE: { name: 'ICICI Direct Breeze', apiName: 'icici_breeze', doc: 'ICICI Direct Breeze API' },
 }
 
-/** UI BrokerType -> backend broker-registry name (backend/brokers/registry.py). */
-export const BROKER_API_NAME: Record<BrokerType, string> = {
+/** UI BrokerType -> backend broker-registry name (backend/brokers/registry.py).
+ *  oa-<plugin> ids pass through unchanged (registry resolves them lazily). */
+export const BROKER_API_NAME: Record<NativeBrokerType, string> = {
   SIMFEED: 'sim',
   DHAN: 'dhan',
   SHOONYA: 'shoonya',

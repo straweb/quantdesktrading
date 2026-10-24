@@ -206,11 +206,24 @@ class SimAdapter(BaseBroker):
                (new_qty, round(new_avg, 2), time.time(), row["id"]))
 
     # ------------------------------------------------------------------ history / master
+    def _universe_rows(self) -> list[dict]:
+        """Round-27: the sim universe is the sim MASTER table (so symbols added
+        at runtime — e.g. via option-chain ensure-strike — are served), with
+        build_universe() as the empty-DB fallback."""
+        try:
+            rows = db.broker_db("sim").query(
+                "SELECT token,symbol,name,exchange,instrument,expiry,strike,right,lotsize FROM master")
+            if rows:
+                return [dict(r) for r in rows]
+        except Exception:
+            pass
+        return sim_mapping.build_universe()
+
     async def get_history(self, symbol: str, tf_minutes: int, days: int) -> list[dict]:
         """Synthesized history priced like the LIVE stream (options at premium
         level, spot at mapping base) and ANCHORED so the last candle closes at
         the exact base the tick stream starts from — no chart/LTP jump."""
-        info = next((u for u in sim_mapping.build_universe()
+        info = next((u for u in self._universe_rows()
                      if u["symbol"] == symbol or u["symbol"] == f"NSE:{symbol}"
                      or u["symbol"].split(":")[-1] == symbol), None)
         if not info:
@@ -276,7 +289,7 @@ class SimAdapter(BaseBroker):
         from backend.brokers.sim.streaming import SimStream
 
         universe: dict[str, dict] = {}
-        for r in sim_mapping.build_universe():
+        for r in self._universe_rows():
             inst = (r.get("instrument") or "EQ").upper()
             if inst == "OPT":
                 base = option_premium(r)          # same model as get_history
@@ -287,4 +300,20 @@ class SimAdapter(BaseBroker):
                     or r.get("strike") or random.Random(r["symbol"]).uniform(300, 4000)
             universe[r["token"]] = {**r, "base": round(base, 2),
                                     "vol": 0.0008 if inst == "OPT" else 0.0007}
-        return SimStream(on_tick, universe)
+        # Round-27: tokens added to the sim master AFTER the stream started
+        # (auto-ensure on first chart open) resolve on demand
+        def _lookup(tok: str) -> Optional[dict]:
+            for r in self._universe_rows():
+                if r.get("token") == tok:
+                    inst = (r.get("instrument") or "EQ").upper()
+                    if inst == "OPT":
+                        base = option_premium(r)
+                    elif inst == "FUT":
+                        base = _spot_of_underlying(r["symbol"].split(":")[-1]) * 1.002
+                    else:
+                        base = _spot_of_underlying(r["symbol"].split(":")[-1]) \
+                            or r.get("strike") or random.Random(r["symbol"]).uniform(300, 4000)
+                    return {**r, "base": round(base, 2),
+                            "vol": 0.0008 if inst == "OPT" else 0.0007}
+            return None
+        return SimStream(on_tick, universe, lookup=_lookup)

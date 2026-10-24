@@ -118,7 +118,7 @@ BROKER_DBS = {                                        # per-broker DB (OpenAlgo 
 # ------------------------------------------------------------------ mode
 # Global trading mode: "live" | "sandbox". When "live", sim/sandbox data is
 # never allowed to serve market data or paper fills for live accounts.
-DEFAULT_TRADING_MODE = os.getenv("DEFAULT_TRADING_MODE", "sandbox")
+DEFAULT_TRADING_MODE = os.getenv("DEFAULT_TRADING_MODE", "simulation")
 
 # ------------------------------------------------------------------ feed tuning
 TICK_FANOUT_MIN_MS = _int_env("TICK_FANOUT_MIN_MS", 80)          # coalesce window (ms)

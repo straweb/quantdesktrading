@@ -33,6 +33,32 @@ from backend.options_chain import (build_chain, ensure_chain_subscribed,
 router = APIRouter(prefix="/pyapi")
 
 
+# ================================================================== broker catalog (Round-27)
+@router.get("/brokers")
+async def brokers_catalog(authorization: str = Header(default="")):
+    """Every selectable broker: 4 native + 37 openalgo plugins (catalog-driven
+    credential fields for the Add-Account + Session dialogs)."""
+    uid(authorization)
+    from backend.brokers.oa import oa_catalog
+    native = [
+        {"broker": "sim", "label": "Sim Feed (built-in)", "kind": "native", "fields": [],
+         "login_url_template": None, "auth_params": []},
+        {"broker": "dhan", "label": "Dhan (native)", "kind": "native", "fields": [],
+         "login_url_template": None, "auth_params": ["consent|pin:totp|tokenId"]},
+        {"broker": "shoonya", "label": "Shoonya (native)", "kind": "native", "fields": [],
+         "login_url_template": None, "auth_params": ["code"]},
+        {"broker": "breeze", "label": "ICICI Direct Breeze (native)", "kind": "native", "fields": [],
+         "login_url_template": None, "auth_params": ["apisession"]},
+    ]
+    oa = []
+    for spec in oa_catalog.catalog():
+        oa.append({"broker": f"oa-{spec['broker']}", "label": f"{spec['label']} (openalgo)",
+                   "kind": "openalgo", "fields": spec["fields"],
+                   "login_url_template": spec.get("login_url_template"),
+                   "auth_params": spec.get("auth_params") or []})
+    return {"brokers": native + oa}
+
+
 def _iso(ts: Optional[float]) -> Optional[str]:
     if not ts:
         return None
@@ -1199,6 +1225,57 @@ async def broker_auth_status(accountId: str, authorization: str = Header(default
         creds = {}
     sess = db.core().one("SELECT session_token FROM broker_sessions WHERE account_id=?", (aid,))
     broker = acc["broker"].lower()
+
+    # ---- Round-27: openalgo plugins (oa-<name>) — catalog-driven dialog ----
+    if broker.startswith("oa-"):
+        from backend.brokers.oa import oa_catalog
+
+        plugin = broker[3:]
+        spec = oa_catalog.broker_spec(plugin)
+        cred_fields = []
+        for f in spec["fields"]:
+            key, label = f["key"], f["label"]
+            masked = ("••••" + str(creds[key])[-4:]) if creds.get(key) else None
+            cred_fields.append({"key": key, "label": label, "masked": masked,
+                                "sample": "", "secret": bool(f.get("secret"))})
+        login_url = spec.get("login_url_template")
+        if login_url:
+            for k in set(re.findall(r"\{([a-z_]+)\}", login_url)):
+                v = str(creds.get(k) or "").strip()
+                login_url = login_url.replace("{" + k + "}", v)
+            login_url = login_url if "{" not in login_url else login_url
+        params = spec.get("auth_params") or []
+        if any(p in ("request_token", "code", "token") for p in params):
+            instructions = [
+                "Save your API credentials below first (they are sent with the exchange)",
+                "Open the login URL above, log in to the broker",
+                "Copy the token/code from the redirect URL (fresh each time)",
+                "Paste it below — the openalgo plugin exchanges and validates it",
+                "On success master contracts auto-sync and the account connects",
+            ]
+        elif params:  # clientcode/pin/totp style
+            instructions = [
+                "Fill ALL fields below (client id, PIN/password, TOTP)",
+                "TOTP auto-generates from the saved TOTP secret when left blank",
+                "Press Complete — the openalgo plugin performs the full login",
+            ]
+        else:
+            instructions = [
+                "Save your API credentials below",
+                "Press Complete — the openalgo plugin logs in with the saved keys directly",
+            ]
+        return {
+            "accountId": str(aid), "label": acc["label"], "brokerType": acc["broker"].upper(),
+            "sessionKind": "daily", "hasSession": bool(sess and sess["session_token"]),
+            "sessionMasked": (("••••" + sess["session_token"][-4:]) if sess and sess["session_token"] else None),
+            "userId": creds.get("user_id") or creds.get("client_id"),
+            "liveCapable": True, "mode": acc["mode"],
+            "loginUrl": login_url, "instructions": instructions,
+            "serverIp": None, "ipInfo": None,
+            "fieldsNeeded": [c["key"] for c in cred_fields if not creds.get(c["key"])],
+            "credFields": cred_fields,
+        }
+
     field_specs = {
         "breeze": [("api_key", "App Key", "••••", "your-breeze-app-key"),
                    ("api_secret", "App Secret", "••••", "your-breeze-app-secret")],
@@ -1322,9 +1399,11 @@ async def broker_auth_post(body: dict, authorization: str = Header(default="")):
             return await _auth_consent(aid, acc, creds, broker)
         if action == "complete":
             code = (body.get("code") or "").strip()
-            if not code:
+            if broker.startswith("oa-"):
+                res = await _oa_complete(aid, acc, creds, broker, code)
+            elif not code:
                 raise HTTPException(400, "code required — paste the redirect value (or PIN:TOTP / pwd:factor2)")
-            if broker == "shoonya":
+            elif broker == "shoonya":
                 res = await _shoonya_complete(aid, acc, creds, code)
             elif broker == "dhan":
                 res = await _dhan_complete(aid, acc, creds, code)
@@ -1353,6 +1432,48 @@ async def broker_auth_post(body: dict, authorization: str = Header(default="")):
                 "message": f"Auth step failed ({type(e).__name__}): {msg[:220]} — "
                            "this is usually transient; press the button again. "
                            "If it repeats, check Admin → Broker Diagnostics."}
+
+
+async def _oa_complete(aid: int, acc: dict, creds: dict, broker: str, code: str) -> dict:
+    """Round-27 — run an openalgo plugin's authenticate_broker() flow and
+    persist the resulting session exactly like the native flows."""
+    import inspect as _inspect
+
+    from backend.brokers.oa import oa_catalog
+    from backend.brokers.oa.oa_context import call_authenticate
+
+    plugin = broker[3:]
+    spec = oa_catalog.broker_spec(plugin)
+    params = spec.get("auth_params") or []
+    needs_code = any(p in ("request_token", "code", "token") for p in params)
+    # friendly pre-checks (surface as structured {ok:false}, never 500)
+    if needs_code and not code:
+        return {"ok": False,
+                "message": "Paste the auth code / request token from the broker "
+                           f"login redirect first ({plugin} flow requires it)."}
+    missing = [c["key"] for c in spec["fields"]
+               if c["key"] != "code" and not creds.get(c["key"])]
+    if missing:
+        return {"ok": False,
+                "message": f"Save these credentials first (pencil → credentials): {', '.join(missing)}"}
+    loop = asyncio.get_event_loop()
+    res = await loop.run_in_executor(
+        None, lambda: call_authenticate(plugin, creds, code, aid))
+    if not res.get("ok"):
+        msg = res.get("message") or "authentication failed"
+        config.log("broker-auth", f"oa-{plugin} complete failed (account#{aid}): {msg[:220]}", "WARN")
+        return {"ok": False, "message": f"oa-{plugin}: {msg}"}
+    token = res.get("token") or ""
+    meta = {"broker": broker, "plugin": plugin, "source": "openalgo",
+            "validated_at": time.time()}
+    from backend import session_store
+    session_store.save(aid, broker, token, meta)
+    session_store.mark_validated(aid)
+    db.core().exec("UPDATE accounts SET status='connected', status_message='' WHERE id=?", (aid,))
+    config.log("broker-auth", f"oa-{plugin} session created for account#{aid} "
+                              f"(token {'••••' + token[-4:] if token else 'n/a'})")
+    return {"ok": True, "message": f"Session created via openalgo plugin ({plugin})",
+            "sessionMasked": ("••••" + token[-4:]) if token else None}
 
 
 async def _post_session_success(aid: int, acc: dict, broker: str) -> None:

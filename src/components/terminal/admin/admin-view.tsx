@@ -37,52 +37,62 @@ export function AdminView() {
 }
 
 // ---------------- Trading mode (Live-Only switch) ----------------
-// Round-12: a global checkbox that DISABLES the sim feed + sandbox fills.
-// ON  → the feed engine stops the random walk (charts/watchlists show real
-//        broker data only, empty until ticks arrive) and broker adapters
-//        REJECT orders without a live session instead of simulating them.
-// OFF → sim feed + sandbox execution available as before.
+// Round-27: THREE global trading modes (replaces the Round-12 LIVE-ONLY
+// checkbox which is now the LIVE setting):
+//   LIVE       — real trading: real broker sessions, real fills. No sim,
+//                no sandbox — the sim engine is stopped and sandbox
+//                accounts detach; charts show real data or nothing.
+//   SANDBOX    — paper trading on a LIVE broker account's data: fills are
+//                local (the real broker API is never touched), P&L + charges
+//                are computed per the selected account's schedule.
+//   SIMULATION — session simulator: the sim feed account + local fills for
+//                offline testing (weekends/holidays/strategy dev).
+const TRADING_MODES: { id: 'live' | 'sandbox' | 'simulation'; label: string; desc: string; cls: string }[] = [
+  { id: 'live', label: 'LIVE', desc: 'Real orders via broker sessions — no sim/sandbox anywhere.', cls: 'border-[#e05252]/60 bg-[#e05252]/10 text-[#ff8a80]' },
+  { id: 'sandbox', label: 'SANDBOX', desc: 'Paper fills on the selected live broker account\'s data — broker API untouched.', cls: 'border-[#e0a63f]/60 bg-[#e0a63f]/10 text-[#e0a63f]' },
+  { id: 'simulation', label: 'SIMULATION', desc: 'Sim feed account + local fills — offline testing (closed days / strategy dev).', cls: 'border-[#4dd0e1]/50 bg-[#4dd0e1]/10 text-[#4dd0e1]' },
+]
+
 function TradingMode() {
   const qc = useQueryClient()
   const adm = useSyncChannel<SyncAdmin>('sync:admin')
   const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource() })
-  const simDisabled = adm?.feedSource?.simDisabled ?? data?.simDisabled ?? false
+  const mode = (adm?.feedSource?.tradingMode ?? (data as { tradingMode?: string } | undefined)?.tradingMode ?? 'simulation') as 'live' | 'sandbox' | 'simulation'
   const [busy, setBusy] = useState(false)
-  const toggle = async (next: boolean) => {
+  const setMode = async (next: 'live' | 'sandbox' | 'simulation') => {
+    if (next === mode) return
     setBusy(true)
     try {
-      const r = await api.setSimDisabled(next) as { steeredTo?: string; message?: string; source?: string }
+      await api.setTradingMode(next)
       await qc.invalidateQueries({ queryKey: ['feed-source'] })
-      if (next && r.steeredTo) {
-        // the previous source was a sandbox account — the server auto-switched
-        // to a live account (round-13: LIVE-ONLY must never sit on a dead feed)
-        toast.success(`LIVE-ONLY mode — ${r.message ?? 'feed source moved to a live account'}`)
-      } else {
-        toast.success(next
-          ? 'LIVE-ONLY mode — sim feed + sandbox fills disabled'
-          : 'Sim feed + sandbox re-enabled')
-      }
+      toast.success(next === 'live'
+        ? 'LIVE mode — real broker orders, sim feed stopped, sandbox detached'
+        : next === 'sandbox'
+          ? 'SANDBOX mode — paper fills on live broker data (broker API untouched)'
+          : 'SIMULATION mode — sim feed + local fills for testing')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Switch failed')
     } finally { setBusy(false) }
   }
+  const current = TRADING_MODES.find(m => m.id === mode) ?? TRADING_MODES[2]
   return (
-    <div className={`rounded-lg border bg-card px-4 py-3 flex flex-wrap items-center gap-3 ${simDisabled ? 'border-[#e0a63f]/50' : 'border-border'}`}>
+    <div className={`rounded-lg border bg-card px-4 py-3 flex flex-wrap items-center gap-3 ${current.cls.split(' ')[0]}`}>
       <div className="min-w-[260px] flex-1">
         <h3 className="text-sm font-semibold flex items-center gap-1.5">
-          {simDisabled ? <ShieldAlert className="h-4 w-4 text-[#e0a63f]" /> : <ShieldCheck className="h-4 w-4 text-[#4dd0e1]" />}
-          Trading mode — {simDisabled ? 'LIVE ONLY' : 'Sim + Sandbox allowed'}
+          {mode === 'live' ? <ShieldAlert className="h-4 w-4 text-[#e05252]" /> : <ShieldCheck className="h-4 w-4 text-[#4dd0e1]" />}
+          Trading mode — {current.label}
         </h3>
-        <p className="text-[11px] text-muted-foreground">
-          {simDisabled
-            ? 'Sim feed is OFF for every symbol and sandbox fills are refused — orders need a live broker session, charts show real data or nothing.'
-            : 'Sim feed drives prices when no broker source is active and orders can fall back to sandbox fills. Switch ON when trading a real broker account.'}
-        </p>
+        <p className="text-[11px] text-muted-foreground">{current.desc}</p>
       </div>
-      <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
-        <Switch checked={simDisabled} disabled={busy} onCheckedChange={toggle} />
-        <span className={simDisabled ? 'text-[#e0a63f] font-semibold' : 'text-muted-foreground'}>Disable Sim Feed &amp; Sandbox</span>
-      </label>
+      <div className="flex items-center rounded-lg border border-border overflow-hidden" role="group" aria-label="Trading mode">
+        {TRADING_MODES.map(m => (
+          <button key={m.id} type="button" disabled={busy}
+            onClick={() => setMode(m.id)}
+            className={`px-3 py-1.5 text-xs font-semibold transition-colors ${m.id === mode ? m.cls : 'text-muted-foreground hover:bg-muted/40'} ${m.id !== 'live' ? 'border-l border-border' : ''}`}>
+            {m.label}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }
@@ -830,33 +840,43 @@ function AccountsManager() {
   const core = useSyncChannel<SyncCore>('sync:core')
   const { data: rest } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), enabled: !core, refetchInterval: 5000 })
   const data = core ? { accounts: core.accounts as unknown as AccountRow[] } : rest
+  // Round-27: full broker catalog (4 native + 37 openalgo plugins)
+  const { data: catalog } = useQuery({ queryKey: ['brokers'], queryFn: () => api.brokers(), staleTime: 3600_000 })
   const [dlgOpen, setDlgOpen] = useState(false)
   const [form, setForm] = useState<{
     label: string; brokerType: BrokerType; clientId: string; initialCapital: string; mode: CapitalMode
-    apiKey: string; secret: string; extra: string
+    apiKey: string; secret: string; extra: string; oaCreds: Record<string, string>
   }>({
-    label: '', brokerType: 'SIMFEED', clientId: '', initialCapital: '500000', mode: 'INITIAL_PLUS_PNL', apiKey: '', secret: '', extra: '',
+    label: '', brokerType: 'SIMFEED', clientId: '', initialCapital: '500000', mode: 'INITIAL_PLUS_PNL', apiKey: '', secret: '', extra: '', oaCreds: {},
   })
 
   const accounts = data?.accounts ?? []
+  const isOa = form.brokerType.startsWith('oa-')
+  const oaSpec = isOa ? catalog?.brokers.find(b => b.broker === form.brokerType) : undefined
 
   const isLive = form.brokerType !== 'SIMFEED'
 
   const create = async () => {
     try {
       const credentials: Record<string, string> = {}
-      for (const [k, v] of Object.entries(oauthFieldsFor(form.brokerType, form))) {
-        if (v?.trim()) credentials[k] = v.trim()
+      if (isOa) {
+        for (const [k, v] of Object.entries(form.oaCreds)) {
+          if (v?.trim()) credentials[k] = v.trim()
+        }
+      } else {
+        for (const [k, v] of Object.entries(oauthFieldsFor(form.brokerType, form))) {
+          if (v?.trim()) credentials[k] = v.trim()
+        }
       }
       // live brokers: blank initial capital = 100% of the REAL broker
       // available cash (pulled from the funds API) — the round-10 default
       const capBlank = !form.initialCapital.trim()
       // canonical backend contract: broker is the registry name (sim/breeze/
-      // dhan/shoonya); capitalMode is the sizing mode; `mode` is live|sandbox.
-      // Sending brokerType/initialCapital aliases also works (backend accepts
-      // both) — this shape is the source of truth.
+      // dhan/shoonya/oa-<plugin>); capitalMode is the sizing mode; `mode` is
+      // live|sandbox. Sending brokerType/initialCapital aliases also works
+      // (backend accepts both) — this shape is the source of truth.
       await api.createAccount({
-        broker: BROKER_API_NAME[form.brokerType],
+        broker: (BROKER_API_NAME as Record<string, string>)[form.brokerType] ?? form.brokerType,
         label: form.label,
         mode: isLive ? 'live' : 'sandbox',
         clientId: form.clientId || undefined,
@@ -868,7 +888,7 @@ function AccountsManager() {
       })
       toast.success(`Account "${form.label}" added${isLive && capBlank ? ' — capital = 100% of broker available cash (funds sync every 45s)' : ''}`)
       setDlgOpen(false)
-      setForm({ ...form, label: '', clientId: '', apiKey: '', secret: '', extra: '', initialCapital: isLive ? '' : '500000' })
+      setForm({ ...form, label: '', clientId: '', apiKey: '', secret: '', extra: '', oaCreds: {}, initialCapital: isLive ? '' : '500000' })
       qc.invalidateQueries({ queryKey: ['accounts'] })
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed')
@@ -904,18 +924,27 @@ function AccountsManager() {
                 <Input value={form.label} onChange={e => setForm({ ...form, label: e.target.value })} placeholder="e.g. Dhan Prop Desk 2" className="h-8" />
               </Field>
               <Field label="Broker">
-                <Select value={form.brokerType} onValueChange={v => setForm({ ...form, brokerType: v as BrokerType })}>
+                <Select value={form.brokerType} onValueChange={v => setForm({ ...form, brokerType: v as BrokerType, oaCreds: {} })}>
                   <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="max-h-[50vh]">
                     {(Object.keys(BROKER_META) as BrokerType[]).map(b => (
                       <SelectItem key={b} value={b}>{BROKER_META[b].name} — {BROKER_META[b].doc}</SelectItem>
+                    ))}
+                    {(catalog?.brokers ?? []).filter(b => b.kind === 'openalgo').length > 0 && (
+                      <div className="px-2 py-1 text-[9px] uppercase tracking-wider text-muted-foreground">OpenAlgo plugins — 37 brokers</div>
+                    )}
+                    {(catalog?.brokers ?? []).filter(b => b.kind === 'openalgo').map(b => (
+                      <SelectItem key={b.broker} value={b.broker}>{b.label}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </Field>
-              <Field label="Client ID" hint={clientIdHint(form.brokerType)}>
+              {isOa && (
+                <div className="text-[10px] text-muted-foreground">OpenAlgo plugin adapter — full auth/feed/orders/history/master-sync via the vendored openalgo broker implementation. Create the session with the Session button after adding.</div>
+              )}
+              {!isOa && (<Field label="Client ID" hint={clientIdHint(form.brokerType)}>
                 <Input value={form.clientId} onChange={e => setForm({ ...form, clientId: e.target.value })} className="h-8" placeholder={clientIdSample(form.brokerType)} />
-              </Field>
+              </Field>)}
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Initial Capital ₹" hint={isLive ? 'Leave BLANK for live brokers — capital becomes 100% of the REAL available cash pulled from the funds API (changeable anytime).' : 'Fixed rupee starting capital for sizing.'}>
                   <Input type="number" value={form.initialCapital} onChange={e => setForm({ ...form, initialCapital: e.target.value })} className="h-8 tabular" placeholder={isLive ? 'blank = 100% of broker cash' : '500000'} />
@@ -929,6 +958,16 @@ function AccountsManager() {
                   </Select>
                 </Field>
               </div>
+              {isOa ? (
+                (oaSpec?.fields ?? []).map(f => (
+                  <Field key={f.key} label={f.label} hint={f.hint || 'Encrypted at rest (AES-256-GCM).'}>
+                    <Input type={f.secret ? 'password' : 'text'} value={form.oaCreds[f.key] ?? ''}
+                      onChange={e => setForm({ ...form, oaCreds: { ...form.oaCreds, [f.key]: e.target.value } })}
+                      className="h-8" />
+                  </Field>
+                ))
+              ) : (
+                <>
               <Field label={credFieldLabel(form.brokerType)} hint={`${credFieldSample(form.brokerType)} · Encrypted at rest (AES-256-GCM). OAuth session tokens are created per-day via the Session button after adding.`}>
                 <Input value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} className="h-8" placeholder={credFieldSample(form.brokerType)} />
               </Field>
@@ -941,6 +980,8 @@ function AccountsManager() {
                 <Field label={extraFieldLabel(form.brokerType)!} hint={extraFieldSample(form.brokerType)}>
                   <Input value={form.extra} onChange={e => setForm({ ...form, extra: e.target.value })} className="h-8" placeholder={extraFieldSample(form.brokerType)} />
                 </Field>
+              )}
+                </>
               )}
               <Button className="h-8 text-xs" onClick={create} disabled={!form.label}>Add Account</Button>
             </div>
@@ -957,7 +998,7 @@ function AccountsManager() {
                 {a.isLiveDataSource && <span className="text-[8px] px-1 py-0.5 rounded bg-[#4dd0e1]/15 text-[#4dd0e1] flex items-center gap-0.5"><Radio className="h-2.5 w-2.5" />DATA</span>}
                 {a.isCopyMaster && <span className="text-[8px] px-1 py-0.5 rounded bg-[#f5a623]/15 text-[#f5a623]">MASTER</span>}
               </div>
-              <div className="text-[10px] text-muted-foreground">{BROKER_META[a.brokerType as BrokerType]?.name} · {a.clientId ?? '—'}</div>
+              <div className="text-[10px] text-muted-foreground">{BROKER_META[a.brokerType as BrokerType]?.name ?? (a.brokerType.startsWith('OA-') ? `${a.brokerType.slice(3)} (openalgo)` : a.brokerType)} · {a.clientId ?? '—'}</div>
             </div>
             <CapCell label="Usable" value={a.usableCapital} />
             <CapCell label="Initial" value={a.initialCapital} />

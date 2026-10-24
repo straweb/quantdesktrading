@@ -18,10 +18,12 @@ from backend import config
 class SimStream:
     name = "sim-feed"
 
-    def __init__(self, on_tick, universe: dict[str, dict]):
-        # universe: token -> {symbol, base, vol, lotsize, exchange, instrument,...}
+    def __init__(self, on_tick, universe: dict[str, dict], lookup=None):
+        # lookup (round-27): resolve tokens added to the sim master AFTER the
+        # stream started — auto-ensure on first chart open works live
         self.on_tick = on_tick
         self.universe = universe
+        self.lookup = lookup
         self.subscribed: dict[str, dict] = {}   # token -> state
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -49,6 +51,10 @@ class SimStream:
     async def subscribe(self, tokens: list[str]) -> None:
         for tok in tokens:
             info = self.universe.get(tok)
+            if not info and self.lookup is not None:
+                info = self.lookup(tok)  # round-27: on-demand synthesized contract
+                if info:
+                    self.universe[tok] = info
             if not info:
                 continue
             if tok not in self.subscribed:

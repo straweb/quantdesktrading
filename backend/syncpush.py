@@ -93,7 +93,7 @@ def _admin_payload() -> dict:
             last_sync = log["ts"]
     return {
         "feed": hub.feed_status(),
-        "feedSource": {"source": hub.feed_source(), "simDisabled": hub.sim_disabled(),
+        "feedSource": {"source": hub.feed_source(), "simDisabled": hub.sim_disabled(), "tradingMode": hub.trading_mode(),
                        "sources": hub.feed_sources()},
         "accountsMeta": [
             {"id": str(a["id"]), "label": a["label"], "brokerType": a["broker"].upper(),

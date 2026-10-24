@@ -97,14 +97,13 @@ async def get_settings(authorization: str = Header(default="")):
 async def set_mode(body: dict, authorization: str = Header(default="")):
     _uid(authorization)
     mode = (body or {}).get("mode")
-    if mode not in ("live", "sandbox"):
-        raise HTTPException(400, "mode must be 'live' or 'sandbox'")
+    if mode not in ("live", "sandbox", "simulation"):
+        raise HTTPException(400, "mode must be 'live' | 'sandbox' | 'simulation'")
     hub = Hub.instance()
-    db.core().exec("INSERT INTO settings(key,value) VALUES('trading_mode',?) "
-                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (mode,))
+    # single source of truth: hub.set_trading_mode (mirrors sim_disabled for
+    # legacy consumers) — LIVE hard-stops the sim engine + detaches sandboxes
+    hub.set_trading_mode(mode)
     await hub.enforce_mode()
-    if mode == "live":
-        hub.set_sim_disabled(True)
     if hub.sio:
         await hub.sio.emit("mode", {"mode": mode})
     config.log("rest", f"trading mode -> {mode.upper()}")

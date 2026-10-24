@@ -7,6 +7,8 @@ DB files:
 """
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
 import threading
 import time
@@ -90,12 +92,23 @@ def core() -> DB:
 
 
 def broker_db(name: str) -> DB:
-    """Per-broker database (master contracts live here, OpenAlgo-style isolation)."""
+    """Per-broker database (master contracts live here, OpenAlgo-style isolation).
+    Round-27: unknown names (openalgo plugins: oa-zerodha, oa-angel, …) get an
+    auto-derived db/<name>.db with the master schema applied on first use
+    instead of silently sharing sim.db."""
     db = _broker_dbs.get(name)
     if db is None:
-        path = config.BROKER_DBS.get(name) or config.BROKER_DBS["sim"]
+        path = config.BROKER_DBS.get(name)
+        fresh = path is None
+        if fresh:
+            if not re.fullmatch(r"[a-z0-9_-]{1,48}", name or ""):
+                raise ValueError(f"invalid broker db name: {name!r}")
+            path = os.path.join(config.DATA_DIR, f"{name}.db")
         db = DB(path)
         _broker_dbs[name] = db
+        if fresh:
+            for ddl in MASTER_SCHEMA:
+                db.exec(ddl)
     return db
 
 

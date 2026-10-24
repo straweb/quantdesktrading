@@ -60,7 +60,10 @@ const BROKER_ICON: Record<string, { glyph: string; cls: string }> = {
   ICICI_BREEZE: { glyph: 'iB', cls: 'bg-[#f97316]/25 text-[#fb923c]' },
 }
 function brokerIcon(brokerType: string) {
-  return BROKER_ICON[brokerType] ?? { glyph: brokerType.slice(0, 1) ?? '?', cls: 'bg-secondary text-muted-foreground' }
+  const bt = (brokerType || '').toUpperCase()
+  if (bt.startsWith('OA-')) return { glyph: bt.slice(3, 3).toUpperCase() || 'O', cls: 'bg-emerald-500/20 text-emerald-300' }
+  if (bt === 'SIM') return BROKER_ICON.SIMFEED
+  return BROKER_ICON[bt] ?? BROKER_ICON[`${bt}`] ?? { glyph: bt.slice(0, 1) || '?', cls: 'bg-secondary text-muted-foreground' }
 }
 
 const qc = new QueryClient({
@@ -598,8 +601,8 @@ function FeedChip({ up }: { up: boolean }) {
   const accounts: AccountRow[] = sync?.accounts
     ? (sync.accounts as unknown as AccountRow[])
     : (restAccs?.accounts ?? [])
-  const source = adm?.feedSource.source ?? data?.source ?? 'sim'
-  const simDisabled = adm?.feedSource.simDisabled ?? data?.simDisabled ?? false
+  const source = adm?.feedSource.source ?? data?.source ?? ''
+  const tradingMode = adm?.feedSource.tradingMode ?? 'simulation'
   const sources = adm?.feedSource.sources ?? data?.sources ?? []
   const bumpDataEpoch = useTerminal(s => s.bumpDataEpoch)
   const current = sources.find(s => s.id === source)
@@ -616,13 +619,13 @@ function FeedChip({ up }: { up: boolean }) {
 
   const pick = async (id: string) => {
     if (id === source || busy) return
-    // Live-Only mode: sandbox accounts (no broker session) can never be the
+    // LIVE mode: sandbox accounts (no broker session) can never be the
     // data source — block at the UI level (the API refuses them too)
-    if (simDisabled && id !== 'sim') {
+    if (tradingMode === 'live') {
       const row = sources.find(s => s.id === id)
       const sessioned = accById.get(id)?.hasSession ?? row?.hasSession ?? false
       if (!sessioned) {
-        toast.error(`${row?.label ?? 'This account'} has no broker session (sandbox) — Live-Only mode requires a live account. Create the session in Admin → Session.`)
+        toast.error(`${row?.label ?? 'This account'} has no broker session — LIVE mode requires a live account. Create the session in Admin → Session.`)
         return
       }
     }
@@ -631,10 +634,10 @@ function FeedChip({ up }: { up: boolean }) {
       await api.setFeedSource(id)
       await refresh()
       // purge every client-side market-data holder (candles, ghost, ticks,
-      // depth books) — sim data must never linger under a real-broker source
+      // depth books) — the previous source's data must never linger
       bumpDataEpoch()
       const label = sources.find(s => s.id === id)?.label ?? id
-      toast.success(`Market data source → ${label}${id === 'sim' ? '' : ' (sim data cleared)'}`)
+      toast.success(`Market data source → ${label}`)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Switch failed')
     } finally { setBusy(false) }
@@ -647,16 +650,17 @@ function FeedChip({ up }: { up: boolean }) {
       await api.patchAccount(id, { isActive: next })
       await refresh()
       const a = accById.get(id)
-      toast.success(`${a?.label ?? 'Account'} ${next ? 'connected' : 'disconnected'}${!next && source === id ? ' — feed fell back to Sim' : ''}`)
+      toast.success(`${a?.label ?? 'Account'} ${next ? 'connected' : 'disconnected'}`)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Update failed')
     } finally { setBusy(false) }
   }
 
   const toggleFeed = async (id: string) => {
-    // if this account already feeds the terminal -> disable (back to sim);
-    // otherwise enable it as the active source
-    await pick(source === id ? 'sim' : id)
+    // clicking the active source's radio picks THAT account again — there is
+    // no built-in sim fallback: unpicking = pick another account explicitly
+    if (source === id) { toast.info('This account is already the data source — pick another account to switch') ; return }
+    await pick(id)
   }
 
   const pullFunds = async (id: string) => {
@@ -712,18 +716,19 @@ function FeedChip({ up }: { up: boolean }) {
           className={`flex items-center gap-1 px-1.5 py-1 rounded border transition-colors ${
             up ? 'border-[#00c896]/30 bg-up/40 text-[#00c896] hover:bg-up/60' : 'border-[#ff4d5e]/30 bg-down/40 text-[#ff4d5e] hover:bg-down/60'
           }`}
-          title={`Market data source — click to view / switch${source !== 'sim' ? ` · live feed ${liveHealthy ? 'ticking' : (waiting ? 'connected — waiting for data (closed/holiday?)' : `STALLED${liveErr ? `: ${liveErr}` : ''}`)}` : ''}${noSource ? ' · NO SOURCE PICKED (Live-Only)' : ''}`}
+          title={`Market data source — click to view / switch${source ? ` · live feed ${liveHealthy ? 'ticking' : (waiting ? 'connected — waiting for data (closed/holiday?)' : `STALLED${liveErr ? `: ${liveErr}` : ''}`)}` : ''}${noSource ? ' · NO SOURCE PICKED — select an account below' : ''}`}
         >
           <CircleDot className={`h-3 w-3 ${up ? 'pulse-dot' : ''}`} />
           <span className="font-bold">FEED {up ? 'LIVE' : 'DOWN'}</span>
-          {source !== 'sim' && (
+          {source && (
             <span
               className={`h-1.5 w-1.5 rounded-full ${liveHealthy ? 'bg-[#00c896] pulse-dot' : 'bg-[#e0a63f]'}`}
               title={liveHealthy ? `live broker data ticking (${feedStatus?.symbols} symbols · last ${tickAge}s ago)` : `live data stalled${liveErr ? ` — ${liveErr}` : ' — waiting for ticks'}`}
             />
           )}
-          <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? 'Sim Feed'}</span>
-          {simDisabled && <span className="px-1 rounded bg-[#e0a63f]/20 text-[#e0a63f] text-[8px] font-bold" title="Live-Only mode (admin) — sim feed disabled">LIVE-ONLY</span>}
+          <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? (source ? source : 'No source')}</span>
+          {tradingMode === 'live' && <span className="px-1 rounded bg-[#e05252]/20 text-[#ff8a80] text-[8px] font-bold" title="LIVE trading mode (admin) — sim/sandbox disabled">LIVE</span>}
+          {tradingMode === 'sandbox' && <span className="px-1 rounded bg-[#e0a63f]/20 text-[#e0a63f] text-[8px] font-bold" title="SANDBOX mode — paper fills on live data">PAPER</span>}
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-[360px] p-2 text-[11px] space-y-1">
@@ -737,7 +742,7 @@ function FeedChip({ up }: { up: boolean }) {
         )}
         {noSource && (
           <div className="mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border border-[#e0a63f]/40 bg-[#e0a63f]/10 text-[#e0a63f]">
-            <b>NO DATA SOURCE</b> — Live-Only mode is on and the sim feed is disabled. Pick a live broker account above; until then every panel stays empty (no fallback data).
+            <b>NO DATA SOURCE</b> — pick an account below (sim is a plain account too). Until then every panel stays empty — no fallback data, ever.
           </div>
         )}
         {feedStatus?.sourceIsLive && (
@@ -752,7 +757,7 @@ function FeedChip({ up }: { up: boolean }) {
           </div>
         )}
         {sources.map(s => {
-          const acc = s.id === 'sim' ? null : accById.get(s.id)
+          const acc = accById.get(s.id)
           const isSrc = s.id === source
           return (
             <div
@@ -770,8 +775,8 @@ function FeedChip({ up }: { up: boolean }) {
               }`}>
                 {isSrc && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
               </span>
-              <span className={`h-4 w-4 rounded text-[8px] font-bold grid place-items-center shrink-0 ${s.id === 'sim' ? 'bg-slate-500/25 text-slate-300' : brokerIcon(s.brokerType ?? '').cls}`}>
-                {s.id === 'sim' ? '⚡' : brokerIcon(s.brokerType ?? '').glyph}
+              <span className={`h-4 w-4 rounded text-[8px] font-bold grid place-items-center shrink-0 ${s.brokerType === 'SIM' ? 'bg-slate-500/25 text-slate-300' : brokerIcon(s.brokerType ?? '').cls}`}>
+                {s.brokerType === 'SIM' ? '⚡' : brokerIcon(s.brokerType ?? '').glyph}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="flex items-center gap-1.5 min-w-0">
@@ -789,12 +794,12 @@ function FeedChip({ up }: { up: boolean }) {
                           ? 'bg-[#00c896]/15 text-[#00c896]'
                           : 'bg-[#e0a63f]/15 text-[#e0a63f]'
                       }`}
-                      title={acc.hasSession ? 'broker session present — live account' : 'no broker session — sandbox account (Live-Only mode cannot use it)'}
+                      title={acc.hasSession ? 'broker session present — live account' : 'no broker session — sandbox account (LIVE mode cannot use it)'}
                     >
                       {acc.hasSession ? 'LIVE' : 'SANDBOX'}
                     </span>
-                    {!acc.hasSession && simDisabled && (
-                      <span className="text-[#e0a63f]" title="Live-Only mode — create the session in Admin → Session to use this account">session required</span>
+                    {!acc.hasSession && tradingMode === 'live' && (
+                      <span className="text-[#e0a63f]" title="LIVE mode — create the session in Admin → Session to use this account">session required</span>
                     )}
                     <span className={acc.realizedPnl >= 0 ? 'term-up' : 'term-down'}>
                       PnL {acc.realizedPnl >= 0 ? '+' : ''}{fmtCompact(acc.realizedPnl)}
@@ -841,17 +846,17 @@ function FeedChip({ up }: { up: boolean }) {
                   {/* live feed enable / disable for this account */}
                   <button
                     onClick={e => { e.stopPropagation(); toggleFeed(acc.id) }}
-                    disabled={busy || (simDisabled && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))}
+                    disabled={busy || (tradingMode === 'live' && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))}
                     title={
-                      isSrc ? 'Disable this account feed (back to Sim)'
-                      : simDisabled && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession)
-                        ? 'Blocked — Live-Only mode: this sandbox account has no broker session'
-                        : 'Enable this account as the live feed'
+                      isSrc ? 'This account IS the data source'
+                      : tradingMode === 'live' && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession)
+                        ? 'Blocked — LIVE mode: this account has no broker session'
+                        : 'Enable this account as the data source'
                     }
                     className={`p-1 rounded border transition-colors ${
                       isSrc
                         ? 'border-primary/60 text-primary bg-primary/15'
-                        : busy || (simDisabled && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))
+                        : busy || (tradingMode === 'live' && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))
                           ? 'border-border/50 text-muted-foreground/40 cursor-not-allowed'
                           : 'border-border text-muted-foreground hover:text-foreground hover:bg-secondary'
                     }`}
@@ -860,7 +865,7 @@ function FeedChip({ up }: { up: boolean }) {
                   </button>
                 </span>
               )}
-              {s.id === 'sim' && isSrc && <span className="text-[8px] font-bold text-primary shrink-0">ACTIVE</span>}
+              {isSrc && <span className="text-[8px] font-bold text-primary shrink-0">ACTIVE</span>}
             </div>
           )
         })}
