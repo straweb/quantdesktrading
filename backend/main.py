@@ -46,17 +46,31 @@ async def startup() -> None:
 
     hub = Hub.instance()
     hub.ensure_sim_account()
-    # Round-26: Live-Only (sim_disabled) must survive restarts — the sim feed
-    # stays DISCONNECTED so no synthetic tick can ever flow before the user
-    # picks a live broker source.
+    # Round-27: sim is a PLAIN ACCOUNT — boot connects ONLY the user's
+    # persisted feed source (any account; sim too, when the mode allows it).
+    # No source picked → NOTHING connects; the feed chip shows
+    # "pick an account" and every panel stays empty until the user selects.
     row = db.core().one("SELECT * FROM accounts WHERE broker='sim'")
-    import json as _json
-    creds = _json.loads(row["credentials"] or "{}")
-    if hub.sim_disabled():
-        config.log("boot", "LIVE-ONLY mode active (sim_disabled=1) — sim feed NOT connected; "
-                           "pick a live broker source in the FEED chip")
+    src = hub.feed_source()
+    if src and src.isdigit():
+        acc = db.core().one("SELECT * FROM accounts WHERE id=?", (int(src),))
+        if acc:
+            import json as _json
+            creds = _json.loads(acc["credentials"] or "{}")
+            if acc["broker"] == "sim" and hub.trading_mode() == "live":
+                config.log("boot", "LIVE mode — persisted source is the sim account; "
+                                   "sim engine stays stopped (pick a live broker source)")
+            else:
+                try:
+                    await hub.connect_account(dict(acc), creds)
+                    config.log("boot", f"feed source account#{src} ({acc['label']}) connected")
+                except Exception as e:
+                    config.log("boot", f"feed source account#{src} connect failed: {e} "
+                                       "(reconnect it from the FEED chip / Admin)", "WARN")
+        else:
+            config.log("boot", f"persisted feed source #{src} no longer exists — pick an account")
     else:
-        await hub.connect_account(dict(row), creds)
+        config.log("boot", "no feed source picked — connect an account and select it in the FEED chip")
 
     # seed sim master so search/subscribe works out of the box
     sim = db.broker_db("sim")

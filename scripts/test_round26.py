@@ -136,15 +136,43 @@ hub._src_ts = None
 os.environ.setdefault("SIM_DISABLED_FORCE", "1")
 import sqlite3  # noqa: E402
 cdb = sqlite3.connect(coredb.core().path)
+# Round-27: the gate keys off trading_mode=='live' (the legacy sim_disabled
+# row is now only a mirror kept for the old toggle UI).
 cdb.execute("INSERT INTO settings(key,value) VALUES('sim_disabled','1') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+cdb.execute("INSERT INTO settings(key,value) VALUES('trading_mode','live') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
 cdb.commit()
 cdb.close()
 before = hub._dropped_ticks
 hub._on_broker_tick({"symbol": "NSE:NIFTY", "ltp": 1.0, "source": "sim", "_aid": 19, "ts": 1})
-check("sim tick DROPPED under sim_disabled (stale pin or not)", hub._dropped_ticks == before + 1,
+check("sim tick DROPPED under LIVE mode (stale pin or not)", hub._dropped_ticks == before + 1,
       f"dropped={hub._dropped_ticks} before={before}")
 check("no sim tick entered the cache", "NSE:NIFTY" not in hub.ticks)
+# Round-27: sim is a PLAIN account — its ticks ARE legal when it IS the
+# picked source and the mode is not live.
+cdb = sqlite3.connect(coredb.core().path)
+cdb.execute("INSERT INTO settings(key,value) VALUES('trading_mode','simulation') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+cdb.commit()
+cdb.close()
+hub._src_ts = None
+cdb2 = sqlite3.connect(coredb.core().path)
+srow = cdb2.execute("SELECT id FROM accounts WHERE broker='sim' ORDER BY id LIMIT 1").fetchone()
+cdb2.close()
+if srow:
+    cdb = sqlite3.connect(coredb.core().path)
+    cdb.execute("INSERT INTO settings(key,value) VALUES('feed_source',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(srow[0]),))
+    cdb.commit()
+    cdb.close()
+    hub._src_ts = None
+    hub._on_broker_tick({"symbol": "NSE:SIMPLAIN", "ltp": 7.0, "source": "sim", "_aid": srow[0], "ts": 1})
+    check("sim tick ACCEPTED as picked source in simulation mode (plain account)",
+          hub.ticks.get("NSE:SIMPLAIN", {}).get("ltp") == 7.0,
+          str(hub.ticks.get("NSE:SIMPLAIN")))
+else:
+    print("  (no sim account row — plain-account acceptance check skipped)")
 # 2. explicit live source: sim ticks dropped, source-account ticks accepted,
 #    other-account ticks dropped
 hub._src_aid = 21
@@ -178,6 +206,8 @@ hub.token_map[21] = {"tok1": "NSE:NIFTY"}
 # allow sim as source again for the switch test (clear live-only)
 cdb = sqlite3.connect(coredb.core().path)
 cdb.execute("INSERT INTO settings(key,value) VALUES('sim_disabled','0') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+cdb.execute("INSERT INTO settings(key,value) VALUES('trading_mode','simulation') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
 cdb.commit()
 cdb.close()
