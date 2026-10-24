@@ -1,0 +1,20 @@
+brokers/execution.ts(110,43): error TS2345: Argument of type '{ symbol: string; exchange: string; productType: "MIS" | "CNC" | "NRML"; netQty: number; buyQty: number; sellQty: number; avgPrice: number; realizedPnl: number; ltp: number; lotSize: number; updatedAt: string; }' is not assignable to parameter of type 'PositionRecord & { instrumentType?: string | undefined; }'.
+  Property 'unrealizedPnl' is missing in type '{ symbol: string; exchange: string; productType: "MIS" | "CNC" | "NRML"; netQty: number; buyQty: number; sellQty: number; avgPrice: number; realizedPnl: number; ltp: number; lotSize: number; updatedAt: string; }' but required in type 'PositionRecord'.
+brokers/execution.ts(117,43): error TS2345: Argument of type '{ symbol: string; exchange: string; instrumentType: string; productType: "MIS" | "CNC" | "NRML"; netQty: number; buyQty: number; sellQty: number; avgPrice: number; realizedPnl: number; ltp: number; lotSize: number; updatedAt: string; }' is not assignable to parameter of type 'PositionRecord & { instrumentType?: string | undefined; }'.
+  Property 'unrealizedPnl' is missing in type '{ symbol: string; exchange: string; instrumentType: string; productType: "MIS" | "CNC" | "NRML"; netQty: number; buyQty: number; sellQty: number; avgPrice: number; realizedPnl: number; ltp: number; lotSize: number; updatedAt: string; }' but required in type 'PositionRecord'.
+skills/image-edit/scripts/image-edit.ts(10,4): error TS2561: Object literal may only specify known properties, but 'images' does not exist in type 'CreateImageEditBody'. Did you mean to write 'image'?
+skills/stock-analysis-skill/src/analyzer.ts(253,11): error TS2322: Type '({ type: string; image: { type: "base64"; data: string; mediaType: "image/png"; url?: undefined; } | { type: "url"; url: string; data?: undefined; mediaType?: undefined; }; } | { type: string; text: string; })[]' is not assignable to type 'string'.
+src/app/api/orders/route.ts(16,17): error TS2345: Argument of type '{ accountId: string; accountLabel: string; brokerType: string; id: string; masterOrderId?: string; symbol: string; exchange: string; side: OrderSide; qty: number; filledQty: number; orderType: OrderTypeKind; ... 7 more ...; updatedAt: string; }' is not assignable to parameter of type 'never'.
+src/app/api/orders/route.ts(19,26): error TS2339: Property 'createdAt' does not exist on type 'never'.
+src/app/api/orders/route.ts(19,40): error TS2339: Property 'createdAt' does not exist on type 'never'.
+src/app/api/trades/route.ts(13,17): error TS2345: Argument of type '{ accountId: string; accountLabel: string; brokerType: string; id: string; orderId: string; symbol: string; exchange: string; side: OrderSide; qty: number; price: number; ... 6 more ...; productType?: string; }' is not assignable to parameter of type 'never'.
+src/app/api/trades/route.ts(16,26): error TS2339: Property 'ts' does not exist on type 'never'.
+src/app/api/trades/route.ts(16,33): error TS2339: Property 'ts' does not exist on type 'never'.
+src/app/api/trades/route.ts(18,49): error TS2339: Property 'chargesTotal' does not exist on type 'never'.
+src/app/api/trades/route.ts(19,51): error TS2339: Property 'realizedPnl' does not exist on type 'never'.
+src/components/terminal/admin/admin-view.tsx(392,112): error TS2339: Property 'version' does not exist on type '{ ok: boolean; symbolCount: number; mappedCount: number; }'.
+src/components/terminal/chart/canvas-chart.tsx(492,91): error TS2339: Property 'showADX' does not exist on type 'Props'.
+src/components/terminal/chart/canvas-chart.tsx(580,23): error TS2304: Cannot find name 'useMemo'.
+src/lib/charges.ts(45,28): error TS2339: Property 'brokeragePct' does not exist on type '{ instrumentType: string; productType: string; side: "BUY" | "SELL"; value: number; isExitLeg?: boolean | undefined; }'.
+src/lib/services/order-router.ts(154,7): error TS2322: Type 'string | null' is not assignable to type 'string | undefined'.
+  Type 'null' is not assignable to type 'string | undefined'.

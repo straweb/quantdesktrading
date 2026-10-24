@@ -1,0 +1,678 @@
+     1→import { createServer } from 'http'
+     2→import { Server } from 'socket.io'
+     3→import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync } from 'fs'
+     4→import path from 'path'
+     5→import { spawn } from 'child_process'
+     6→// bun:sqlite — embedded recorder for tick-by-tick session backups
+     7→// (used later for paper trading / replay). Node fallback: not supported.
+     8→// @ts-ignore bun runtime builtin
+     9→import { Database } from 'bun:sqlite'
+    10→
+    11→// ============================================================
+    12→// Market Feed Mini-Service (port 3003, bun runtime)
+    13→// - Simulated tick engine (random walk, per-symbol volatility)
+    14→// - Candle aggregation for 1m/3m/5m/15m/30m/1h/1d
+    15→// - Deterministic historical backfill (3 sessions of 1m bars)
+    16→// - Socket.io streaming for subscribed symbols
+    17→// - REST: health / universe / candles / ltp / quote / depth
+    18→//         /feed-source (active feed account — one at a time)
+    19→// In production this service hosts pluggable feed adapters
+    20→// (Dhan WebSocket, Shoonya WebSocket, ICICI Breeze stream);
+    21→// the sim feed is the default source and the sandbox fallback.
+    22→// ============================================================
+    23→
+    24→interface UniverseEntry {
+    25→  symbol: string
+    26→  basePrice: number
+    27→  lotSize: number
+    28→  instrumentType: string
+    29→}
+    30→
+    31→interface SymbolState {
+    32→  symbol: string
+    33→  instrumentType: string
+    34→  lotSize: number
+    35→  base: number
+    36→  ltp: number
+    37→  prevClose: number
+    38→  open: number
+    39→  high: number
+    40→  low: number
+    41→  vol: number
+    42→  vola: number // per-tick volatility
+    43→  bid: number
+    44→  ask: number
+    45→  lastTickDir: number
+    46→}
+    47→
+    48→interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
+    49→
+    50→const PORT = Number(process.env.PORT || 3003) // socket.io (browser via Caddy)
+    51→const REST_PORT = Number(process.env.REST_PORT || 3004) // REST (Next.js server-side proxy)
+    52→
+    53→// ---------- default universe (before master sync pushes the real one) ----------
+    54→const DEFAULT_UNIVERSE: UniverseEntry[] = [
+    55→  { symbol: 'NIFTY', basePrice: 24500, lotSize: 1, instrumentType: 'INDEX' },
+    56→  { symbol: 'BANKNIFTY', basePrice: 51800, lotSize: 1, instrumentType: 'INDEX' },
+    57→  { symbol: 'SENSEX', basePrice: 81000, lotSize: 1, instrumentType: 'INDEX' },
+    58→  { symbol: 'RELIANCE', basePrice: 2870, lotSize: 250, instrumentType: 'EQ' },
+    59→  { symbol: 'TCS', basePrice: 4150, lotSize: 175, instrumentType: 'EQ' },
+    60→  { symbol: 'HDFCBANK', basePrice: 1740, lotSize: 550, instrumentType: 'EQ' },
+    61→  { symbol: 'INFY', basePrice: 1870, lotSize: 400, instrumentType: 'EQ' },
+    62→  { symbol: 'SBIN', basePrice: 830, lotSize: 750, instrumentType: 'EQ' },
+    63→  { symbol: 'ICICIBANK', basePrice: 1265, lotSize: 700, instrumentType: 'EQ' },
+    64→]
+    65→
+    66→const TF_MS: Record<string, number> = {
+    67→  '1m': 60_000, '3m': 180_000, '5m': 300_000, '15m': 900_000,
+    68→  '30m': 1_800_000, '1h': 3_600_000, '1d': 86_400_000,
+    69→}
+    70→
+    71→// ---------- seeded PRNG for deterministic history ----------
+    72→function mulberry32(seed: number) {
+    73→  return function () {
+    74→    let t = (seed += 0x6d2b79f5)
+    75→    t = Math.imul(t ^ (t >>> 15), t | 1)
+    76→    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    77→    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    78→  }
+    79→}
+    80→
+    81→function hashStr(s: string): number {
+    82→  let h = 5381
+    83→  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
+    84→  return h
+    85→}
+    86→
+    87→function volaFor(instrumentType: string): number {
+    88→  // per-250ms-tick volatility (annualizes to realistic daily moves)
+    89→  if (instrumentType === 'INDEX') return 0.00006
+    90→  if (instrumentType === 'FUT') return 0.0001
+    91→  if (instrumentType === 'CE' || instrumentType === 'PE') return 0.0007
+    92→  return 0.00012
+    93→}
+    94→
+    95→function volaHist(instrumentType: string): number {
+    96→  // per 5s history sub-step
+    97→  if (instrumentType === 'INDEX') return 0.00018
+    98→  if (instrumentType === 'FUT') return 0.0003
+    99→  if (instrumentType === 'CE' || instrumentType === 'PE') return 0.0022
+   100→  return 0.00035
+   101→}
+   102→
+   103→// ---------- state ----------
+   104→const g = globalThis as unknown as {
+   105→  __feedState: {
+   106→    states: Map<string, SymbolState>
+   107→    candles: Map<string, Candle[]> // key symbol|tf
+   108→    subs: Map<string, Set<string>> // socketId -> symbols
+   109→  } | undefined
+   110→}
+   111→
+   112→if (!g.__feedState) {
+   113→  g.__feedState = { states: new Map(), candles: new Map(), subs: new Map() }
+   114→}
+   115→const S = g.__feedState
+   116→
+   117→// ---------- active feed source (persisted; one at a time) ----------
+   118→const FEED_SRC_FILE = process.env.FEED_SRC_FILE || path.resolve(process.cwd(), '../../db/feed-source.json')
+   119→let feedSource = 'sim'
+   120→try {
+   121→  const raw = readFileSync(FEED_SRC_FILE, 'utf8')
+   122→  feedSource = (JSON.parse(raw) as { source?: string }).source ?? 'sim'
+   123→} catch { /* first boot — default 'sim' */ }
+   124→
+   125→// ---------- tick recorder (session live-feed backup) ----------
+   126→// Every tick of the configured symbols is written to a per-session SQLite
+   127→// DB (one file per feed boot, plus a new file when the IST date rolls over).
+   128→// Default: NIFTY + SENSEX. Admin can disable or add symbols via REST/Next API.
+   129→// These archives power the future paper-trading/replay engine.
+   130→const TICK_DIR = path.resolve(process.cwd(), '../../db/ticks')
+   131→const TICK_CFG_FILE = process.env.TICK_CFG_FILE || path.join(TICK_DIR, 'tick-recorder.json')
+   132→
+   133→interface TickCfg { enabled: boolean; symbols: string[] }
+   134→let tickCfg: TickCfg = { enabled: true, symbols: ['NIFTY', 'SENSEX'] }
+   135→try {
+   136→  const raw = readFileSync(TICK_CFG_FILE, 'utf8')
+   137→  const parsed = JSON.parse(raw) as Partial<TickCfg>
+   138→  if (typeof parsed.enabled === 'boolean') tickCfg.enabled = parsed.enabled
+   139→  if (Array.isArray(parsed.symbols)) tickCfg.symbols = parsed.symbols.filter(s => typeof s === 'string').slice(0, 32)
+   140→} catch { /* first boot — defaults */ }
+   141→
+   142→interface TickSession {
+   143→  db: InstanceType<typeof Database> | null
+   144→  file: string
+   145→  startedAt: string
+   146→  istDate: string
+   147→  rows: number
+   148→}
+   149→const gTick = g as unknown as { __tickSession?: TickSession }
+   150→const gTimers = g as unknown as { __tickRecTimer?: ReturnType<typeof setInterval> }
+   151→
+   152→function istDateStr(ts = Date.now()): string {
+   153→  return new Date(ts + 5.5 * 3600_000).toISOString().slice(0, 10)
+   154→}
+   155→
+   156→function openTickSession(): void {
+   157→  if (!gTimers.__tickRecTimer) {
+   158→    gTimers.__tickRecTimer = setInterval(recordTickOnce, 250)
+   159→  }
+   160→  if (!tickCfg.enabled) { closeTickSession(); return }
+   161→  if (gTick.__tickSession) return
+   162→  try {
+   163→    const now = Date.now()
+   164→    const day = istDateStr(now)
+   165→    const dir = path.join(TICK_DIR, day)
+   166→    mkdirSync(dir, { recursive: true })
+   167→    const d = new Date(now + 5.5 * 3600_000)
+   168→    const file = path.join(dir, `session-${d.toISOString().slice(11, 19).replaceAll(':', '')}.db`)
+   169→    const DatabaseAny = Database as unknown as new (p: string) => InstanceType<typeof Database>
+   170→    const dbh = new DatabaseAny(file)
+   171→    dbh.exec(`
+   172→      CREATE TABLE IF NOT EXISTS ticks (
+   173→        ts INTEGER NOT NULL, symbol TEXT NOT NULL, ltp REAL, bid REAL, ask REAL,
+   174→        vol INTEGER, high REAL, low REAL, open REAL, prevClose REAL
+   175→      );
+   176→      CREATE INDEX IF NOT EXISTS ix_ticks_sym_ts ON ticks(symbol, ts);
+   177→      CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+   178→    `)
+   179→    dbh.prepare(`INSERT OR REPLACE INTO meta (k, v) VALUES ('startedAt', ?), ('symbols', ?)`).run(
+   180→      new Date(now).toISOString(), tickCfg.symbols.join(','),
+   181→    )
+   182→    gTick.__tickSession = { db: dbh, file, startedAt: new Date(now).toISOString(), istDate: day, rows: 0 }
+   183→    console.log(`[market-feed] tick recorder ON — session ${file} (${tickCfg.symbols.join(', ')})`)
+   184→  } catch (e) {
+   185→    console.error('[market-feed] tick session open failed:', e)
+   186→  }
+   187→}
+   188→
+   189→function closeTickSession(): void {
+   190→  const s = gTick.__tickSession
+   191→  if (s?.db) { try { s.db.close() } catch { /* ignore */ } }
+   192→  if (s) console.log(`[market-feed] tick session closed (${s.rows} rows) — ${s.file}`)
+   193→  gTick.__tickSession = undefined
+   194→}
+   195→
+   196→function recordTickOnce(): void {
+   197→  const s = gTick.__tickSession
+   198→  if (!tickCfg.enabled) { if (s) closeTickSession(); return }
+   199→  if (!s) { openTickSession(); return }
+   200→  // new IST day -> new session file (a fresh db per trading session)
+   201→  if (s.istDate !== istDateStr()) { closeTickSession(); openTickSession(); return }
+   202→  if (!s.db) return
+   203→  const now = Date.now()
+   204→  const stmt = s.db.prepare(`INSERT INTO ticks (ts, symbol, ltp, bid, ask, vol, high, low, open, prevClose) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+   205→  const many: unknown[][] = []
+   206→  for (const sym of tickCfg.symbols) {
+   207→    const st = S.states.get(sym)
+   208→    if (!st) continue
+   209→    many.push([now, sym, st.ltp, st.bid, st.ask, st.vol, st.high, st.low, st.open, st.prevClose])
+   210→  }
+   211→  if (many.length === 0) return
+   212→  try {
+   213→    s.db.transaction(() => { for (const r of many) stmt.run(...(r as [unknown])) })()
+   214→    s.rows += many.length
+   215→  } catch (e) {
+   216→    console.error('[market-feed] tick write failed:', e)
+   217→  }
+   218→}
+   219→
+   220→function tickSessionInfo() {
+   221→  const s = gTick.__tickSession
+   222→  return s
+   223→    ? { file: s.file, startedAt: s.startedAt, rows: s.rows }
+   224→    : null
+   225→}
+   226→
+   227→function listTickSessions(): { file: string; bytes: number; mtime: string }[] {
+   228→  const out: { file: string; bytes: number; mtime: string }[] = []
+   229→  try {
+   230→    if (!existsSync(TICK_DIR)) return out
+   231→    for (const day of readdirSync(TICK_DIR)) {
+   232→      const dayDir = path.join(TICK_DIR, day)
+   233→      for (const f of readdirSync(dayDir)) {
+   234→        if (!f.endsWith('.db')) continue
+   235→        const p = path.join(dayDir, f)
+   236→        const stt = statSync(p)
+   237→        out.push({ file: path.relative(path.resolve(process.cwd(), '../..'), p), bytes: stt.size, mtime: stt.mtime.toISOString() })
+   238→      }
+   239→    }
+   240→  } catch { /* ignore */ }
+   241→  return out.sort((a, b) => (a.file < b.file ? 1 : -1)).slice(0, 40)
+   242→}
+   243→
+   244→// ---------- sidecar supervisor: keep the Next.js dev server alive ----------
+   245→// This service is boot-spawned and outlives agent tool sessions (whose spawned
+   246→// processes get reaped at session boundaries), so it doubles as the dev-server
+   247→// watchdog: whenever :3000 stops answering, respawn `bun run dev` detached.
+   248→const PROJECT_ROOT = path.resolve(process.cwd(), '../..')
+   249→let devStarting = false
+   250→
+   251→async function devHealthy(): Promise<boolean> {
+   252→  try {
+   253→    const r = await fetch('http://localhost:3000/api/auth/me', { signal: AbortSignal.timeout(2500) })
+   254→    return r.status < 500 // any HTTP response means the server is up
+   255→  } catch {
+   256→    return false
+   257→  }
+   258→}
+   259→
+   260→function spawnDevServer() {
+   261→  if (devStarting) return
+   262→  devStarting = true
+   263→  console.log('[market-feed] :3000 down — spawning Next.js dev server…')
+   264→  try {
+   265→    const child = spawn('bun', ['run', 'dev'], {
+   266→      cwd: PROJECT_ROOT,
+   267→      detached: true,
+   268→      stdio: 'ignore',
+   269→      // our own env may carry PORT=3003 — the dev script binds :3000 via -p
+   270→      env: { ...process.env, PORT: '3000' },
+   271→    })
+   272→    child.unref()
+   273→    child.on('error', e => console.error('[market-feed] dev spawn error:', e.message))
+   274→  } catch (e) {
+   275→    console.error('[market-feed] dev spawn failed:', e)
+   276→  } finally {
+   277→    // cooldown so a crashing server cannot trigger a tight respawn loop
+   278→    setTimeout(() => { devStarting = false }, 20_000)
+   279→  }
+   280→}
+   281→
+   282→// watchdog itself is registered in the single-owner timer block at the bottom
+   283→// of this file (survives hot reloads without stacking)
+   284→
+   285→const DAYS_BACK = 3
+   286→
+   287→function bucketStart(ts: number, tf: string): number {
+   288→  const ms = TF_MS[tf] ?? 60000
+   289→  return Math.floor(ts / ms) * ms
+   290→}
+   291→
+   292→function buildHistory(entry: UniverseEntry) {
+   293→  const rnd = mulberry32(hashStr(entry.symbol) % 2 ** 31)
+   294→  // independent stream for volume so adding index volume never perturbs the
+   295→  // deterministic price path (same rnd() call sequence as before)
+   296→  const vrnd = mulberry32((hashStr(entry.symbol) ^ 0x9e3779b9) >>> 0)
+   297→  const vola = volaHist(entry.instrumentType)
+   298→  const now = Date.now()
+   299→  const oneMin = TF_MS['1m']
+   300→  const startTs = bucketStart(now, '1m') - DAYS_BACK * 24 * 3600_000
+   301→  const bars: Candle[] = []
+   302→  let price = entry.basePrice * (0.995 + rnd() * 0.01)
+   303→  const MEAN_REV = 0.0006
+   304→
+   305→  for (let t = startTs; t <= bucketStart(now, '1m'); t += oneMin) {
+   306→    const o = price
+   307→    let h = o, l = o, c = o
+   308→    // 12 sub-steps per minute
+   309→    for (let i = 0; i < 12; i++) {
+   310→      const shock = (rnd() - 0.5) * 2 * vola
+   311→      c = c * (1 + shock + MEAN_REV * (entry.basePrice - c) / entry.basePrice)
+   312→      h = Math.max(h, c)
+   313→      l = Math.min(l, c)
+   314→    }
+   315→    const v = Math.round((entry.instrumentType === 'INDEX' ? 2200 + vrnd() * 19000 : 400 + vrnd() * 2600) * (entry.lotSize > 1 ? 1 : 8))
+   316→    bars.push({ t, o: r2(o), h: r2(h), l: r2(l), c: r2(c), v })
+   317→    price = c
+   318→  }
+   319→  S.candles.set(`${entry.symbol}|1m`, bars)
+   320→  return { last: bars[bars.length - 1]?.c ?? entry.basePrice, prevDayClose: entry.basePrice * 0.997 }
+   321→}
+   322→
+   323→function r2(n: number) { return Math.round(n * 100) / 100 }
+   324→
+   325→function loadUniverse(list: UniverseEntry[]) {
+   326→  for (const e of list) {
+   327→    if (S.states.has(e.symbol)) continue
+   328→    const { last, prevDayClose } = buildHistory(e)
+   329→    const bars = S.candles.get(`${e.symbol}|1m`)!
+   330→    const todayBars = bars.slice(-375)
+   331→    S.states.set(e.symbol, {
+   332→      symbol: e.symbol,
+   333→      instrumentType: e.instrumentType,
+   334→      lotSize: e.lotSize,
+   335→      base: e.basePrice,
+   336→      ltp: last,
+   337→      prevClose: r2(prevDayClose),
+   338→      open: todayBars[0]?.o ?? last,
+   339→      high: Math.max(...todayBars.map(b => b.h)),
+   340→      low: Math.min(...todayBars.map(b => b.l)),
+   341→      vol: todayBars.reduce((s, b) => s + b.v, 0),
+   342→      vola: volaFor(e.instrumentType),
+   343→      bid: r2(last * 0.9995),
+   344→      ask: r2(last * 1.0005),
+   345→      lastTickDir: 1,
+   346→    })
+   347→  }
+   348→}
+   349→
+   350→// aggregate 1m -> tf (cached arrays appended on rollover)
+   351→function getSeries(symbol: string, tf: string): Candle[] {
+   352→  const key = `${symbol}|${tf}`
+   353→  if (tf === '1m') return S.candles.get(key) ?? []
+   354→  const base = S.candles.get(`${symbol}|1m`) ?? []
+   355→  let series = S.candles.get(key)
+   356→  if (!series) {
+   357→    series = aggregate(base, tf)
+   358→    S.candles.set(key, series)
+   359→  }
+   360→  return series
+   361→}
+   362→
+   363→function aggregate(base: Candle[], tf: string): Candle[] {
+   364→  const ms = TF_MS[tf]
+   365→  const out: Candle[] = []
+   366→  let cur: Candle | null = null
+   367→  for (const b of base) {
+   368→    const bs = bucketStart(b.t, tf)
+   369→    if (!cur || cur.t !== bs) {
+   370→      if (cur) out.push(cur)
+   371→      cur = { t: bs, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }
+   372→    } else {
+   373→      cur.h = Math.max(cur.h, b.h)
+   374→      cur.l = Math.min(cur.l, b.l)
+   375→      cur.c = b.c
+   376→      cur.v += b.v
+   377→    }
+   378→  }
+   379→  if (cur) out.push(cur)
+   380→  return out
+   381→}
+   382→
+   383→// ---------- tick engine ----------
+   384→function tickOnce() {
+   385→  const now = Date.now()
+   386→  for (const st of S.states.values()) {
+   387→    const shock = (Math.random() - 0.5) * 2 * st.vola
+   388→    const meanRev = (st.base - st.ltp) / st.base * 0.0006
+   389→    st.ltp = r2(st.ltp * (1 + shock + meanRev))
+   390→    st.lastTickDir = shock >= 0 ? 1 : -1
+   391→    st.high = Math.max(st.high, st.ltp)
+   392→    st.low = Math.min(st.low, st.ltp)
+   393→    st.bid = r2(st.ltp - Math.max(0.05, st.ltp * 0.0004))
+   394→    st.ask = r2(st.ltp + Math.max(0.05, st.ltp * 0.0004))
+   395→    // per-tick traded volume — EQ/FUT/OPT scale with lot size, indices get a
+   396→    // synthetic flow calibrated to match the historical per-minute volumes
+   397→    // (history: ~2200-21000/min for INDEX, ~3200-24000/min for lot>1 EQ)
+   398→    const dv = st.instrumentType !== 'INDEX'
+   399→      ? Math.round(Math.random() * st.lotSize * 2)
+   400→      : Math.round(10 + Math.random() * 60)
+   401→    st.vol += dv
+   402→
+   403→    // update 1m candle
+   404→    const key = `${st.symbol}|1m`
+   405→    const bars = S.candles.get(key)
+   406→    if (bars) {
+   407→      const bs = bucketStart(now, '1m')
+   408→      let cur = bars[bars.length - 1]
+   409→      if (!cur || cur.t !== bs) {
+   410→        cur = { t: bs, o: st.ltp, h: st.ltp, l: st.ltp, c: st.ltp, v: dv }
+   411→        bars.push(cur)
+   412→        // keep memory bounded
+   413→        if (bars.length > DAYS_BACK * 1440 + 500) bars.splice(0, 200)
+   414→        // invalidate higher tf caches lazily (they re-aggregate tail)
+   415→        for (const tf of Object.keys(TF_MS)) {
+   416→          if (tf === '1m') continue
+   417→          const sk = `${st.symbol}|${tf}`
+   418→          const series = S.candles.get(sk)
+   419→          if (series) {
+   420→            const b2 = bucketStart(now, tf)
+   421→            const last2 = series[series.length - 1]
+   422→            if (last2 && last2.t === b2) {
+   423→              last2.h = Math.max(last2.h, st.ltp)
+   424→              last2.l = Math.min(last2.l, st.ltp)
+   425→              last2.c = st.ltp
+   426→              last2.v += dv
+   427→            } else {
+   428→              series.push({ t: b2, o: st.ltp, h: st.ltp, l: st.ltp, c: st.ltp, v: dv })
+   429→            }
+   430→          }
+   431→        }
+   432→      } else {
+   433→        cur.h = Math.max(cur.h, st.ltp)
+   434→        cur.l = Math.min(cur.l, st.ltp)
+   435→        cur.c = st.ltp
+   436→        cur.v += dv
+   437→      }
+   438→    }
+   439→  }
+   440→}
+   441→
+   442→function subscribedSymbols(): Set<string> {
+   443→  const set = new Set<string>()
+   444→  for (const syms of S.subs.values()) for (const s of syms) set.add(s)
+   445→  return set
+   446→}
+   447→
+   448→// ---------- http server ----------
+   449→const httpServer = createServer((req, res) => {
+   450→  const url = new URL(req.url ?? '/', `http://localhost:${PORT}`)
+   451→  res.setHeader('Access-Control-Allow-Origin', '*')
+   452→  res.setHeader('Content-Type', 'application/json')
+   453→
+   454→  const json = (code: number, obj: unknown) => {
+   455→    res.statusCode = code
+   456→    res.end(JSON.stringify(obj))
+   457→  }
+   458→
+   459→  if (url.pathname === '/health') return json(200, { ok: true, symbols: S.states.size, ts: Date.now() })
+   460→
+   461→  // ---- tick recorder config (session live-feed backup) ----
+   462→  if (url.pathname === '/tick-config') {
+   463→    if (req.method === 'POST') {
+   464→      let body = ''
+   465→      req.on('data', c => (body += c))
+   466→      req.on('end', () => {
+   467→        try {
+   468→          const b = JSON.parse(body) as Partial<TickCfg>
+   469→          if (typeof b.enabled === 'boolean') tickCfg.enabled = b.enabled
+   470→          if (Array.isArray(b.symbols)) {
+   471→            tickCfg.symbols = b.symbols.filter(s => typeof s === 'string' && s.trim()).map(s => s.trim().toUpperCase()).slice(0, 32)
+   472→          }
+   473→          try {
+   474→            mkdirSync(path.dirname(TICK_CFG_FILE), { recursive: true })
+   475→            writeFileSync(TICK_CFG_FILE, JSON.stringify(tickCfg, null, 2))
+   476→          } catch (e) { console.error('[market-feed] tick-config persist failed:', e) }
+   477→          if (tickCfg.enabled) openTickSession()
+   478→          else closeTickSession()
+   479→          console.log(`[market-feed] tick recorder config: enabled=${tickCfg.enabled} symbols=[${tickCfg.symbols.join(',')}]`)
+   480→          json(200, { ok: true, ...tickCfg, session: tickSessionInfo() })
+   481→        } catch (e) { json(400, { ok: false, error: String(e) }) }
+   482→      })
+   483→      return
+   484→    }
+   485→    return json(200, { ...tickCfg, session: tickSessionInfo() })
+   486→  }
+   487→
+   488→  if (url.pathname === '/tick-sessions') {
+   489→    return json(200, { sessions: listTickSessions(), current: tickSessionInfo() })
+   490→  }
+   491→
+   492→  // tick sample replay — future paper-trading input:
+   493→  // GET /tick-sample?file=db/ticks/2026-10-21/session-091500.db&symbol=NIFTY&limit=200&from=0
+   494→  if (url.pathname === '/tick-sample') {
+   495→    const file = url.searchParams.get('file') ?? ''
+   496→    const symbol = url.searchParams.get('symbol') ?? ''
+   497→    const limit = Math.min(5000, Number(url.searchParams.get('limit') ?? 500))
+   498→    const from = Math.max(0, Number(url.searchParams.get('from') ?? 0))
+   499→    if (!file || !file.includes('db/ticks') || file.includes('..')) return json(400, { error: 'file required' })
+   500→    try {
+   501→      const DatabaseAny = Database as unknown as new (p: string, ro: boolean) => InstanceType<typeof Database>
+   502→      const dbh = new DatabaseAny(path.resolve(process.cwd(), '../..', file), true)
+   503→      const rows = symbol
+   504→        ? dbh.prepare('SELECT * FROM ticks WHERE symbol = ? ORDER BY ts LIMIT ? OFFSET ?').all(symbol, limit, from)
+   505→        : dbh.prepare('SELECT * FROM ticks ORDER BY ts LIMIT ? OFFSET ?').all(limit, from)
+   506→      dbh.close()
+   507→      return json(200, { file, count: rows.length, ticks: rows })
+   508→    } catch (e) { return json(500, { error: String(e) }) }
+   509→  }
+   510→
+   511→  // ---- active feed source (which account the terminal pulls data from) ----
+   512→  // Persisted to a shared JSON file so the Next.js API can read/write it too.
+   513→  // 'sim' = built-in simulated feed; otherwise a BrokerAccount id whose
+   514→  // adapter websocket is used when that broker feed is connected.
+   515→  if (url.pathname === '/feed-source') {
+   516→    if (req.method === 'POST') {
+   517→      let body = ''
+   518→      req.on('data', c => (body += c))
+   519→      req.on('end', () => {
+   520→        try {
+   521→          const { source } = JSON.parse(body) as { source?: string }
+   522→          if (!source || typeof source !== 'string') return json(400, { ok: false, error: 'source required' })
+   523→          feedSource = source
+   524→          try {
+   525→            mkdirSync(path.dirname(FEED_SRC_FILE), { recursive: true })
+   526→            writeFileSync(FEED_SRC_FILE, JSON.stringify({ source: feedSource, updatedAt: new Date().toISOString() }, null, 2))
+   527→          } catch (e) {
+   528→            console.error('[market-feed] feed-source persist failed:', e)
+   529→          }
+   530→          console.log(`[market-feed] feed source -> ${feedSource}`)
+   531→          json(200, { ok: true, source: feedSource })
+   532→        } catch (e) {
+   533→          json(400, { ok: false, error: String(e) })
+   534→        }
+   535→      })
+   536→      return
+   537→    }
+   538→    return json(200, { source: feedSource })
+   539→  }
+   540→
+   541→  if (url.pathname === '/universe') {
+   542→    if (req.method === 'POST') {
+   543→      let body = ''
+   544→      req.on('data', c => (body += c))
+   545→      req.on('end', () => {
+   546→        try {
+   547→          const { universe } = JSON.parse(body) as { universe: UniverseEntry[] }
+   548→          loadUniverse(universe)
+   549→          json(200, { ok: true, symbols: S.states.size })
+   550→        } catch (e) {
+   551→          json(400, { ok: false, error: String(e) })
+   552→        }
+   553→      })
+   554→      return
+   555→    }
+   556→    return json(200, { universe: [...S.states.values()].map(s => ({ symbol: s.symbol, basePrice: s.ltp, lotSize: s.lotSize, instrumentType: s.instrumentType })) })
+   557→  }
+   558→
+   559→  if (url.pathname === '/ltp') {
+   560→    const symbols = (url.searchParams.get('symbols') ?? '').split(',').filter(Boolean)
+   561→    const quotes: Record<string, unknown> = {}
+   562→    for (const s of symbols) {
+   563→      const st = S.states.get(s)
+   564→      if (st) {
+   565→        quotes[s] = { symbol: s, ltp: st.ltp, prevClose: st.prevClose, open: st.open, high: st.high, low: st.low, vol: st.vol, ts: Date.now() }
+   566→      }
+   567→    }
+   568→    return json(200, { quotes })
+   569→  }
+   570→
+   571→  if (url.pathname === '/quote') {
+   572→    const s = url.searchParams.get('symbol') ?? ''
+   573→    const st = S.states.get(s)
+   574→    if (!st) return json(404, { error: 'unknown symbol' })
+   575→    return json(200, {
+   576→      symbol: s, ltp: st.ltp, prevClose: st.prevClose, open: st.open, high: st.high, low: st.low, vol: st.vol,
+   577→      bid: st.bid, ask: st.ask,
+   578→      depth: {
+   579→        buys: [0, 1, 2, 3, 4].map(i => ({ price: r2(st.bid - i * (st.ltp * 0.0005 + 0.05)), qty: Math.round(50 + Math.random() * 900) })),
+   580→        sells: [0, 1, 2, 3, 4].map(i => ({ price: r2(st.ask + i * (st.ltp * 0.0005 + 0.05)), qty: Math.round(50 + Math.random() * 900) })),
+   581→      },
+   582→      ts: Date.now(),
+   583→    })
+   584→  }
+   585→
+   586→  if (url.pathname === '/candles') {
+   587→    const symbol = url.searchParams.get('symbol') ?? ''
+   588→    const tf = url.searchParams.get('tf') ?? '5m'
+   589→    const limit = Math.min(3000, Number(url.searchParams.get('limit') ?? 500))
+   590→    if (!S.states.has(symbol)) return json(404, { error: `unknown symbol ${symbol}` })
+   591→    const series = getSeries(symbol, tf)
+   592→    return json(200, { symbol, tf, candles: series.slice(-limit) })
+   593→  }
+   594→
+   595→  json(404, { error: 'not found' })
+   596→})
+   597→
+   598→// ---------- socket server (socket.io, path '/' per gateway convention) ----------
+   599→const socketServer = createServer()
+   600→
+   601→const io = new Server(socketServer, {
+   602→  path: '/',
+   603→  cors: { origin: '*', methods: ['GET', 'POST'] },
+   604→  pingTimeout: 60000,
+   605→  pingInterval: 25000,
+   606→})
+   607→
+   608→io.on('connection', socket => {
+   609→  S.subs.set(socket.id, new Set())
+   610→
+   611→  socket.on('subscribe', (symbols: string[]) => {
+   612→    const set = S.subs.get(socket.id)
+   613→    if (set) for (const s of symbols || []) set.add(s)
+   614→    socket.emit('subscribed', { symbols, count: set?.size ?? 0 })
+   615→  })
+   616→
+   617→  socket.on('unsubscribe', (symbols: string[]) => {
+   618→    const set = S.subs.get(socket.id)
+   619→    if (set) for (const s of symbols || []) set.delete(s)
+   620→  })
+   621→
+   622→  socket.on('disconnect', () => S.subs.delete(socket.id))
+   623→})
+   624→
+   625→loadUniverse(DEFAULT_UNIVERSE)
+   626→
+   627→// ---- timers: bun --hot stacks intervals across reloads — deregister the
+   628→// previous module's loops first (globalThis survives hot reloads) ----
+   629→interface HotTimers { tick?: ReturnType<typeof setInterval>; stream?: ReturnType<typeof setInterval>; watch?: ReturnType<typeof setInterval>; tickRec?: ReturnType<typeof setInterval> }
+   630→const hot = g as unknown as { __feedTimers?: HotTimers }
+   631→if (hot.__feedTimers) {
+   632→  if (hot.__feedTimers.tick) clearInterval(hot.__feedTimers.tick)
+   633→  if (hot.__feedTimers.stream) clearInterval(hot.__feedTimers.stream)
+   634→  if (hot.__feedTimers.watch) clearInterval(hot.__feedTimers.watch)
+   635→  if (hot.__feedTimers.tickRec) clearInterval(hot.__feedTimers.tickRec)
+   636→}
+   637→hot.__feedTimers = {}
+   638→// the tick-recorder loop registers itself via gTimers.__tickRecTimer inside
+   639→// openTickSession() — clear any stale one left by a previous module instance
+   640→if (gTimers.__tickRecTimer) clearInterval(gTimers.__tickRecTimer)
+   641→gTimers.__tickRecTimer = undefined
+   642→
+   643→// ---- tick recorder: open the session DB if enabled (after timer cleanup) ----
+   644→if (tickCfg.enabled) openTickSession()
+   645→
+   646→// tick loop 250ms — streams subscribed symbols
+   647→hot.__feedTimers.tick = setInterval(tickOnce, 250)
+   648→hot.__feedTimers.stream = setInterval(() => {
+   649→  const syms = subscribedSymbols()
+   650→  if (syms.size === 0) return
+   651→  const ticks: unknown[] = []
+   652→  const now = Date.now()
+   653→  for (const s of syms) {
+   654→    const st = S.states.get(s)
+   655→    if (!st) continue
+   656→    ticks.push({ symbol: s, ltp: st.ltp, prevClose: st.prevClose, open: st.open, high: st.high, low: st.low, vol: st.vol, bid: st.bid, ask: st.ask, ts: now })
+   657→  }
+   658→  if (ticks.length) io.emit('ticks', ticks)
+   659→}, 250)
+   660→
+   661→// dev-server watchdog — every 10s, respawn `bun run dev` when :3000 is dark
+   662→hot.__feedTimers.watch = setInterval(() => {
+   663→  void devHealthy().then(up => { if (!up) spawnDevServer() })
+   664→}, 10_000)
+   665→
+   666→httpServer.listen(REST_PORT, () => {
+   667→  console.log(`[market-feed] REST listening on :${REST_PORT} with ${S.states.size} symbols`)
+   668→})
+   669→socketServer.on('error', e => console.error('[market-feed] socket.io error:', (e as Error).message))
+   670→httpServer.on('error', e => console.error('[market-feed] REST error:', (e as Error).message))
+   671→socketServer.listen(PORT, () => {
+   672→  console.log(`[market-feed] socket.io listening on :${PORT}`)
+   673→})
+   674→
+   675→process.on('SIGTERM', () => { httpServer.close(() => process.exit(0)); socketServer.close(() => process.exit(0)) })
+   676→process.on('SIGINT', () => { httpServer.close(() => process.exit(0)); socketServer.close(() => process.exit(0)) })
+   677→// reload-probe 1792602789
+   678→

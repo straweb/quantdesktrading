@@ -1,0 +1,907 @@
+     1→     1→'use client'
+     2→     2→
+     3→     3→import { useEffect, useState } from 'react'
+     4→     4→import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
+     5→     5→import { Activity, SquareTerminal, Settings2, Bot, LogOut, CircleDot, Trophy, LayoutDashboard, Link2, Unlink, Radio, Pencil, RefreshCw, Wallet } from 'lucide-react'
+     6→     6→import { Button } from '@/components/ui/button'
+     7→     7→import { Input } from '@/components/ui/input'
+     8→     8→import { Slider } from '@/components/ui/slider'
+     9→     9→import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+    10→    10→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+    11→    11→import { Switch } from '@/components/ui/switch'
+    12→    12→import { toast } from 'sonner'
+    13→    13→import { api } from './lib/client-api'
+    14→    14→import type { AccountRow } from './lib/client-api'
+    15→    15→import { useTerminal, type AppView } from './lib/store'
+    16→    16→import { onFeedStatus, ensureSocket } from './lib/socket'
+    17→    17→import { useSyncChannel, type SyncCore, type SyncAdmin } from './lib/sync'
+    18→    18→import { TerminalView } from './terminal-view'
+    19→    19→import { AdminView } from './admin/admin-view'
+    20→    20→import { StrategyView } from './strategy/strategy-view'
+    21→    21→import { DashboardView } from './dashboard/dashboard-view'
+    22→    22→import { CAPITAL_MODES } from '@/lib/types'
+    23→    23→import type { CapitalMode } from '@/lib/types'
+    24→    24→
+    25→    25→const MODE_SHORT: Record<CapitalMode, string> = {
+    26→    26→  PROFIT_ONLY: 'Profit only',
+    27→    27→  INITIAL_PLUS_PNL: 'Initial + PnL',
+    28→    28→  INITIAL_WITH_LOSS_REDUCTION: 'Initial − losses',
+    29→    29→}
+    30→    30→
+    31→    31→function fmtCompact(n: number | null | undefined): string {
+    32→    32→  if (n == null || isNaN(n)) return '—'
+    33→    33→  const abs = Math.abs(n)
+    34→    34→  if (abs >= 1e7) return `₹${(n / 1e7).toFixed(2)}Cr`
+    35→    35→  if (abs >= 1e5) return `₹${(n / 1e5).toFixed(2)}L`
+    36→    36→  if (abs >= 1000) return `₹${(n / 1000).toFixed(1)}k`
+    37→    37→  return `₹${Math.round(n)}`
+    38→    38→}
+    39→    39→
+    40→    40→/** Slider max for the fixed-₹ capital editor — ~125% of the account's
+    41→    41→ *  available cash (or ₹10L when cash is unknown), rounded to a clean step. */
+    42→    42→function fixedSliderMax(cash: number | null | undefined): number {
+    43→    43→  const base = Math.max(100_000, Math.ceil(((cash ?? 0) * 1.25) / 50_000) * 50_000)
+    44→    44→  return Math.max(base, 1_000_000)
+    45→    45→}
+    46→    46→
+    47→    47→/** Round a rupee slider position to a clean step value. */
+    48→    48→function snapStep(v: number, step = 5_000): number {
+    49→    49→  return Math.round(v / step) * step
+    50→    50→}
+    51→    51→
+    52→    52→// broker icon glyph + tint — replaces the full account label on the chip
+    53→    53→// (saves horizontal space; the label lives in the tooltip + popover)
+    54→    54→const BROKER_ICON: Record<string, { glyph: string; cls: string }> = {
+    55→    55→  SIMFEED: { glyph: '⚡', cls: 'bg-slate-500/25 text-slate-300' },
+    56→    56→  DHAN: { glyph: 'D', cls: 'bg-[#3b82f6]/25 text-[#60a5fa]' },
+    57→    57→  SHOONYA: { glyph: 'S', cls: 'bg-[#8b5cf6]/25 text-[#a78bfa]' },
+    58→    58→  ICICI_BREEZE: { glyph: 'iB', cls: 'bg-[#f97316]/25 text-[#fb923c]' },
+    59→    59→}
+    60→    60→function brokerIcon(brokerType: string) {
+    61→    61→  return BROKER_ICON[brokerType] ?? { glyph: brokerType.slice(0, 1) ?? '?', cls: 'bg-secondary text-muted-foreground' }
+    62→    62→}
+    63→    63→
+    64→    64→const qc = new QueryClient({
+    65→    65→  defaultOptions: { queries: { retry: 1, staleTime: 1000 } },
+    66→    66→})
+    67→    67→
+    68→    68→export function TradingTerminalApp() {
+    69→    69→  return (
+    70→    70→    <QueryClientProvider client={qc}>
+    71→    71→      <Shell />
+    72→    72→    </QueryClientProvider>
+    73→    73→  )
+    74→    74→}
+    75→    75→
+    76→    76→function Shell() {
+    77→    77→  const [user, setUser] = useState<string | null | undefined>(undefined)
+    78→    78→  const [feedUp, setFeedUp] = useState(true)
+    79→    79→  const [now, setNow] = useState('')
+    80→    80→  const setView = useTerminal(s => s.setView)
+    81→    81→  const view = useTerminal(s => s.view)
+    82→    82→
+    83→    83→  useEffect(() => {
+    84→    84→    // rehydrate persisted workspaces AFTER first render — prevents the
+    85→    85→    // React hydration mismatch ("attributes of the server rendered HTML
+    86→    86→    // didn't match the client properties") caused by localStorage state
+    87→    87→    // diverging from server-rendered defaults.
+    88→    88→    void useTerminal.persist.rehydrate()
+    89→    89→    // debug/E2E hook (harmless in prod)
+    90→    90→    ;(window as unknown as { __qdStore?: typeof useTerminal }).__qdStore = useTerminal
+    91→    91→    api.me().then(r => setUser(r.user)).catch(() => setUser(null))
+    92→    92→    ensureSocket()
+    93→    93→    return onFeedStatus(setFeedUp)
+    94→    94→  }, [])
+    95→    95→
+    96→    96→  useEffect(() => {
+    97→    97→    const iv = setInterval(() => setNow(new Date().toLocaleTimeString('en-IN', { hour12: false })), 1000)
+    98→    98→    return () => clearInterval(iv)
+    99→    99→  }, [])
+   100→   100→
+   101→   101→  if (user === undefined) {
+   102→   102→    return <div className="h-full flex items-center justify-center text-sm text-muted-foreground">Loading terminal…</div>
+   103→   103→  }
+   104→   104→  if (!user) return <LoginGate onLogin={() => api.me().then(r => setUser(r.user))} />
+   105→   105→
+   106→   106→  return (
+   107→   107→    <div className="h-full flex flex-col">
+   108→   108→      {/* top bar */}
+   109→   109→      <header className="flex items-center gap-3 px-3 h-10 border-b border-border bg-card shrink-0">
+   110→   110→        <div className="flex items-center gap-1.5">
+   111→   111→          <Activity className="h-4 w-4 text-primary" />
+   112→   112→          <span className="text-sm font-bold tracking-tight">QuantDesk</span>
+   113→   113→          <span className="text-[9px] text-muted-foreground mt-0.5">multi-broker terminal</span>
+   114→   114→        </div>
+   115→   115→
+   116→   116→        <nav className="flex items-center gap-1 ml-4">
+   117→   117→          {([
+   118→   118→            ['terminal', 'Terminal', SquareTerminal],
+   119→   119→            ['dashboard', 'Dashboard', LayoutDashboard],
+   120→   120→            ['strategy', 'Strategy Builder', Bot],
+   121→   121→            ['admin', 'Admin', Settings2],
+   122→   122→          ] as [AppView, string, typeof SquareTerminal][]).map(([v, label, Icon]) => (
+   123→   123→            <button
+   124→   124→              key={v}
+   125→   125→              onClick={() => setView(v)}
+   126→   126→              className={`flex items-center gap-1 px-2.5 py-1 rounded text-[11px] transition-colors ${
+   127→   127→                view === v ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'
+   128→   128→              }`}
+   129→   129→            >
+   130→   130→              <Icon className="h-3 w-3" /> {label}
+   131→   131→            </button>
+   132→   132→          ))}
+   133→   133→        </nav>
+   134→   134→
+   135→   135→        <div className="flex-1" />
+   136→   136→
+   137→   137→        {/* per-account capital chips — quick enable + capital sizing */}
+   138→   138→        <CapitalChips />
+   139→   139→        <SessionStatsChip />
+   140→   140→
+   141→   141→        <div className="flex items-center gap-2 text-[10px]">
+   142→   142→          <FeedChip up={feedUp} />
+   143→   143→          <span className="tabular text-muted-foreground">{now} IST</span>
+   144→   144→          <Button variant="ghost" size="sm" className="h-6 px-2 text-[10px]" onClick={() => api.logout().then(() => setUser(null))}>
+   145→   145→            <LogOut className="h-3 w-3" /> admin
+   146→   146→          </Button>
+   147→   147→        </div>
+   148→   148→      </header>
+   149→   149→
+   150→   150→      {/* body */}
+   151→   151→      <main className="flex-1 min-h-0">
+   152→   152→        {view === 'terminal' && <TerminalView />}
+   153→   153→        {view === 'admin' && <AdminView />}
+   154→   154→        {view === 'strategy' && <StrategyView />}
+   155→   155→        {view === 'dashboard' && <DashboardView />}
+   156→   156→      </main>
+   157→   157→    </div>
+   158→   158→  )
+   159→   159→}
+   160→   160→
+   161→   161→// ------------------------------------------------------------
+   162→   162→// Capital chips (top-right): one chip per broker account.
+   163→   163→// Click a chip to enable/disable order routing and edit the
+   164→   164→// account's capital sizing (initial capital + house mode).
+   165→   165→// ------------------------------------------------------------
+   166→   166→function CapitalChips() {
+   167→   167→  // realtime: sync:core pushes accounts every 1s (fallback: REST when the
+   168→   168→  // feed socket has never delivered a payload)
+   169→   169→  const sync = useSyncChannel<SyncCore>('sync:core')
+   170→   170→  const { data } = useQuery({
+   171→   171→    queryKey: ['accounts'],
+   172→   172→    queryFn: () => api.accounts(),
+   173→   173→    enabled: !sync,
+   174→   174→    refetchInterval: 3000,
+   175→   175→  })
+   176→   176→  const accounts: AccountRow[] = sync?.accounts
+   177→   177→    ? (sync.accounts as unknown as AccountRow[])
+   178→   178→    : (data?.accounts ?? [])
+   179→   179→  if (accounts.length === 0) return null
+   180→   180→  return (
+   181→   181→    <div className="flex items-center gap-1 max-w-[44vw] overflow-x-auto py-0.5">
+   182→   182→      {accounts.map(a => <CapitalChip key={a.id} acc={a} />)}
+   183→   183→    </div>
+   184→   184→  )
+   185→   185→}
+   186→   186→
+   187→   187→function CapitalChip({ acc }: { acc: AccountRow }) {
+   188→   188→  const qc = useQueryClient()
+   189→   189→  const [open, setOpen] = useState(false)
+   190→   190→  const [capital, setCapital] = useState(String(acc.initialCapitalFixed ?? acc.initialCapital))
+   191→   191→  const [pct, setPct] = useState(String(acc.capitalPct ?? 100))
+   192→   192→  const [base, setBase] = useState<'FIXED' | 'AVAILABLE_CASH_PCT'>(acc.capitalBase ?? 'FIXED')
+   193→   193→  const [mode, setMode] = useState<CapitalMode>(acc.mode ?? 'INITIAL_PLUS_PNL')
+   194→   194→  const [busy, setBusy] = useState(false)
+   195→   195→
+   196→   196→  // (re)seed the editor fields each time the popover opens — avoids the
+   197→   197→  // setState-in-effect cascade lint rule
+   198→   198→  const openEditor = (next: boolean) => {
+   199→   199→    setOpen(next)
+   200→   200→    if (next) {
+   201→   201→      setCapital(String(acc.initialCapitalFixed ?? acc.initialCapital))
+   202→   202→      setPct(String(acc.capitalPct ?? 100))
+   203→   203→      setBase(acc.capitalBase ?? 'FIXED')
+   204→   204→      setMode(acc.mode ?? 'INITIAL_PLUS_PNL')
+   205→   205→    }
+   206→   206→  }
+   207→   207→
+   208→   208→  const toggleEnabled = async (next: boolean) => {
+   209→   209→    try {
+   210→   210→      await api.patchAccount(acc.id, { isOrderEnabled: next })
+   211→   211→      await qc.invalidateQueries({ queryKey: ['accounts'] })
+   212→   212→      toast.success(`${acc.label} order routing ${next ? 'enabled' : 'disabled'}`)
+   213→   213→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Update failed') }
+   214→   214→  }
+   215→   215→
+   216→   216→  const cash = acc.availableCash ?? null
+   217→   217→  const pctPreview = base === 'AVAILABLE_CASH_PCT' && cash != null ? Math.max(0, cash * ((Number(pct) || 0) / 100)) : null
+   218→   218→
+   219→   219→  const save = async () => {
+   220→   220→    setBusy(true)
+   221→   221→    try {
+   222→   222→      const body: Record<string, unknown> = { mode, capitalBase: base }
+   223→   223→      if (base === 'AVAILABLE_CASH_PCT') {
+   224→   224→        body.capitalPct = Math.min(100, Math.max(0, Number(pct) || 0))
+   225→   225→      } else {
+   226→   226→        body.initialCapital = Number(capital) || 0
+   227→   227→      }
+   228→   228→      await api.patchAccount(acc.id, body)
+   229→   229→      await qc.invalidateQueries({ queryKey: ['accounts'] })
+   230→   230→      await qc.invalidateQueries({ queryKey: ['funds'] })
+   231→   231→      const desc = base === 'AVAILABLE_CASH_PCT'
+   232→   232→        ? `${body.capitalPct}% of available cash${cash != null ? ` (₹${fmtCompact(pctPreview ?? 0)})` : ''}`
+   233→   233→        : fmtCompact(Number(capital) || 0)
+   234→   234→      toast.success(`${acc.label} capital updated — ${desc} · ${MODE_SHORT[mode]}`)
+   235→   235→      setOpen(false)
+   236→   236→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Update failed') }
+   237→   237→    setBusy(false)
+   238→   238→  }
+   239→   239→
+   240→   240→  return (
+   241→   241→    <Popover open={open} onOpenChange={openEditor}>
+   242→   242→      <PopoverTrigger asChild>
+   243→   243→        <button
+   244→   244→          className={`flex items-center gap-1 h-6 pl-1 pr-1.5 rounded-full border transition-colors ${
+   245→   245→            acc.isOrderEnabled
+   246→   246→              ? 'border-[#00c896]/40 bg-up text-foreground hover:bg-up/70'
+   247→   247→              : 'border-border bg-secondary/50 text-muted-foreground hover:text-foreground'
+   248→   248→          }`}
+   249→   249→          title={`${acc.label} (${acc.brokerType}) — usable ${fmtCompact(acc.usableCapital)} · ${acc.capitalBase === 'AVAILABLE_CASH_PCT' ? `${acc.capitalPct}% of available cash` : 'fixed ₹ capital'} · click to manage capital sizing`}
+   250→   250→        >
+   251→   251→          <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${acc.isOrderEnabled ? 'bg-[#00c896]' : 'bg-muted-foreground/50'}`} />
+   252→   252→          <span className={`h-4 w-4 rounded text-[8px] font-bold grid place-items-center shrink-0 ${brokerIcon(acc.brokerType).cls}`}>
+   253→   253→            {brokerIcon(acc.brokerType).glyph}
+   254→   254→          </span>
+   255→   255→          <span className="tabular font-bold text-[9px]">{fmtCompact(acc.usableCapital)}</span>
+   256→   256→          {acc.capitalBase === 'AVAILABLE_CASH_PCT' && (
+   257→   257→            <span className="text-[8px] font-bold text-[#e0a63f] tabular">{acc.capitalPct}%</span>
+   258→   258→          )}
+   259→   259→        </button>
+   260→   260→      </PopoverTrigger>
+   261→   261→      <PopoverContent align="end" className="w-64 p-3 space-y-2.5 text-[11px]">
+   262→   262→        <div className="flex items-start justify-between gap-2">
+   263→   263→          <div className="min-w-0">
+   264→   264→            <div className="font-bold text-xs truncate">{acc.label}</div>
+   265→   265→            <div className="text-[9px] text-muted-foreground uppercase tracking-wide">{acc.brokerType}</div>
+   266→   266→          </div>
+   267→   267→          <div className="text-right shrink-0">
+   268→   268→            <div className="text-[9px] text-muted-foreground">usable</div>
+   269→   269→            <div className="tabular font-bold text-[#00c896]">{fmtCompact(acc.usableCapital)}</div>
+   270→   270→          </div>
+   271→   271→        </div>
+   272→   272→        <div className="flex items-center justify-between">
+   273→   273→          <span className="text-muted-foreground">Order routing</span>
+   274→   274→          <Switch checked={acc.isOrderEnabled} onCheckedChange={toggleEnabled} />
+   275→   275→        </div>
+   276→   276→        <div className="space-y-1">
+   277→   277→          <div className="text-[9px] text-muted-foreground">Capital source</div>
+   278→   278→          <div className="grid grid-cols-2 gap-1">
+   279→   279→            <button
+   280→   280→              onClick={() => { setBase('FIXED'); setCapital(String((acc.initialCapitalFixed ?? acc.initialCapital) || 500000)) }}
+   281→   281→              className={`px-2 py-1 rounded text-[10px] font-semibold border ${base === 'FIXED' ? 'bg-primary/20 border-primary/50 text-foreground' : 'bg-secondary/50 border-border text-muted-foreground hover:text-foreground'}`}
+   282→   282→            >Fixed ₹</button>
+   283→   283→            <button
+   284→   284→              onClick={() => { setBase('AVAILABLE_CASH_PCT'); setPct(String(acc.capitalPct ?? 100)) }}
+   285→   285→              className={`px-2 py-1 rounded text-[10px] font-semibold border ${base === 'AVAILABLE_CASH_PCT' ? 'bg-primary/20 border-primary/50 text-foreground' : 'bg-secondary/50 border-border text-muted-foreground hover:text-foreground'}`}
+   286→   286→            >% of cash</button>
+   287→   287→          </div>
+   288→   288→        </div>
+   289→   289→        {base === 'FIXED' ? (
+   290→   290→          <div className="space-y-1">
+   291→   291→            <div className="text-[9px] text-muted-foreground">Capital size (₹)</div>
+   292→   292→            <div className="flex items-center gap-2">
+   293→   293→              <Slider
+   294→   294→                value={[Math.min(fixedSliderMax(cash), Number(capital) || 0)]}
+   295→   295→                min={0}
+   296→   296→                max={fixedSliderMax(cash)}
+   297→   297→                step={5_000}
+   298→   298→                onValueChange={v => setCapital(String(snapStep(v[0])))}
+   299→   299→                className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+   300→   300→              />
+   301→   301→              <Input
+   302→   302→                value={capital}
+   303→   303→                onChange={e => setCapital(e.target.value.replace(/[^0-9.]/g, ''))}
+   304→   304→                className="h-7 text-[11px] tabular w-24"
+   305→   305→              />
+   306→   306→            </div>
+   307→   307→            <div className="text-[8px] text-muted-foreground">slider steps ₹5k · type any amount in the box</div>
+   308→   308→          </div>
+   309→   309→        ) : (
+   310→   310→          <div className="space-y-1">
+   311→   311→            <div className="flex items-center justify-between text-[9px] text-muted-foreground">
+   312→   312→              <span>Share of available cash</span>
+   313→   313→              {cash != null && <span className="tabular">cash {fmtCompact(cash)}</span>}
+   314→   314→            </div>
+   315→   315→            <div className="flex items-center gap-2">
+   316→   316→              <Slider
+   317→   317→                value={[Math.min(100, Number(pct) || 0)]}
+   318→   318→                min={1}
+   319→   319→                max={100}
+   320→   320→                step={1}
+   321→   321→                onValueChange={v => setPct(String(v[0]))}
+   322→   322→                className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+   323→   323→              />
+   324→   324→              <Input
+   325→   325→                value={pct}
+   326→   326→                onChange={e => setPct(e.target.value.replace(/[^0-9.]/g, ''))}
+   327→   327→                className="h-7 text-[11px] tabular w-16"
+   328→   328→              />
+   329→   329→              <span className="text-muted-foreground">%</span>
+   330→   330→            </div>
+   331→   331→            {pctPreview != null && (
+   332→   332→              <div className="tabular font-bold text-[#00c896] text-[10px]">= {fmtCompact(pctPreview)}</div>
+   333→   333→            )}
+   334→   334→            <div className="text-[8px] text-muted-foreground leading-snug">Recomputed live from the account&apos;s available cash on every sizing call — tracks the real balance (sizing mode is bypassed; PnL is already inside the cash).</div>
+   335→   335→          </div>
+   336→   336→        )}
+   337→   337→        {base === 'AVAILABLE_CASH_PCT' && (
+   338→   338→          <div className="text-[8px] text-[#e0a63f] leading-snug bg-[#e0a63f]/10 rounded px-1.5 py-1">
+   339→   339→            Live brokers: the cash base comes from the broker funds API (auto-refreshed every 45s) — press <b>Pull funds</b> to fetch it right now.
+   340→   340→          </div>
+   341→   341→        )}
+   342→   342→        <div className="space-y-1">
+   343→   343→          <div className="text-[9px] text-muted-foreground">Sizing mode</div>
+   344→   344→          <Select value={mode} onValueChange={v => setMode(v as CapitalMode)}>
+   345→   345→            <SelectTrigger className="h-7 text-[11px] w-full">
+   346→   346→              <SelectValue>{MODE_SHORT[mode]}</SelectValue>
+   347→   347→            </SelectTrigger>
+   348→   348→            <SelectContent>
+   349→   349→              {(Object.keys(CAPITAL_MODES) as CapitalMode[]).map(m => (
+   350→   350→                <SelectItem key={m} value={m} textValue={MODE_SHORT[m]} title={CAPITAL_MODES[m].detail}>
+   351→   351→                  {MODE_SHORT[m]}
+   352→   352→                </SelectItem>
+   353→   353→              ))}
+   354→   354→            </SelectContent>
+   355→   355→          </Select>
+   356→   356→          <div className="text-[8px] text-muted-foreground leading-snug">{CAPITAL_MODES[mode].detail}</div>
+   357→   357→        </div>
+   358→   358→        <div className="flex items-center justify-between pt-0.5">
+   359→   359→          <span className="text-[9px] text-muted-foreground">
+   360→   360→            realized <b className={acc.realizedPnl >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(acc.realizedPnl)}</b>
+   361→   361→          </span>
+   362→   362→          <div className="flex items-center gap-1">
+   363→   363→            {acc.brokerType !== 'SIMFEED' && (
+   364→   364→              <Button
+   365→   365→                size="sm" variant="secondary"
+   366→   366→                className="h-7 px-2 text-[10px] gap-1"
+   367→   367→                disabled={busy}
+   368→   368→                title="Pull the REAL broker available cash now (funds API) — the % base uses this number"
+   369→   369→                onClick={async () => {
+   370→   370→                  setBusy(true)
+   371→   371→                  try {
+   372→   372→                    const r = await api.syncFunds(acc.id)
+   373→   373→                    if (r.ok) toast.success(`${acc.label} funds pulled — ${r.message ?? fmtCompact(r.cash ?? 0)}`)
+   374→   374→                    else toast.error(r.message ?? 'Funds pull failed')
+   375→   375→                    await qc.invalidateQueries({ queryKey: ['accounts'] })
+   376→   376→                  } catch (e) { toast.error(e instanceof Error ? e.message : 'Funds pull failed') }
+   377→   377→                  setBusy(false)
+   378→   378→                }}
+   379→   379→              >
+   380→   380→                <RefreshCw className={`h-3 w-3 ${busy ? 'animate-spin' : ''}`} /> Pull funds
+   381→   381→              </Button>
+   382→   382→            )}
+   383→   383→            <Button size="sm" className="h-7 px-3 text-[10px]" onClick={save} disabled={busy}>
+   384→   384→              {busy ? 'Saving…' : 'Apply'}
+   385→   385→            </Button>
+   386→   386→          </div>
+   387→   387→        </div>
+   388→   388→      </PopoverContent>
+   389→   389→    </Popover>
+   390→   390→  )
+   391→   391→}
+   392→   392→
+   393→   393→// ------------------------------------------------------------
+   394→   394→// Session stats chip — win rate + points captured this session,
+   395→   395→// with a per-account breakdown popover.
+   396→   396→// ------------------------------------------------------------
+   397→   397→interface SessionStats {
+   398→   398→  winRate: number | null
+   399→   399→  pts: number
+   400→   400→  realized: number
+   401→   401→  unrealized: number
+   402→   402→  net: number
+   403→   403→  closes: number
+   404→   404→  wins: number
+   405→   405→  trades: number
+   406→   406→  charges: number
+   407→   407→  perAccount: { accountId: string; label: string; brokerType: string; trades: number; closes: number; wins: number; pts: number; realized: number; unrealized: number; charges: number }[]
+   408→   408→  topSymbols: { symbol: string; pts: number }[]
+   409→   409→}
+   410→   410→
+   411→   411→function SessionStatsChip() {
+   412→   412→  // realtime: sync:core carries the same session payload computed in the
+   413→   413→  // feed service (win rate / pts / per-account) — REST fallback if absent
+   414→   414→  const sync = useSyncChannel<SyncCore>('sync:core')
+   415→   415→  const { data: rest } = useQuery({
+   416→   416→    queryKey: ['session-stats'],
+   417→   417→    queryFn: () => api.sessionStats(),
+   418→   418→    enabled: !sync,
+   419→   419→    refetchInterval: 6000,
+   420→   420→  })
+   421→   421→  const data = sync?.session ?? rest
+   422→   422→  if (!data) return null
+   423→   423→  const wr = data.winRate
+   424→   424→  const pos = data.pts >= 0
+   425→   425→  return (
+   426→   426→    <Popover>
+   427→   427→      <PopoverTrigger asChild>
+   428→   428→        <button
+   429→   429→          className="flex items-center gap-1 px-1.5 py-1 rounded border border-border bg-card text-[10px] hover:bg-secondary/60 transition-colors"
+   430→   430→          title="Session performance — win rate + net points captured (click for per-account breakdown)"
+   431→   431→        >
+   432→   432→          <Trophy className={`h-3 w-3 ${pos ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`} />
+   433→   433→          <span className="tabular font-bold">{wr != null ? `${wr.toFixed(0)}%` : '—'}</span>
+   434→   434→          <span className="text-muted-foreground">WR</span>
+   435→   435→          <span className="w-px h-3 bg-border" />
+   436→   436→          <span className={`tabular font-bold ${pos ? 'term-up' : 'term-down'}`}>
+   437→   437→            {pos ? '+' : ''}{data.pts.toFixed(1)} pts
+   438→   438→          </span>
+   439→   439→        </button>
+   440→   440→      </PopoverTrigger>
+   441→   441→      <PopoverContent align="end" className="w-72 p-3 text-[11px] space-y-2">
+   442→   442→        <div className="flex items-center justify-between">
+   443→   443→          <span className="text-[9px] uppercase tracking-wide text-muted-foreground">current session</span>
+   444→   444→          <span className="text-[9px] text-muted-foreground">{data.trades} trades · {data.closes} closed</span>
+   445→   445→        </div>
+   446→   446→        <div className="grid grid-cols-2 gap-1.5">
+   447→   447→          <div className="rounded bg-secondary/50 p-1.5">
+   448→   448→            <div className="text-[8px] text-muted-foreground">WIN RATE</div>
+   449→   449→            <div className="tabular font-bold text-sm">{wr != null ? `${wr.toFixed(1)}%` : '—'}</div>
+   450→   450→            <div className="text-[8px] text-muted-foreground">{data.wins}W / {data.closes - data.wins}L</div>
+   451→   451→          </div>
+   452→   452→          <div className="rounded bg-secondary/50 p-1.5">
+   453→   453→            <div className="text-[8px] text-muted-foreground">NET POINTS</div>
+   454→   454→            <div className={`tabular font-bold text-sm ${data.pts >= 0 ? 'term-up' : 'term-down'}`}>{data.pts >= 0 ? '+' : ''}{data.pts.toFixed(1)}</div>
+   455→   455→            <div className={`text-[8px] tabular ${data.net >= 0 ? 'term-up' : 'term-down'}`}>net {fmtCompact(data.net)}</div>
+   456→   456→          </div>
+   457→   457→        </div>
+   458→   458→        <div className="flex gap-3 text-[9px] text-muted-foreground tabular">
+   459→   459→          <span>realized <b className={data.realized >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(data.realized)}</b></span>
+   460→   460→          <span>unrealized <b className={data.unrealized >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(data.unrealized)}</b></span>
+   461→   461→          <span>charges {fmtCompact(data.charges)}</span>
+   462→   462→        </div>
+   463→   463→        {data.perAccount.length > 0 && (
+   464→   464→          <div className="border-t border-border/60 pt-1.5 space-y-0.5">
+   465→   465→            <div className="text-[8px] uppercase tracking-wide text-muted-foreground">per account (net = realized + unrealized)</div>
+   466→   466→            {data.perAccount.map(a => {
+   467→   467→              const net = a.realized + a.unrealized
+   468→   468→              return (
+   469→   469→                <div key={a.accountId} className="flex items-center justify-between text-[10px]">
+   470→   470→                  <span className="flex items-center gap-1 min-w-0">
+   471→   471→                    <span className={`h-3 w-3 rounded text-[7px] font-bold grid place-items-center shrink-0 ${brokerIcon(a.brokerType).cls}`}>{brokerIcon(a.brokerType).glyph}</span>
+   472→   472→                    <span className="truncate text-muted-foreground">{a.label}</span>
+   473→   473→                  </span>
+   474→   474→                  <span className="tabular shrink-0">
+   475→   475→                    <span className="text-muted-foreground mr-1.5">{a.closes ? `${((a.wins / a.closes) * 100).toFixed(0)}%` : '—'}</span>
+   476→   476→                    <b className={net >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(net)}</b>
+   477→   477→                  </span>
+   478→   478→                </div>
+   479→   479→              )
+   480→   480→            })}
+   481→   481→          </div>
+   482→   482→        )}
+   483→   483→        {data.topSymbols.length > 0 && (
+   484→   484→          <div className="border-t border-border/60 pt-1.5">
+   485→   485→            <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-0.5">pts by symbol</div>
+   486→   486→            <div className="flex flex-wrap gap-1">
+   487→   487→              {data.topSymbols.map(s => (
+   488→   488→                <span key={s.symbol} className={`px-1 py-0.5 rounded text-[9px] tabular ${s.pts >= 0 ? 'bg-up text-[#00c896]' : 'bg-down text-[#ff4d5e]'}`}>
+   489→   489→                  {s.symbol} {s.pts >= 0 ? '+' : ''}{s.pts.toFixed(1)}
+   490→   490→                </span>
+   491→   491→              ))}
+   492→   492→            </div>
+   493→   493→          </div>
+   494→   494→        )}
+   495→   495→      </PopoverContent>
+   496→   496→    </Popover>
+   497→   497→  )
+   498→   498→}
+   499→   499→
+   500→   500→// ------------------------------------------------------------
+   501→   501→// Feed status chip — click to see / switch the market-data
+   502→   502→// source. Radio semantics: exactly ONE feed source is active
+   503→   503→// (Sim built-in or one broker account's feed adapter).
+   504→   504→// Round-8: each account row carries ICON BUTTONS for
+   505→   505→// connect / disconnect (account active state) and live feed
+   506→   506→// enable / disable (set as the active source or fall back to
+   507→   507→// sim), plus the account's live PnL and capital.
+   508→   508→// Round-10: per-row LIVE-FEED health (ticking / last tick age /
+   509→   509→// last error from the feed service), a capital quick editor
+   510→   510→// (% of cash / fixed ₹, editable anytime — even while connected)
+   511→   511→// and a one-click "pull real funds" action.
+   512→   512→// ------------------------------------------------------------
+   513→   513→function FeedChip({ up }: { up: boolean }) {
+   514→   514→  const qc = useQueryClient()
+   515→   515→  const [open, setOpen] = useState(false)
+   516→   516→  const [busy, setBusy] = useState(false)
+   517→   517→  const [capEdit, setCapEdit] = useState<string | null>(null)
+   518→   518→  const [capBase, setCapBase] = useState<'FIXED' | 'AVAILABLE_CASH_PCT'>('AVAILABLE_CASH_PCT')
+   519→   519→  const [capVal, setCapVal] = useState('25')
+   520→   520→  // admin plane over the websocket (2s push) — replaces the feed-source +
+   521→   521→  // feed-status REST polls; REST stays as the fallback when the socket is down
+   522→   522→  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+   523→   523→  const { data } = useQuery({ queryKey: ['feed-source'], queryFn: () => api.feedSource(), enabled: !adm, refetchInterval: 8000 })
+   524→   524→  // live broker feed engine health (ticking? last error?)
+   525→   525→  const { data: feedSt } = useQuery({ queryKey: ['feed-status'], queryFn: () => api.feedStatus(), enabled: !adm, refetchInterval: 5000, retry: false })
+   526→   526→  const feedStatus = adm?.feed ?? feedSt
+   527→   527→  // realtime PnL / capital / connection state straight from sync:core
+   528→   528→  const sync = useSyncChannel<SyncCore>('sync:core')
+   529→   529→  const { data: restAccs } = useQuery({
+   530→   530→    queryKey: ['accounts'],
+   531→   531→    queryFn: () => api.accounts(),
+   532→   532→    enabled: !sync,
+   533→   533→    refetchInterval: 5000,
+   534→   534→  })
+   535→   535→  const accounts: AccountRow[] = sync?.accounts
+   536→   536→    ? (sync.accounts as unknown as AccountRow[])
+   537→   537→    : (restAccs?.accounts ?? [])
+   538→   538→  const source = adm?.feedSource.source ?? data?.source ?? 'sim'
+   539→   539→  const simDisabled = adm?.feedSource.simDisabled ?? data?.simDisabled ?? false
+   540→   540→  const sources = adm?.feedSource.sources ?? data?.sources ?? []
+   541→   541→  const bumpDataEpoch = useTerminal(s => s.bumpDataEpoch)
+   542→   542→  const current = sources.find(s => s.id === source)
+   543→   543→  const accById = new Map(accounts.map(a => [a.id, a]))
+   544→   544→  const tickAge = feedStatus?.lastTickTs ? Math.max(0, Math.round((Date.now() - feedStatus.lastTickTs) / 1000)) : null
+   545→   545→
+   546→   546→  const refresh = async () => {
+   547→   547→    await Promise.all([
+   548→   548→      qc.invalidateQueries({ queryKey: ['feed-source'] }),
+   549→   549→      qc.invalidateQueries({ queryKey: ['accounts'] }),
+   550→   550→      qc.invalidateQueries({ queryKey: ['feed-status'] }),
+   551→   551→    ])
+   552→   552→  }
+   553→   553→
+   554→   554→  const pick = async (id: string) => {
+   555→   555→    if (id === source || busy) return
+   556→   556→    // Live-Only mode: sandbox accounts (no broker session) can never be the
+   557→   557→    // data source — block at the UI level (the API refuses them too)
+   558→   558→    if (simDisabled && id !== 'sim') {
+   559→   559→      const row = sources.find(s => s.id === id)
+   560→   560→      const sessioned = accById.get(id)?.hasSession ?? row?.hasSession ?? false
+   561→   561→      if (!sessioned) {
+   562→   562→        toast.error(`${row?.label ?? 'This account'} has no broker session (sandbox) — Live-Only mode requires a live account. Create the session in Admin → Session.`)
+   563→   563→        return
+   564→   564→      }
+   565→   565→    }
+   566→   566→    setBusy(true)
+   567→   567→    try {
+   568→   568→      await api.setFeedSource(id)
+   569→   569→      await refresh()
+   570→   570→      // purge every client-side market-data holder (candles, ghost, ticks,
+   571→   571→      // depth books) — sim data must never linger under a real-broker source
+   572→   572→      bumpDataEpoch()
+   573→   573→      const label = sources.find(s => s.id === id)?.label ?? id
+   574→   574→      toast.success(`Market data source → ${label}${id === 'sim' ? '' : ' (sim data cleared)'}`)
+   575→   575→    } catch (e) {
+   576→   576→      toast.error(e instanceof Error ? e.message : 'Switch failed')
+   577→   577→    } finally { setBusy(false) }
+   578→   578→  }
+   579→   579→
+   580→   580→  const toggleAccount = async (id: string, next: boolean) => {
+   581→   581→    if (busy) return
+   582→   582→    setBusy(true)
+   583→   583→    try {
+   584→   584→      await api.patchAccount(id, { isActive: next })
+   585→   585→      await refresh()
+   586→   586→      const a = accById.get(id)
+   587→   587→      toast.success(`${a?.label ?? 'Account'} ${next ? 'connected' : 'disconnected'}${!next && source === id ? ' — feed fell back to Sim' : ''}`)
+   588→   588→    } catch (e) {
+   589→   589→      toast.error(e instanceof Error ? e.message : 'Update failed')
+   590→   590→    } finally { setBusy(false) }
+   591→   591→  }
+   592→   592→
+   593→   593→  const toggleFeed = async (id: string) => {
+   594→   594→    // if this account already feeds the terminal -> disable (back to sim);
+   595→   595→    // otherwise enable it as the active source
+   596→   596→    await pick(source === id ? 'sim' : id)
+   597→   597→  }
+   598→   598→
+   599→   599→  const pullFunds = async (id: string) => {
+   600→   600→    setBusy(true)
+   601→   601→    try {
+   602→   602→      const r = await api.syncFunds(id)
+   603→   603→      if (r.ok) toast.success(`Funds pulled — ${r.message ?? fmtCompact(r.cash ?? 0)}`)
+   604→   604→      else toast.error(r.message ?? 'Funds pull failed — check Admin → Broker Diagnostics')
+   605→   605→      await refresh()
+   606→   606→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Funds pull failed') }
+   607→   607→    setBusy(false)
+   608→   608→  }
+   609→   609→
+   610→   610→  const saveCap = async (id: string) => {
+   611→   611→    setBusy(true)
+   612→   612→    try {
+   613→   613→      const body: Record<string, unknown> = { capitalBase: capBase }
+   614→   614→      if (capBase === 'AVAILABLE_CASH_PCT') body.capitalPct = Math.min(100, Math.max(1, Number(capVal) || 25))
+   615→   615→      else body.initialCapital = Number(capVal) || 0
+   616→   616→      await api.patchAccount(id, body)
+   617→   617→      await refresh()
+   618→   618→      toast.success(`Capital updated — ${capBase === 'AVAILABLE_CASH_PCT' ? `${body.capitalPct}% of available cash` : fmtCompact(Number(capVal) || 0)}`)
+   619→   619→      setCapEdit(null)
+   620→   620→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Update failed') }
+   621→   621→    setBusy(false)
+   622→   622→  }
+   623→   623→
+   624→   624→  const openCapEdit = (acc: AccountRow) => {
+   625→   625→    setCapEdit(acc.id)
+   626→   626→    setCapBase(acc.capitalBase ?? 'AVAILABLE_CASH_PCT')
+   627→   627→    setCapVal(String(acc.capitalBase === 'AVAILABLE_CASH_PCT' ? (acc.capitalPct ?? 100) : (acc.initialCapitalFixed ?? acc.initialCapital)))
+   628→   628→  }
+   629→   629→
+   630→   630→  // live-feed health for the ACTIVE broker source
+   631→   631→  const liveHealthy = !!feedStatus?.sourceIsLive && !!feedStatus?.fresh
+   632→   632→  const liveErr = feedStatus?.sourceIsLive ? feedStatus?.lastError : null
+   633→   633→
+   634→   634→  return (
+   635→   635→    <Popover open={open} onOpenChange={setOpen}>
+   636→   636→      <PopoverTrigger asChild>
+   637→   637→        <button
+   638→   638→          className={`flex items-center gap-1 px-1.5 py-1 rounded border transition-colors ${
+   639→   639→            up ? 'border-[#00c896]/30 bg-up/40 text-[#00c896] hover:bg-up/60' : 'border-[#ff4d5e]/30 bg-down/40 text-[#ff4d5e] hover:bg-down/60'
+   640→   640→          }`}
+   641→   641→          title={`Market data source — click to view / switch${source !== 'sim' ? ` · live feed ${liveHealthy ? 'ticking' : `STALLED${liveErr ? `: ${liveErr}` : ''}`}` : ''}`}
+   642→   642→        >
+   643→   643→          <CircleDot className={`h-3 w-3 ${up ? 'pulse-dot' : ''}`} />
+   644→   644→          <span className="font-bold">FEED {up ? 'LIVE' : 'DOWN'}</span>
+   645→   645→          {source !== 'sim' && (
+   646→   646→            <span
+   647→   647→              className={`h-1.5 w-1.5 rounded-full ${liveHealthy ? 'bg-[#00c896] pulse-dot' : 'bg-[#e0a63f]'}`}
+   648→   648→              title={liveHealthy ? `live broker data ticking (${feedStatus?.symbols} symbols · last ${tickAge}s ago)` : `live data stalled${liveErr ? ` — ${liveErr}` : ' — waiting for ticks'}`}
+   649→   649→            />
+   650→   650→          )}
+   651→   651→          <span className="max-w-[110px] truncate text-foreground/80">{current?.label ?? 'Sim Feed'}</span>
+   652→   652→          {simDisabled && <span className="px-1 rounded bg-[#e0a63f]/20 text-[#e0a63f] text-[8px] font-bold" title="Live-Only mode (admin) — sim feed disabled">LIVE-ONLY</span>}
+   653→   653→        </button>
+   654→   654→      </PopoverTrigger>
+   655→   655→      <PopoverContent align="end" className="w-[360px] p-2 text-[11px] space-y-1">
+   656→   656→        <div className="px-1 pb-1 text-[9px] text-muted-foreground leading-snug">
+   657→   657→          Market data source — one feed active at a time. Live rows show real feed health; click <b>cap</b> to change % / fixed capital anytime, even while connected.
+   658→   658→        </div>
+   659→   659→        {feedStatus?.sourceIsLive && (
+   660→   660→          <div className={`mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border ${
+   661→   661→            liveHealthy ? 'border-[#00c896]/30 bg-up/30 text-[#00c896]' : 'border-[#e0a63f]/40 bg-[#e0a63f]/10 text-[#e0a63f]'
+   662→   662→          }`}>
+   663→   663→            {liveHealthy
+   664→   664→              ? <>Live broker feed ticking — {feedStatus.symbols} symbols · last tick {tickAge}s ago · {feedStatus.polls} polls</>
+   665→   665→              : <>Live feed NOT flowing{feedStatus.lastError ? ` — ${feedStatus.lastError}` : ''}{!feedStatus.sessionPresent ? ' · no session — create it in Admin → Session' : ''} · details in Admin → Broker Diagnostics</>}
+   666→   666→          </div>
+   667→   667→        )}
+   668→   668→        {sources.map(s => {
+   669→   669→          const acc = s.id === 'sim' ? null : accById.get(s.id)
+   670→   670→          const isSrc = s.id === source
+   671→   671→          return (
+   672→   672→            <div
+   673→   673→              key={s.id}
+   674→   674→              role="button"
+   675→   675→              tabIndex={0}
+   676→   676→              onClick={() => pick(s.id)}
+   677→   677→              onKeyDown={e => { if (e.key === 'Enter') pick(s.id) }}
+   678→   678→              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left transition-colors cursor-pointer ${
+   679→   679→                isSrc ? 'bg-primary/20 border border-primary/50' : 'hover:bg-secondary border border-transparent'
+   680→   680→              } ${acc && !acc.isActive ? 'opacity-60' : ''}`}
+   681→   681→            >
+   682→   682→              <span className={`h-2.5 w-2.5 rounded-full border shrink-0 flex items-center justify-center ${
+   683→   683→                isSrc ? 'border-primary' : 'border-muted-foreground/40'
+   684→   684→              }`}>
+   685→   685→                {isSrc && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
+   686→   686→              </span>
+   687→   687→              <span className={`h-4 w-4 rounded text-[8px] font-bold grid place-items-center shrink-0 ${s.id === 'sim' ? 'bg-slate-500/25 text-slate-300' : brokerIcon(s.brokerType ?? '').cls}`}>
+   688→   688→                {s.id === 'sim' ? '⚡' : brokerIcon(s.brokerType ?? '').glyph}
+   689→   689→              </span>
+   690→   690→              <span className="min-w-0 flex-1">
+   691→   691→                <span className="flex items-center gap-1.5 min-w-0">
+   692→   692→                  <span className="truncate font-medium">{s.label}</span>
+   693→   693→                  {acc && <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${acc.isActive ? 'bg-[#00c896]' : 'bg-[#ff4d5e]'}`} title={acc.isActive ? 'connected' : 'disconnected'} />}
+   694→   694→                </span>
+   695→   695→                {acc ? (
+   696→   696→                  <span className="flex items-center gap-2 text-[8px] tabular mt-0.5">
+   697→   697→                    <span className="uppercase tracking-wide text-muted-foreground">{s.brokerType}</span>
+   698→   698→                    {/* LIVE vs SANDBOX — session presence (round 13: the Live-Only
+   699→   699→                        mode must never silently sit on a sandbox account) */}
+   700→   700→                    <span
+   701→   701→                      className={`px-1 rounded font-bold ${
+   702→   702→                        acc.hasSession
+   703→   703→                          ? 'bg-[#00c896]/15 text-[#00c896]'
+   704→   704→                          : 'bg-[#e0a63f]/15 text-[#e0a63f]'
+   705→   705→                      }`}
+   706→   706→                      title={acc.hasSession ? 'broker session present — live account' : 'no broker session — sandbox account (Live-Only mode cannot use it)'}
+   707→   707→                    >
+   708→   708→                      {acc.hasSession ? 'LIVE' : 'SANDBOX'}
+   709→   709→                    </span>
+   710→   710→                    {!acc.hasSession && simDisabled && (
+   711→   711→                      <span className="text-[#e0a63f]" title="Live-Only mode — create the session in Admin → Session to use this account">session required</span>
+   712→   712→                    )}
+   713→   713→                    <span className={acc.realizedPnl >= 0 ? 'term-up' : 'term-down'}>
+   714→   714→                      PnL {acc.realizedPnl >= 0 ? '+' : ''}{fmtCompact(acc.realizedPnl)}
+   715→   715→                    </span>
+   716→   716→                    {/* capital quick editor — click to change %/fixed, editable even while connected */}
+   717→   717→                    <button
+   718→   718→                      onClick={e => { e.stopPropagation(); openCapEdit(acc) }}
+   719→   719→                      className="flex items-center gap-1 text-muted-foreground hover:text-foreground underline decoration-dotted"
+   720→   720→                      title="Edit capital — % of available cash or fixed ₹ (works while connected)"
+   721→   721→                    >
+   722→   722→                      cap <b className="text-foreground">{fmtCompact(acc.usableCapital)}</b>
+   723→   723→                      {acc.capitalBase === 'AVAILABLE_CASH_PCT' && <span className="text-[#e0a63f] font-bold">{acc.capitalPct}%</span>}
+   724→   724→                      <Pencil className="h-2.5 w-2.5" />
+   725→   725→                    </button>
+   726→   726→                  </span>
+   727→   727→                ) : (
+   728→   728→                  <span className="block text-[8px] text-muted-foreground uppercase tracking-wide">built-in synthetic feed</span>
+   729→   729→                )}
+   730→   730→              </span>
+   731→   731→              {acc && (
+   732→   732→                <span className="flex items-center gap-0.5 shrink-0">
+   733→   733→                  {/* pull REAL broker funds into the % base */}
+   734→   734→                  <button
+   735→   735→                    onClick={e => { e.stopPropagation(); pullFunds(acc.id) }}
+   736→   736→                    disabled={busy}
+   737→   737→                    title="Pull available cash from the broker funds API now"
+   738→   738→                    className="p-1 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+   739→   739→                  >
+   740→   740→                    <Wallet className="h-3 w-3" />
+   741→   741→                  </button>
+   742→   742→                  {/* connect / disconnect the account itself */}
+   743→   743→                  <button
+   744→   744→                    onClick={e => { e.stopPropagation(); toggleAccount(acc.id, !acc.isActive) }}
+   745→   745→                    disabled={busy}
+   746→   746→                    title={acc.isActive ? 'Disconnect account' : 'Connect account'}
+   747→   747→                    className={`p-1 rounded border transition-colors ${
+   748→   748→                      acc.isActive
+   749→   749→                        ? 'border-[#00c896]/40 text-[#00c896] hover:bg-[#00c896]/20'
+   750→   750→                        : 'border-[#ff4d5e]/40 text-[#ff4d5e] hover:bg-[#ff4d5e]/20'
+   751→   751→                    }`}
+   752→   752→                  >
+   753→   753→                    {acc.isActive ? <Link2 className="h-3 w-3" /> : <Unlink className="h-3 w-3" />}
+   754→   754→                  </button>
+   755→   755→                  {/* live feed enable / disable for this account */}
+   756→   756→                  <button
+   757→   757→                    onClick={e => { e.stopPropagation(); toggleFeed(acc.id) }}
+   758→   758→                    disabled={busy || (simDisabled && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))}
+   759→   759→                    title={
+   760→   760→                      isSrc ? 'Disable this account feed (back to Sim)'
+   761→   761→                      : simDisabled && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession)
+   762→   762→                        ? 'Blocked — Live-Only mode: this sandbox account has no broker session'
+   763→   763→                        : 'Enable this account as the live feed'
+   764→   764→                    }
+   765→   765→                    className={`p-1 rounded border transition-colors ${
+   766→   766→                      isSrc
+   767→   767→                        ? 'border-primary/60 text-primary bg-primary/15'
+   768→   768→                        : busy || (simDisabled && !isSrc && !(acc.hasSession ?? sources.find(x => x.id === acc.id)?.hasSession))
+   769→   769→                          ? 'border-border/50 text-muted-foreground/40 cursor-not-allowed'
+   770→   770→                          : 'border-border text-muted-foreground hover:text-foreground hover:bg-secondary'
+   771→   771→                    }`}
+   772→   772→                  >
+   773→   773→                    <Radio className={`h-3 w-3 ${isSrc ? 'pulse-dot' : ''}`} />
+   774→   774→                  </button>
+   775→   775→                </span>
+   776→   776→              )}
+   777→   777→              {s.id === 'sim' && isSrc && <span className="text-[8px] font-bold text-primary shrink-0">ACTIVE</span>}
+   778→   778→            </div>
+   779→   779→          )
+   780→   780→        })}
+   781→   781→        {/* inline capital editor for the selected row */}
+   782→   782→        {capEdit && accById.get(capEdit) && (() => {
+   783→   783→          const acc = accById.get(capEdit)!
+   784→   784→          const cash = acc.availableCash ?? null
+   785→   785→          const preview = capBase === 'AVAILABLE_CASH_PCT' && cash != null ? Math.max(0, cash * ((Number(capVal) || 0) / 100)) : null
+   786→   786→          return (
+   787→   787→            <div className="mx-1 mt-1 rounded border border-primary/40 bg-primary/5 p-2 space-y-1.5" onClick={e => e.stopPropagation()}>
+   788→   788→              <div className="text-[10px] font-bold">Capital — {acc.label}</div>
+   789→   789→              <div className="grid grid-cols-2 gap-1">
+   790→   790→                <button
+   791→   791→                  onClick={() => { setCapBase('AVAILABLE_CASH_PCT'); setCapVal(String(acc.capitalPct ?? 100)) }}
+   792→   792→                  className={`px-2 py-1 rounded text-[10px] font-semibold border ${capBase === 'AVAILABLE_CASH_PCT' ? 'bg-primary/20 border-primary/50' : 'bg-secondary/50 border-border text-muted-foreground'}`}
+   793→   793→                >% of cash</button>
+   794→   794→                <button
+   795→   795→                  onClick={() => { setCapBase('FIXED'); setCapVal(String((acc.initialCapitalFixed ?? acc.initialCapital) || 500000)) }}
+   796→   796→                  className={`px-2 py-1 rounded text-[10px] font-semibold border ${capBase === 'FIXED' ? 'bg-primary/20 border-primary/50' : 'bg-secondary/50 border-border text-muted-foreground'}`}
+   797→   797→                >Fixed ₹</button>
+   798→   798→              </div>
+   799→   799→              {capBase === 'AVAILABLE_CASH_PCT' ? (
+   800→   800→                <div className="space-y-1">
+   801→   801→                  <div className="flex items-center gap-2">
+   802→   802→                    <Slider
+   803→   803→                      value={[Math.min(100, Number(capVal) || 0)]}
+   804→   804→                      min={1}
+   805→   805→                      max={100}
+   806→   806→                      step={1}
+   807→   807→                      onValueChange={v => setCapVal(String(v[0]))}
+   808→   808→                      className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+   809→   809→                      title={`${capVal}% of available cash`}
+   810→   810→                    />
+   811→   811→                    <Input
+   812→   812→                      value={capVal}
+   813→   813→                      onChange={e => setCapVal(e.target.value.replace(/[^0-9.]/g, ''))}
+   814→   814→                      className="h-7 text-[11px] tabular w-16"
+   815→   815→                      placeholder="25"
+   816→   816→                    />
+   817→   817→                    <span className="text-muted-foreground text-[10px]">%</span>
+   818→   818→                  </div>
+   819→   819→                  {preview != null && (
+   820→   820→                    <div className="tabular text-[10px] font-bold text-[#00c896]">= {fmtCompact(preview)} deployable</div>
+   821→   821→                  )}
+   822→   822→                  {cash != null && (
+   823→   823→                    <div className="text-[8px] text-muted-foreground">broker cash {fmtCompact(cash)} — auto-refreshed from the funds API every 45s</div>
+   824→   824→                  )}
+   825→   825→                </div>
+   826→   826→              ) : (
+   827→   827→                <div className="space-y-1">
+   828→   828→                  <div className="flex items-center gap-2">
+   829→   829→                    <Slider
+   830→   830→                      value={[Math.min(fixedSliderMax(cash), Number(capVal) || 0)]}
+   831→   831→                      min={0}
+   832→   832→                      max={fixedSliderMax(cash)}
+   833→   833→                      step={5_000}
+   834→   834→                      onValueChange={v => setCapVal(String(snapStep(v[0])))}
+   835→   835→                      className="flex-1 [&_[data-slot=slider-thumb]]:h-3 [&_[data-slot=slider-thumb]]:w-3"
+   836→   836→                      title={`₹${Number(capVal) || 0} fixed capital`}
+   837→   837→                    />
+   838→   838→                    <Input
+   839→   839→                      value={capVal}
+   840→   840→                      onChange={e => setCapVal(e.target.value.replace(/[^0-9.]/g, ''))}
+   841→   841→                      className="h-7 text-[11px] tabular w-24"
+   842→   842→                      placeholder="500000"
+   843→   843→                    />
+   844→   844→                    <span className="text-muted-foreground text-[10px]">₹</span>
+   845→   845→                  </div>
+   846→   846→                  <div className="text-[8px] text-muted-foreground">slider steps ₹5k (max {fmtCompact(fixedSliderMax(cash))}) · type any amount in the box</div>
+   847→   847→                </div>
+   848→   848→              )}
+   849→   849→              <div className="flex items-center justify-between pt-0.5">
+   850→   850→                <button className="text-[10px] text-muted-foreground hover:text-foreground" onClick={() => setCapEdit(null)}>cancel</button>
+   851→   851→                <Button size="sm" className="h-6 px-2.5 text-[10px]" disabled={busy} onClick={() => saveCap(acc.id)}>Save</Button>
+   852→   852→              </div>
+   853→   853→            </div>
+   854→   854→          )
+   855→   855→        })()}
+   856→   856→        <div className="px-1 pt-1 text-[8px] text-muted-foreground leading-snug">
+   857→   857→          Live broker feeds poll the broker quote APIs every second (Dhan batched / Shoonya Noren / Breeze) and skip the sim random-walk for fed symbols. Disconnecting the feeding account falls back to Sim ticks automatically.
+   858→   858→        </div>
+   859→   859→      </PopoverContent>
+   860→   860→    </Popover>
+   861→   861→  )
+   862→   862→}
+   863→   863→
+   864→   864→function LoginGate({ onLogin }: { onLogin: () => void }) {
+   865→   865→  const [username, setUsername] = useState('admin')
+   866→   866→  const [password, setPassword] = useState('admin123')
+   867→   867→  const [busy, setBusy] = useState(false)
+   868→   868→  const [err, setErr] = useState<string | null>(null)
+   869→   869→
+   870→   870→  const submit = async () => {
+   871→   871→    setBusy(true); setErr(null)
+   872→   872→    try {
+   873→   873→      await api.login(username, password)
+   874→   874→      onLogin()
+   875→   875→    } catch (e) {
+   876→   876→      setErr(e instanceof Error ? e.message : 'Login failed')
+   877→   877→    } finally { setBusy(false) }
+   878→   878→  }
+   879→   879→
+   880→   880→  return (
+   881→   881→    <div className="h-full flex items-center justify-center bg-[#0b0e11]">
+   882→   882→      <div className="w-80 rounded-lg border border-border bg-card p-6 space-y-4">
+   883→   883→        <div className="flex items-center gap-2">
+   884→   884→          <Activity className="h-5 w-5 text-primary" />
+   885→   885→          <div>
+   886→   886→            <div className="text-sm font-bold">QuantDesk Terminal</div>
+   887→   887→            <div className="text-[10px] text-muted-foreground">Sim Feed · Dhan · Shoonya · ICICI Breeze</div>
+   888→   888→          </div>
+   889→   889→        </div>
+   890→   890→        <div className="space-y-2">
+   891→   891→          <Input value={username} onChange={e => setUsername(e.target.value)} placeholder="Username" className="h-9 text-xs" />
+   892→   892→          <Input
+   893→   893→            type="password" value={password} onChange={e => setPassword(e.target.value)}
+   894→   894→            placeholder="Password" className="h-9 text-xs"
+   895→   895→            onKeyDown={e => e.key === 'Enter' && submit()}
+   896→   896→          />
+   897→   897→          {err && <div className="text-[10px] text-[#ff4d5e]">{err}</div>}
+   898→   898→          <Button className="w-full h-9 text-xs" onClick={submit} disabled={busy}>
+   899→   899→            {busy ? 'Signing in…' : 'Sign in as admin'}
+   900→   900→          </Button>
+   901→   901→          <div className="text-[9px] text-muted-foreground text-center">default credentials: admin / admin123</div>
+   902→   902→        </div>
+   903→   903→      </div>
+   904→   904→    </div>
+   905→   905→  )
+   906→   906→}
+   907→   907→

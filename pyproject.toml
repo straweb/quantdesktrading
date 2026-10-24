@@ -1,0 +1,17 @@
+[project]
+name = "trading-terminal-backend"
+version = "1.0.0"
+description = "Multi-broker trading terminal — Python backend (FastAPI REST :8000 + socket.io WS :8001)"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.110,<1.0",
+  "uvicorn>=0.29",
+  "python-socketio>=5.11",
+  "pydantic>=2.6,<3",
+  "httpx>=0.27",
+  "websockets>=11.0",
+]
+
+[tool.uv]
+# deps-only project: never try to build/install this repo as a package
+package = false

@@ -1,0 +1,9 @@
+{
+  "name": "pyapi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Python FastAPI(REST:8000) + socket.io WS(:8001) backend for the trading terminal",
+  "scripts": {
+    "dev": "cd /home/z/my-project && exec /home/z/.venv/bin/python -m backend.main"
+  }
+}

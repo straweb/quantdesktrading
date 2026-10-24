@@ -1,0 +1,1115 @@
+     1→'use client'
+     2→
+     3→import { useEffect, useRef, useState, useCallback } from 'react'
+     4→import type { Candle, Tick } from '@/lib/types'
+     5→import { TF_MS } from '@/lib/types'
+     6→import { api } from '../lib/client-api'
+     7→import { onTicks, subscribeTicks, unsubscribeTicks } from '../lib/socket'
+     8→
+     9→// ============================================================
+    10→// From-scratch canvas candlestick chart — no charting library.
+    11→// Candles / line / area + volume histogram + indicator panels.
+    12→//   · wheel on plot / time axis  -> time zoom (bars)
+    13→//   · wheel on price axis / +Shift -> price-scale-only zoom
+    14→//   · drag plot                   -> free pan (left/right/top/bottom)
+    15→//   · drag price axis             -> squeeze/stretch price scale
+    16→//   · drag time axis              -> pan time
+    17→//   · double-click / ▶LIVE button -> reset view to live edge
+    18→//   · panning right shows up to 50 bars of FUTURE space
+    19→// Legend (title + O/H/L/C/V + LTP) is ALWAYS visible; hovering
+    20→// switches it to the hovered candle. Crosshair is SYNCED across
+    21→// every open chart locked to the same interval (timeframe).
+    22→// Overlays: SMA20/50, EMA9/21, VWAP (session), Bollinger(20,2).
+    23→// Sub-panels: RSI(14), MACD(12,26,9).
+    24→// ============================================================
+    25→
+    26→export interface ChartMarker { price: number; label: string; color: string }
+    27→
+    28→/** Blank bars the user can pan into beyond the live edge. */
+    29→export const FUTURE_BARS = 50
+    30→
+    31→/** Axis scales (sample-tool "SCALES" popup): topmost enabled scale gets the
+    32→ *  right axis, the others render as a left measurement column. % / pts are
+    33→ *  relative to a baseline the user can drag or set by clicking the chart. */
+    34→export interface ScalesCfg { price: boolean; pct: boolean; inv: boolean; pts: boolean }
+    35→
+    36→interface Props {
+    37→  symbol: string
+    38→  tf: string
+    39→  chartType: 'candles' | 'line' | 'area'
+    40→  showVolume: boolean
+    41→  showSMA20: boolean
+    42→  showSMA50: boolean
+    43→  showEMA?: boolean
+    44→  showVWAP?: boolean
+    45→  showBOLL?: boolean
+    46→  showRSI?: boolean
+    47→  showMACD?: boolean
+    48→  // 1M ghost: overlay 1m candles on higher-timeframe charts (hollow/fade)
+    49→  showGhost?: boolean
+    50→  ghostStyle?: 'hollow' | 'fade'
+    51→  scales?: ScalesCfg
+    52→  markers?: ChartMarker[]
+    53→  onPriceClick?: (price: number) => void
+    54→  height: string
+    55→  mini?: boolean // compact mode (option panes): thinner axes
+    56→}
+    57→
+    58→const UP = '#00c896'
+    59→const DOWN = '#ff4d5e'
+    60→const GRID = 'rgba(255,255,255,0.045)'
+    61→const AXIS_TXT = '#8b949e'
+    62→const CROSS = 'rgba(255,255,255,0.25)'
+    63→
+    64→// ---------------- indicator math ----------------
+    65→
+    66→function sma(data: Candle[], period: number): (number | null)[] {
+    67→  const out: (number | null)[] = []
+    68→  let sum = 0
+    69→  for (let i = 0; i < data.length; i++) {
+    70→    sum += data[i].c
+    71→    if (i >= period) sum -= data[i - period].c
+    72→    out.push(i >= period - 1 ? sum / period : null)
+    73→  }
+    74→  return out
+    75→}
+    76→
+    77→function ema(data: Candle[], period: number): (number | null)[] {
+    78→  const out: (number | null)[] = []
+    79→  const k = 2 / (period + 1)
+    80→  let prev = 0
+    81→  for (let i = 0; i < data.length; i++) {
+    82→    if (i < period - 1) { out.push(null); prev += data[i].c; continue }
+    83→    if (i === period - 1) { prev = (prev + data[i].c) / period; out.push(prev); continue }
+    84→    prev = data[i].c * k + prev * (1 - k)
+    85→    out.push(prev)
+    86→  }
+    87→  return out
+    88→}
+    89→
+    90→/** Session VWAP — resets each calendar day (IST) like real intraday VWAP. */
+    91→function vwap(data: Candle[]): (number | null)[] {
+    92→  const out: (number | null)[] = []
+    93→  let day = '', cumPV = 0, cumV = 0
+    94→  for (const c of data) {
+    95→    const d = new Date(c.t + 5.5 * 3600_000).toISOString().slice(0, 10) // IST day bucket
+    96→    if (d !== day) { day = d; cumPV = 0; cumV = 0 }
+    97→    const tp = (c.h + c.l + c.c) / 3
+    98→    cumPV += tp * (c.v || 1)
+    99→    cumV += c.v || 1
+   100→    out.push(cumV > 0 ? cumPV / cumV : null)
+   101→  }
+   102→  return out
+   103→}
+   104→
+   105→function bollinger(data: Candle[], period = 20, mult = 2) {
+   106→  const mid = sma(data, period)
+   107→  const up: (number | null)[] = []
+   108→  const lo: (number | null)[] = []
+   109→  for (let i = 0; i < data.length; i++) {
+   110→    if (mid[i] == null) { up.push(null); lo.push(null); continue }
+   111→    let s = 0
+   112→    for (let j = i - period + 1; j <= i; j++) s += (data[j].c - mid[i]!) ** 2
+   113→    const sd = Math.sqrt(s / period)
+   114→    up.push(mid[i]! + mult * sd)
+   115→    lo.push(mid[i]! - mult * sd)
+   116→  }
+   117→  return { mid, up, lo }
+   118→}
+   119→
+   120→function rsi(data: Candle[], period = 14): (number | null)[] {
+   121→  const out: (number | null)[] = []
+   122→  let avgG = 0, avgL = 0
+   123→  for (let i = 0; i < data.length; i++) {
+   124→    if (i === 0) { out.push(null); continue }
+   125→    const ch = data[i].c - data[i - 1].c
+   126→    const g = Math.max(0, ch), l = Math.max(0, -ch)
+   127→    if (i <= period) {
+   128→      avgG += g / period; avgL += l / period
+   129→      out.push(i === period ? toRsi(avgG, avgL) : null)
+   130→      continue
+   131→    }
+   132→    avgG = (avgG * (period - 1) + g) / period
+   133→    avgL = (avgL * (period - 1) + l) / period
+   134→    out.push(toRsi(avgG, avgL))
+   135→  }
+   136→  return out
+   137→}
+   138→function toRsi(g: number, l: number): number | null {
+   139→  if (l === 0) return 100
+   140→  const rs = g / l
+   141→  return 100 - 100 / (1 + rs)
+   142→}
+   143→
+   144→function macd(data: Candle[], fast = 12, slow = 26, sig = 9) {
+   145→  const ef = ema(data, fast)
+   146→  const es = ema(data, slow)
+   147→  const line = data.map((_, i) => (ef[i] != null && es[i] != null ? ef[i]! - es[i]! : null))
+   148→  // signal = EMA9 of the macd line (skip nulls at head)
+   149→  const signal: (number | null)[] = []
+   150→  const k = 2 / (sig + 1)
+   151→  let prev = 0
+   152→  let seeded = false
+   153→  for (let i = 0; i < data.length; i++) {
+   154→    if (line[i] == null) { signal.push(null); continue }
+   155→    if (!seeded) { prev = line[i]!; seeded = true; signal.push(prev); continue }
+   156→    prev = line[i]! * k + prev * (1 - k)
+   157→    signal.push(prev)
+   158→  }
+   159→  const hist = data.map((_, i) => (line[i] != null && signal[i] != null ? line[i]! - signal[i]! : null))
+   160→  return { line, signal, hist }
+   161→}
+   162→
+   163→// ---------------- crosshair sync bus ----------------
+   164→// Every chart publishes its hovered candle time; charts running the
+   165→// same interval draw a synced crosshair + legend values at that time.
+   166→
+   167→export interface CrossSyncMsg { src: number; tf: string; t: number | null; price: number | null }
+   168→const crossBusListeners = new Set<(m: CrossSyncMsg) => void>()
+   169→let CHART_SEQ = 0
+   170→
+   171→function emitCross(m: CrossSyncMsg) {
+   172→  for (const fn of crossBusListeners) fn(m)
+   173→}
+   174→
+   175→function niceTicks(min: number, max: number, count: number): number[] {
+   176→  const span = max - min
+   177→  if (span <= 0) return [min]
+   178→  const raw = span / count
+   179→  const mag = Math.pow(10, Math.floor(Math.log10(raw)))
+   180→  const norm = raw / mag
+   181→  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag
+   182→  const start = Math.ceil(min / step) * step
+   183→  const out: number[] = []
+   184→  for (let v = start; v <= max; v += step) out.push(v)
+   185→  return out
+   186→}
+   187→
+   188→function fmtAxisTime(t: number, tf: string): string {
+   189→  const d = new Date(t)
+   190→  if (tf === '1d') return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
+   191→  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
+   192→}
+   193→
+   194→function fmtVol(v: number): string {
+   195→  if (v >= 1e7) return `${(v / 1e7).toFixed(1)}Cr`
+   196→  if (v >= 1e5) return `${(v / 1e5).toFixed(1)}L`
+   197→  if (v >= 1000) return `${(v / 1000).toFixed(1)}k`
+   198→  return String(Math.round(v))
+   199→}
+   200→
+   201→// ---- scale labels (percent / points vs baseline) ----
+   202→function labelPct(v: number): string {
+   203→  const s = v >= 0 ? '+' : '-', a = Math.abs(v)
+   204→  return s + (a >= 100 ? a.toFixed(0) : a >= 10 ? a.toFixed(1) : a.toFixed(2)) + '%'
+   205→}
+   206→function labelPts(v: number): string {
+   207→  const s = v >= 0 ? '+' : '-', a = Math.abs(v)
+   208→  return s + (a >= 1000 ? a.toFixed(0) : a >= 100 ? a.toFixed(1) : a.toFixed(2))
+   209→}
+   210→
+   211→// baseline pick-mode bus (toolbar "Set base" button arms ALL charts;
+   212→// the next chart click consumes it)
+   213→const BASE_PICK_EVENT = 'qd-chart-set-base'
+   214→const BASE_SET_EVENT = 'qd-chart-base-set'
+   215→
+   216→function lowerBoundTime(arr: Candle[], t: number): number {
+   217→  let lo = 0, hi = arr.length
+   218→  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid].t < t) lo = mid + 1; else hi = mid }
+   219→  return lo
+   220→}
+   221→
+   222→interface DragState {
+   223→  zone: 'plot' | 'price' | 'time' | 'base'
+   224→  startX: number
+   225→  startY: number
+   226→  startOffset: number
+   227→  startPriceOff: number
+   228→  startPriceZoom: number
+   229→  pxPerPx: number
+   230→  moved: number
+   231→}
+   232→
+   233→export function CanvasChart({
+   234→  symbol, tf, chartType, showVolume, showSMA20, showSMA50,
+   235→  showEMA = false, showVWAP = false, showBOLL = false, showRSI = false, showMACD = false,
+   236→  showGhost = false, ghostStyle = 'hollow', scales,
+   237→  markers = [], onPriceClick, height, mini = false,
+   238→}: Props) {
+   239→  const wrapRef = useRef<HTMLDivElement>(null)
+   240→  const canvasRef = useRef<HTMLCanvasElement>(null)
+   241→  const [candles, setCandles] = useState<Candle[]>([])
+   242→  const [loading, setLoading] = useState(true)
+   243→  const [err, setErr] = useState<string | null>(null)
+   244→  const [barCount, setBarCount] = useState(mini ? 60 : 120)
+   245→  const [dirty, setDirty] = useState(false) // false = view pinned to live edge
+   246→  const offsetRef = useRef(0) // bars panned; NEGATIVE = into future space
+   247→  const priceZoomRef = useRef(1)
+   248→  const priceOffRef = useRef(0)
+   249→  const [, forceRender] = useState(0)
+   250→  const crossRef = useRef<{ x: number; y: number } | null>(null)
+   251→  const syncCrossRef = useRef<{ slot: number; price: number | null } | null>(null)
+   252→  const dragRef = useRef<DragState | null>(null)
+   253→  const sizeRef = useRef({ w: 0, h: 0 })
+   254→  const winRef = useRef({ w: 0, h: 0, plotW: 0, priceH: 0, axisH: mini ? 12 : 20, pMin: 0, pMax: 1 })
+   255→  const lastRangeRef = useRef({ pMin: 0, pMax: 1 }) // survives full-future views
+   256→  const lastVolRef = useRef<Record<string, number>>({})
+   257→  const chartId = useRef(++CHART_SEQ)
+   258→  // ---- 1M ghost overlay ----
+   259→  const [ghost, setGhost] = useState<Candle[]>([])
+   260→  // ---- scales baseline (null = day open ref) + pick mode ----
+   261→  const baseRef = useRef<number | null>(null)
+   262→  const pickRef = useRef(false)
+   263→  const [baseArmed, setBaseArmed] = useState(false)
+   264→  // last-drawn baseline geometry (for the grab zone) — updated every frame
+   265→  const drawMetaRef = useRef({ yBase: -1, baseline: 0 })
+   266→
+   267→  // ---- baseline pick-mode bus (armed from the toolbar SCALES popover) ----
+   268→  useEffect(() => {
+   269→    const arm = () => { pickRef.current = true; setBaseArmed(true) }
+   270→    const disarm = () => { pickRef.current = false; setBaseArmed(false) }
+   271→    window.addEventListener(BASE_PICK_EVENT, arm)
+   272→    window.addEventListener(BASE_SET_EVENT, disarm)
+   273→    return () => {
+   274→      window.removeEventListener(BASE_PICK_EVENT, arm)
+   275→      window.removeEventListener(BASE_SET_EVENT, disarm)
+   276→    }
+   277→  }, [])
+   278→
+   279→  // ---- crosshair sync (same tf only — charts are interval-locked) ----
+   280→  useEffect(() => {
+   281→    const fn = (m: CrossSyncMsg) => {
+   282→      if (m.src === chartId.current || m.tf !== tf) { return }
+   283→      if (m.t == null) { syncCrossRef.current = null; return }
+   284→      syncCrossRef.current = { slot: m.t, price: m.price } // slot stores t; resolved in draw
+   285→      forceRender(n => n + 1)
+   286→    }
+   287→    crossBusListeners.add(fn)
+   288→    return () => { crossBusListeners.delete(fn) }
+   289→  }, [tf])
+   290→
+   291→  // ---- data loading ----
+   292→  const load = useCallback(async () => {
+   293→    if (!symbol) return
+   294→    try {
+   295→      const r = await api.candles(symbol, tf as never, 1000)
+   296→      if (r.candles?.length) {
+   297→        setCandles(r.candles)
+   298→        lastVolRef.current = { [symbol]: r.candles[r.candles.length - 1]?.v ?? 0 }
+   299→      }
+   300→      setErr(null)
+   301→    } catch (e) {
+   302→      setErr(e instanceof Error ? e.message : 'load failed')
+   303→    } finally {
+   304→      setLoading(false)
+   305→    }
+   306→  }, [symbol, tf])
+   307→
+   308→  useEffect(() => {
+   309→    setLoading(true)
+   310→    offsetRef.current = 0
+   311→    priceZoomRef.current = 1
+   312→    priceOffRef.current = 0
+   313→    setDirty(false)
+   314→    load()
+   315→    subscribeTicks([symbol])
+   316→    const iv = setInterval(load, 30_000)
+   317→    return () => {
+   318→      unsubscribeTicks([symbol])
+   319→      clearInterval(iv)
+   320→    }
+   321→  }, [symbol, tf, load])
+   322→
+   323→  // ---- 1m ghost data (only meaningful on higher timeframes) ----
+   324→  useEffect(() => {
+   325→    if (!showGhost || tf === '1m') { setGhost([]); return }
+   326→    let dead = false
+   327→    const pull = async () => {
+   328→      try {
+   329→        const r = await api.candles(symbol, '1m' as never, 1200)
+   330→        if (!dead) setGhost(r.candles ?? [])
+   331→      } catch { /* ghost is best-effort */ }
+   332→    }
+   333→    pull()
+   334→    const iv = setInterval(pull, 30_000)
+   335→    return () => { dead = true; clearInterval(iv) }
+   336→  }, [symbol, tf, showGhost])
+   337→
+   338→  // ---- live ticks merge into the last candle ----
+   339→  useEffect(() => {
+   340→    return onTicks(map => {
+   341→      const t: Tick | undefined = map[symbol]
+   342→      if (!t) return
+   343→      setCandles(prev => {
+   344→        if (prev.length === 0) return prev
+   345→        const arr = prev.slice()
+   346→        const last = { ...arr[arr.length - 1] }
+   347→        const bucket = Math.floor(t.ts / TF_MS[tf as keyof typeof TF_MS]) * TF_MS[tf as keyof typeof TF_MS]
+   348→        const dayVolDelta = Math.max(0, t.vol - (lastVolRef.current[symbol] ?? t.vol))
+   349→        lastVolRef.current[symbol] = t.vol
+   350→        if (bucket > last.t) {
+   351→          arr.push({ t: bucket, o: t.ltp, h: t.ltp, l: t.ltp, c: t.ltp, v: dayVolDelta })
+   352→          if (arr.length > 1600) arr.splice(0, 200)
+   353→        } else {
+   354→          last.c = t.ltp
+   355→          last.h = Math.max(last.h, t.ltp)
+   356→          last.l = Math.min(last.l, t.ltp)
+   357→          last.v += dayVolDelta
+   358→          arr[arr.length - 1] = last
+   359→        }
+   360→        return arr
+   361→      })
+   362→      // ghost 1m last bar follows live ticks as well
+   363→      if (showGhost && tf !== '1m') {
+   364→        setGhost(prevG => {
+   365→          if (prevG.length === 0) return prevG
+   366→          const gArr = prevG.slice()
+   367→          const gl = { ...gArr[gArr.length - 1] }
+   368→          const gb = Math.floor(t.ts / 60_000) * 60_000
+   369→          if (gb > gl.t) {
+   370→            gArr.push({ t: gb, o: t.ltp, h: t.ltp, l: t.ltp, c: t.ltp, v: 0 })
+   371→            if (gArr.length > 2400) gArr.splice(0, 200)
+   372→          } else {
+   373→            gl.c = t.ltp
+   374→            gl.h = Math.max(gl.h, t.ltp)
+   375→            gl.l = Math.min(gl.l, t.ltp)
+   376→            gArr[gArr.length - 1] = gl
+   377→          }
+   378→          return gArr
+   379→        })
+   380→      }
+   381→    })
+   382→  }, [symbol, tf, showGhost])
+   383→
+   384→  // ---- render loop ----
+   385→  useEffect(() => {
+   386→    const canvas = canvasRef.current
+   387→    const wrap = wrapRef.current
+   388→    if (!canvas || !wrap) return
+   389→    let raf = 0
+   390→
+   391→    const draw = () => {
+   392→      const dpr = Math.min(2, window.devicePixelRatio || 1)
+   393→      const w = wrap.clientWidth
+   394→      const h = wrap.clientHeight
+   395→      if (sizeRef.current.w !== w || sizeRef.current.h !== h || canvas.width !== Math.round(w * dpr)) {
+   396→        canvas.width = Math.round(w * dpr)
+   397→        canvas.height = Math.round(h * dpr)
+   398→        canvas.style.width = `${w}px`
+   399→        canvas.style.height = `${h}px`
+   400→        sizeRef.current = { w, h }
+   401→      }
+   402→      const ctx = canvas.getContext('2d')
+   403→      if (!ctx) return
+   404→      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+   405→      ctx.clearRect(0, 0, w, h)
+   406→      ctx.font = '10px ui-monospace, monospace'
+   407→
+   408→      const data = candles
+   409→      if (data.length < 2) {
+   410→        ctx.fillStyle = AXIS_TXT
+   411→        ctx.textAlign = 'center'
+   412→        ctx.fillText(loading ? 'loading candles…' : err || 'no data', w / 2, h / 2)
+   413→        return
+   414→      }
+   415→
+   416→      const axisW = mini ? 46 : 58
+   417→      const axisH = mini ? 12 : 20
+   418→      const plotW = w - axisW
+   419→      const availH = h - axisH
+   420→      const volH = showVolume ? Math.round(availH * (mini ? 0.14 : 0.16)) : 0
+   421→      const subSlot = Math.round(availH * 0.16)
+   422→      const rsiH = !mini && showRSI ? subSlot : 0
+   423→      const macdH = !mini && showMACD ? subSlot : 0
+   424→      const priceH = availH - (showVolume ? volH + 5 : 0) - rsiH - macdH
+   425→
+   426→      // visible window — offset may be NEGATIVE (future space)
+   427→      const end = data.length - Math.round(offsetRef.current)
+   428→      const start = Math.min(end - barCount, data.length - 2)
+   429→      const slots = end - start
+   430→      if (slots < 2) { offsetRef.current = 0; return }
+   431→      const vis: (Candle | null)[] = new Array(slots)
+   432→      for (let i = 0; i < slots; i++) vis[i] = data[start + i] ?? null
+   433→      const lastC0 = data[data.length - 1]
+   434→      const lastT = data[data.length - 1].t
+   435→      const tfMs = TF_MS[tf as keyof typeof TF_MS] ?? 60_000
+   436→      const timeOfSlot = (i: number) => {
+   437→        const di = start + i
+   438→        return di < data.length ? data[di].t : lastT + (di - (data.length - 1)) * tfMs
+   439→      }
+   440→
+   441→      // day-change reference (session open) — the default scales baseline
+   442→      const dayKey = (t: number) => new Date(t + 5.5 * 3600_000).toISOString().slice(0, 10)
+   443→      const todayKey = dayKey(lastT)
+   444→      let dayRef = lastC0.o
+   445→      for (let i = data.length - 1; i >= 0; i--) {
+   446→        if (dayKey(data[i].t) !== todayKey) break
+   447→        dayRef = data[i].o
+   448→      }
+   449→      const baseline = baseRef.current ?? dayRef
+   450→      const pctOf = (p: number) => (baseline ? ((p - baseline) / baseline) * 100 : 0)
+   451→
+   452→      // price range over real candles + overlays
+   453→      let pMin = Infinity, pMax = -Infinity
+   454→      for (const c of vis) { if (!c) continue; if (c.l < pMin) pMin = c.l; if (c.h > pMax) pMax = c.h }
+   455→      // ghost 1m candles stretch the range too
+   456→      if (showGhost && ghost.length > 0 && tfMs > 60_000) {
+   457→        const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
+   458→        const g0 = lowerBoundTime(ghost, tA), g1 = lowerBoundTime(ghost, tB)
+   459→        for (let gi = g0; gi < g1; gi++) { const g = ghost[gi]; if (g.l < pMin) pMin = g.l; if (g.h > pMax) pMax = g.h }
+   460→      }
+   461→      const s20 = showSMA20 ? sma(data, 20) : null
+   462→      const s50 = showSMA50 ? sma(data, 50) : null
+   463→      const e9 = showEMA ? ema(data, 9) : null
+   464→      const e21 = showEMA ? ema(data, 21) : null
+   465→      const vw = showVWAP ? vwap(data) : null
+   466→      const bb = showBOLL ? bollinger(data) : null
+   467→      const includeSeries = (arr: (number | null)[] | null | undefined, up?: (number | null)[] | null, lo?: (number | null)[] | null) => {
+   468→        if (arr) for (let i = start; i < end; i++) { const v = arr[i]; if (v != null) { if (v < pMin) pMin = v; if (v > pMax) pMax = v } }
+   469→        if (up) for (let i = start; i < end; i++) { const v = up[i]; if (v != null) { if (v < pMin) pMin = v; if (v > pMax) pMax = v } }
+   470→        if (lo) for (let i = start; i < end; i++) { const v = lo[i]; if (v != null) { if (v < pMin) pMin = v; if (v > pMax) pMax = v } }
+   471→      }
+   472→      includeSeries(s20); includeSeries(s50); includeSeries(e9); includeSeries(e21); includeSeries(vw)
+   473→      if (bb) includeSeries(bb.mid, bb.up, bb.lo)
+   474→      for (const m of markers) { if (m.price < pMin) pMin = m.price; if (m.price > pMax) pMax = m.price }
+   475→      if (!isFinite(pMin) || !isFinite(pMax)) { pMin = lastRangeRef.current.pMin; pMax = lastRangeRef.current.pMax }
+   476→      const pad = (pMax - pMin) * 0.08 || pMax * 0.001 || 1
+   477→      pMin -= pad; pMax += pad
+   478→      lastRangeRef.current = { pMin, pMax }
+   479→
+   480→      const zoom = priceZoomRef.current
+   481→      const center = (pMin + pMax) / 2
+   482→      const half = ((pMax - pMin) / 2) * zoom
+   483→      pMin = center - half + priceOffRef.current
+   484→      pMax = center + half + priceOffRef.current
+   485→
+   486→      winRef.current = { w, h, plotW, priceH, axisH, pMin, pMax }
+   487→
+   488→      const cw = plotW / slots
+   489→      const bodyW = Math.max(1, Math.min(14, cw * 0.68))
+   490→      const xOf = (i: number) => i * cw + cw / 2
+   491→      const yOf = (p: number) => ((pMax - p) / (pMax - pMin)) * priceH
+   492→
+   493→      // ---- scales config: topmost enabled = right axis, others = left column ----
+   494→      const scalesCfg = scales ?? { price: true, pct: false, inv: false, pts: false }
+   495→      const enabledScales = (['price', 'pct', 'inv', 'pts'] as const).filter(k => scalesCfg[k])
+   496→      const primary = enabledScales[0] ?? 'price'
+   497→      const secondaries = enabledScales.slice(1)
+   498→      const scaleLabel = (p: number) =>
+   499→        primary === 'pct' ? labelPct(pctOf(p))
+   500→        : primary === 'inv' ? labelPct(-pctOf(p))
+   501→        : primary === 'pts' ? labelPts(p - baseline)
+   502→        : (p >= 1000 ? p.toLocaleString('en-IN', { maximumFractionDigits: 1 }) : p.toFixed(2))
+   503→
+   504→      // grid + price axis (labels follow the primary scale)
+   505→      ctx.textAlign = 'left'
+   506→      ctx.textBaseline = 'middle'
+   507→      const tickList = niceTicks(pMin, pMax, Math.max(mini ? 2 : 3, Math.floor(priceH / (mini ? 90 : 55))))
+   508→      for (const p of tickList) {
+   509→        const y = yOf(p)
+   510→        ctx.strokeStyle = GRID
+   511→        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
+   512→        ctx.fillStyle = AXIS_TXT
+   513→        ctx.fillText(scaleLabel(p), plotW + 6, y)
+   514→      }
+   515→
+   516→      // ---- left measurement column (secondary scales, sample-tool style) ----
+   517→      const colW = secondaries.length > 0 ? 10 + Math.max(34, secondaries.length * 40) : 0
+   518→      if (colW > 0 && !mini) {
+   519→        ctx.fillStyle = 'rgba(11,14,17,0.66)'
+   520→        ctx.fillRect(0, 0, colW, priceH)
+   521→        ctx.strokeStyle = 'rgba(255,255,255,0.08)'
+   522→        ctx.beginPath(); ctx.moveTo(colW, 0); ctx.lineTo(colW, priceH); ctx.stroke()
+   523→        ctx.textAlign = 'left'
+   524→        ctx.textBaseline = 'middle'
+   525→        const yBase = yOf(baseline)
+   526→        for (const p of tickList) {
+   527→          const y = yOf(p)
+   528→          if (y < 8 || y > priceH - 8) continue
+   529→          let ly = y - (secondaries.length - 1) * 6
+   530→          for (const s of secondaries) {
+   531→            const v = s === 'pct' ? labelPct(pctOf(p)) : s === 'inv' ? labelPct(-pctOf(p)) : labelPts(p - baseline)
+   532→            ctx.fillStyle = s === 'pct' ? 'rgba(224,166,63,0.85)' : s === 'inv' ? 'rgba(224,106,159,0.85)' : 'rgba(77,208,225,0.85)'
+   533→            ctx.fillText(v, 3, ly)
+   534→            ly += 12
+   535→          }
+   536→        }
+   537→        // baseline marker in the column
+   538→        if (yBase >= 0 && yBase <= priceH) {
+   539→          ctx.fillStyle = 'rgba(224,166,63,0.95)'
+   540→          ctx.fillRect(0, yBase - 7, colW, 14)
+   541→          ctx.fillStyle = '#0b0e11'
+   542→          ctx.font = 'bold 9px ui-monospace, monospace'
+   543→          ctx.fillText('BASE', 3, yBase)
+   544→          ctx.font = '10px ui-monospace, monospace'
+   545→        }
+   546→      }
+   547→
+   548→      // time axis (labels incl. future space)
+   549→      if (!mini) {
+   550→        ctx.textAlign = 'center'
+   551→        ctx.textBaseline = 'top'
+   552→        const labelEvery = Math.max(1, Math.ceil(slots / Math.max(2, Math.floor(plotW / 90))))
+   553→        for (let i = 0; i < slots; i += labelEvery) {
+   554→          const x = xOf(i)
+   555→          ctx.strokeStyle = GRID
+   556→          ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h - axisH); ctx.stroke()
+   557→          ctx.fillStyle = AXIS_TXT
+   558→          ctx.fillText(fmtAxisTime(timeOfSlot(i), tf), x, h - axisH + 4)
+   559→        }
+   560→        // future-space divider
+   561→        const fi = data.length - start
+   562→        if (fi > 0 && fi < slots) {
+   563→          const fx = xOf(fi) - cw / 2
+   564→          ctx.strokeStyle = 'rgba(139,148,158,0.28)'
+   565→          ctx.setLineDash([2, 4])
+   566→          ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, h - axisH); ctx.stroke()
+   567→          ctx.setLineDash([])
+   568→        }
+   569→      }
+   570→
+   571→      // volume histogram
+   572→      if (showVolume && volH > 0) {
+   573→        let vMax = 0
+   574→        for (const c of vis) if (c && c.v > vMax) vMax = c.v
+   575→        const vy0 = priceH + 5 + volH
+   576→        vis.forEach((c, i) => {
+   577→          if (!c || c.v <= 0) return
+   578→          const vh = (c.v / vMax) * volH
+   579→          ctx.fillStyle = c.c >= c.o ? 'rgba(0,200,150,0.35)' : 'rgba(255,77,94,0.35)'
+   580→          ctx.fillRect(xOf(i) - bodyW / 2, vy0 - vh, bodyW, vh)
+   581→        })
+   582→        ctx.fillStyle = 'rgba(139,148,158,0.8)'
+   583→        ctx.textAlign = 'left'
+   584→        ctx.textBaseline = 'top'
+   585→        ctx.fillText(`Vol ${fmtVol(vMax)}`, 4, vy0 - volH + 1)
+   586→      }
+   587→
+   588→      // RSI panel
+   589→      const rsiArr = !mini && showRSI ? rsi(data) : null
+   590→      if (rsiArr && rsiH > 0) {
+   591→        const top = priceH + (showVolume ? 5 + volH + 2 : 2)
+   592→        const yR = (v: number) => top + ((100 - v) / 100) * rsiH
+   593→        ctx.strokeStyle = GRID
+   594→        ctx.beginPath(); ctx.moveTo(0, top); ctx.lineTo(plotW, top); ctx.stroke()
+   595→        for (const g of [30, 70]) {
+   596→          ctx.strokeStyle = 'rgba(255,255,255,0.07)'
+   597→          ctx.setLineDash([2, 3])
+   598→          ctx.beginPath(); ctx.moveTo(0, yR(g)); ctx.lineTo(plotW, yR(g)); ctx.stroke()
+   599→          ctx.setLineDash([])
+   600→        }
+   601→        ctx.strokeStyle = '#f5a623'
+   602→        ctx.lineWidth = 1.2
+   603→        ctx.beginPath()
+   604→        let st = false
+   605→        for (let i = start; i < end; i++) {
+   606→          const v = rsiArr[i]; if (v == null) { st = false; continue }
+   607→          const x = xOf(i - start), y = yR(v)
+   608→          if (!st) { ctx.moveTo(x, y); st = true } else ctx.lineTo(x, y)
+   609→        }
+   610→        ctx.stroke()
+   611→        ctx.lineWidth = 1
+   612→        ctx.fillStyle = '#f5a623'
+   613→        ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+   614→        ctx.fillText('RSI14', 4, top + 1)
+   615→      }
+   616→
+   617→      // MACD panel
+   618→      const macdArr = !mini && showMACD ? macd(data) : null
+   619→      if (macdArr && macdH > 0) {
+   620→        const top = priceH + (showVolume ? 5 + volH + 2 : 2) + (rsiH ? rsiH + 2 : 0)
+   621→        let mMin = Infinity, mMax = -Infinity
+   622→        for (let i = start; i < end; i++) {
+   623→          for (const arr of [macdArr.line, macdArr.signal, macdArr.hist]) {
+   624→            const v = arr[i]; if (v == null) continue
+   625→            if (v < mMin) mMin = v; if (v > mMax) mMax = v
+   626→          }
+   627→        }
+   628→        if (!isFinite(mMin)) { mMin = -1; mMax = 1 }
+   629→        const mAbs = Math.max(Math.abs(mMin), Math.abs(mMax)) || 1
+   630→        const yM = (v: number) => top + ((mAbs - v) / (2 * mAbs)) * macdH
+   631→        ctx.strokeStyle = GRID
+   632→        ctx.beginPath(); ctx.moveTo(0, top); ctx.lineTo(plotW, top); ctx.stroke()
+   633→        // zero line
+   634→        ctx.strokeStyle = 'rgba(255,255,255,0.09)'
+   635→        ctx.beginPath(); ctx.moveTo(0, yM(0)); ctx.lineTo(plotW, yM(0)); ctx.stroke()
+   636→        vis.forEach((c, i) => {
+   637→          if (!c) return
+   638→          const v = macdArr.hist[start + i]; if (v == null) return
+   639→          const y0 = yM(0), y1 = yM(v)
+   640→          ctx.fillStyle = v >= 0 ? 'rgba(0,200,150,0.4)' : 'rgba(255,77,94,0.4)'
+   641→          ctx.fillRect(xOf(i) - bodyW / 2, Math.min(y0, y1), bodyW, Math.max(1, Math.abs(y1 - y0)))
+   642→        })
+   643→        const drawLine = (arr: (number | null)[], color: string) => {
+   644→          ctx.strokeStyle = color
+   645→          ctx.lineWidth = 1.2
+   646→          ctx.beginPath()
+   647→          let st = false
+   648→          for (let i = start; i < end; i++) {
+   649→            const v = arr[i]; if (v == null) { st = false; continue }
+   650→            const x = xOf(i - start), y = yM(v)
+   651→            if (!st) { ctx.moveTo(x, y); st = true } else ctx.lineTo(x, y)
+   652→          }
+   653→          ctx.stroke()
+   654→          ctx.lineWidth = 1
+   655→        }
+   656→        drawLine(macdArr.line, '#4dd0e1')
+   657→        drawLine(macdArr.signal, '#f5a623')
+   658→        ctx.fillStyle = '#4dd0e1'
+   659→        ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+   660→        ctx.fillText('MACD 12·26·9', 4, top + 1)
+   661→      }
+   662→
+   663→      // ---- 1M ghost overlay (sample-tool #ghostCtl): 1m candles on >1m charts ----
+   664→      if (showGhost && ghost.length > 0 && tfMs > 60_000) {
+   665→        const tA = timeOfSlot(0), tB = timeOfSlot(slots - 1) + tfMs
+   666→        const g0 = lowerBoundTime(ghost, tA), g1 = lowerBoundTime(ghost, tB)
+   667→        if (g1 > g0) {
+   668→          ctx.lineWidth = 1
+   669→          ctx.textAlign = 'left'; ctx.textBaseline = 'top'
+   670→          for (let i = 0; i < slots; i++) {
+   671→            const t0 = timeOfSlot(i)
+   672→            if (t0 < ghost[0].t) continue
+   673→            const t1 = t0 + tfMs
+   674→            const lo = Math.max(g0, lowerBoundTime(ghost, t0))
+   675→            const hi = Math.min(g1, lowerBoundTime(ghost, t1))
+   676→            const k = hi - lo
+   677→            if (k <= 0) continue
+   678→            const bw = Math.max(1.5, Math.min(6, (cw / k) * 0.62))
+   679→            for (let j = 0; j < k; j++) {
+   680→              const g = ghost[lo + j]
+   681→              const x = xOf(i) - cw / 2 + ((j + 0.5) / k) * cw
+   682→              const up = g.c >= g.o
+   683→              const col = up ? UP : DOWN
+   684→              const yH = yOf(g.h), yL = yOf(g.l), yO = yOf(g.o), yC = yOf(g.c)
+   685→              if (Math.max(yH, yL) < -4 || Math.min(yH, yL) > priceH + 4) continue
+   686→              ctx.globalAlpha = ghostStyle === 'fade' ? 0.26 : 0.6
+   687→              ctx.strokeStyle = col
+   688→              ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke()
+   689→              const top = Math.min(yO, yC)
+   690→              const bh = Math.max(1, Math.abs(yC - yO))
+   691→              if (ghostStyle === 'hollow') {
+   692→                ctx.strokeRect(x - bw / 2, top, bw, bh)
+   693→              } else {
+   694→                ctx.fillStyle = col
+   695→                ctx.fillRect(x - bw / 2, top, bw, bh)
+   696→              }
+   697→              ctx.globalAlpha = 1
+   698→            }
+   699→          }
+   700→          ctx.fillStyle = 'rgba(224,166,63,0.9)'
+   701→          ctx.fillText('1M GHOST', 4, 14)
+   702→        }
+   703→      }
+   704→
+   705→      // series
+   706→      if (chartType === 'candles') {
+   707→        vis.forEach((c, i) => {
+   708→          if (!c) return
+   709→          const x = xOf(i)
+   710→          const up = c.c >= c.o
+   711→          ctx.strokeStyle = up ? UP : DOWN
+   712→          ctx.fillStyle = up ? UP : DOWN
+   713→          ctx.beginPath()
+   714→          ctx.moveTo(x, yOf(c.h)); ctx.lineTo(x, yOf(c.l))
+   715→          ctx.stroke()
+   716→          const yO = yOf(c.o), yC = yOf(c.c)
+   717→          const top = Math.min(yO, yC)
+   718→          const bh = Math.max(1, Math.abs(yC - yO))
+   719→          ctx.fillRect(x - bodyW / 2, top, bodyW, bh)
+   720→        })
+   721→      } else {
+   722→        ctx.beginPath()
+   723→        let started = false
+   724→        vis.forEach((c, i) => {
+   725→          if (!c) return
+   726→          const x = xOf(i), y = yOf(c.c)
+   727→          if (!started) { ctx.moveTo(x, y); started = true } else ctx.lineTo(x, y)
+   728→        })
+   729→        ctx.strokeStyle = '#f5a623'
+   730→        ctx.lineWidth = 1.5
+   731→        ctx.stroke()
+   732→        ctx.lineWidth = 1
+   733→        if (chartType === 'area' && started) {
+   734→          const lastReal = Math.min(slots - 1, data.length - 1 - start)
+   735→          const grad = ctx.createLinearGradient(0, 0, 0, priceH)
+   736→          grad.addColorStop(0, 'rgba(245,166,35,0.22)')
+   737→          grad.addColorStop(1, 'rgba(245,166,35,0)')
+   738→          ctx.lineTo(xOf(lastReal), priceH)
+   739→          ctx.lineTo(xOf(Math.max(0, data.length - 1 - start < slots ? data.length - 1 - start : 0)) || xOf(0), priceH)
+   740→          ctx.closePath()
+   741→          ctx.fillStyle = grad
+   742→          ctx.fill()
+   743→        }
+   744→      }
+   745→
+   746→      // overlay indicator lines
+   747→      const drawSeries = (arr: (number | null)[], color: string, dash: number[] = []) => {
+   748→        ctx.setLineDash(dash)
+   749→        ctx.strokeStyle = color
+   750→        ctx.lineWidth = 1.1
+   751→        ctx.beginPath()
+   752→        let st = false
+   753→        for (let i = start; i < end; i++) {
+   754→          const v = arr[i]; if (v == null) { st = false; continue }
+   755→          const x = xOf(i - start), y = yOf(v)
+   756→          if (!st) { ctx.moveTo(x, y); st = true } else ctx.lineTo(x, y)
+   757→        }
+   758→        ctx.stroke()
+   759→        ctx.setLineDash([])
+   760→        ctx.lineWidth = 1
+   761→      }
+   762→      if (bb) {
+   763→        // band fill
+   764→        ctx.beginPath()
+   765→        let st = false
+   766→        for (let i = start; i < end; i++) {
+   767→          const v = bb.up[i]; if (v == null) { st = false; continue }
+   768→          const x = xOf(i - start), y = yOf(v)
+   769→          if (!st) { ctx.moveTo(x, y); st = true } else ctx.lineTo(x, y)
+   770→        }
+   771→        for (let i = end - 1; i >= start; i--) {
+   772→          const v = bb.lo[i]; if (v == null) continue
+   773→          ctx.lineTo(xOf(i - start), yOf(v))
+   774→        }
+   775→        ctx.closePath()
+   776→        ctx.fillStyle = 'rgba(139,148,158,0.07)'
+   777→        ctx.fill()
+   778→        drawSeries(bb.mid, 'rgba(139,148,158,0.7)', [4, 3])
+   779→        drawSeries(bb.up, 'rgba(139,148,158,0.4)')
+   780→        drawSeries(bb.lo, 'rgba(139,148,158,0.4)')
+   781→      }
+   782→      if (s20) drawSeries(s20, 'rgba(77,208,225,0.85)')
+   783→      if (s50) drawSeries(s50, 'rgba(180,140,232,0.85)')
+   784→      if (e9) drawSeries(e9, '#ffd166')
+   785→      if (e21) drawSeries(e21, '#e06c9f')
+   786→      if (vw) drawSeries(vw, 'rgba(77,208,225,0.75)', [5, 3])
+   787→
+   788→      // markers (position avg prices)
+   789→      for (const m of markers) {
+   790→        const y = yOf(m.price)
+   791→        if (y < -8 || y > priceH + 8) continue
+   792→        ctx.setLineDash([4, 3])
+   793→        ctx.strokeStyle = m.color
+   794→        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
+   795→        ctx.setLineDash([])
+   796→        ctx.fillStyle = m.color
+   797→        ctx.fillRect(plotW + 2, y - 7, axisW - 4, 14)
+   798→        ctx.fillStyle = '#0b0e11'
+   799→        ctx.textAlign = 'center'
+   800→        ctx.font = '9px ui-monospace, monospace'
+   801→        ctx.fillText(m.label, plotW + axisW / 2, y)
+   802→        ctx.font = '10px ui-monospace, monospace'
+   803→      }
+   804→
+   805→      // last price line + axis tag
+   806→      const lastC = data[data.length - 1]
+   807→      {
+   808→        const y = yOf(lastC.c)
+   809→        if (y >= 0 && y <= priceH) {
+   810→          const up = lastC.c >= lastC.o
+   811→          ctx.setLineDash([2, 3])
+   812→          ctx.strokeStyle = up ? 'rgba(0,200,150,0.55)' : 'rgba(255,77,94,0.55)'
+   813→          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
+   814→          ctx.setLineDash([])
+   815→          ctx.fillStyle = up ? UP : DOWN
+   816→          ctx.fillRect(plotW + 2, y - 8, axisW - 4, 16)
+   817→          ctx.fillStyle = '#0b0e11'
+   818→          ctx.textAlign = 'center'
+   819→          ctx.textBaseline = 'middle'
+   820→          ctx.fillText(lastC.c.toFixed(2), plotW + axisW / 2, y)
+   821→        }
+   822→      }
+   823→
+   824→      // scales baseline — dashed amber line, draggable / set-by-click
+   825→      if (!mini && (secondaries.includes('pct') || secondaries.includes('inv') || secondaries.includes('pts') || primary !== 'price')) {
+   826→        const yBase = yOf(baseline)
+   827→        drawMetaRef.current = { yBase, baseline }
+   828→        if (yBase >= 0 && yBase <= priceH) {
+   829→          ctx.setLineDash([5, 4])
+   830→          ctx.strokeStyle = 'rgba(224,166,63,0.75)'
+   831→          ctx.lineWidth = 1
+   832→          ctx.beginPath(); ctx.moveTo(colW, yBase); ctx.lineTo(plotW, yBase); ctx.stroke()
+   833→          ctx.setLineDash([])
+   834→          ctx.lineWidth = 1
+   835→          // zero anchors of the % / pts scales sit on the baseline
+   836→          ctx.fillStyle = 'rgba(224,166,63,0.9)'
+   837→          ctx.textAlign = 'right'; ctx.textBaseline = 'middle'
+   838→          ctx.fillText(primary === 'price' ? '0%' : '0', plotW - 4, yBase - 6)
+   839→        }
+   840→      }
+   841→
+   842→      // ---- legend: ALWAYS visible. Hovered candle wins over last. ----
+   843→      const drawLegend = (c: Candle, idxTime: number, livePct: number | null) => {
+   844→        const up = c.c >= c.o
+   845→        ctx.textAlign = 'left'
+   846→        ctx.textBaseline = 'top'
+   847→        ctx.fillStyle = '#e6e9ec'
+   848→        ctx.font = 'bold 10px ui-monospace, monospace'
+   849→        ctx.fillText(symbol, 6, 4)
+   850→        let x = 6 + ctx.measureText(symbol).width + 8
+   851→        ctx.font = '10px ui-monospace, monospace'
+   852→        ctx.fillStyle = '#8b949e'
+   853→        ctx.fillText(`· ${tf} ·`, x, 4); x += ctx.measureText(`· ${tf} ·`).width + 6
+   854→        ctx.fillStyle = up ? UP : DOWN
+   855→        const ltpTxt = c.c.toFixed(2)
+   856→        ctx.fillText(ltpTxt, x, 4); x += ctx.measureText(ltpTxt).width + 8
+   857→        if (livePct != null) {
+   858→          ctx.fillStyle = livePct >= 0 ? UP : DOWN
+   859→          ctx.fillText(`${livePct >= 0 ? '+' : ''}${livePct.toFixed(2)}%`, x, 4); x += ctx.measureText(`${livePct >= 0 ? '+' : ''}${livePct.toFixed(2)}%`).width + 10
+   860→        }
+   861→        const parts: [string, number][] = [['O', c.o], ['H', c.h], ['L', c.l], ['C', c.c]]
+   862→        for (const [k, v] of parts) {
+   863→          ctx.fillStyle = '#8b949e'
+   864→          ctx.fillText(k, x, 4); x += 10
+   865→          ctx.fillStyle = up ? UP : DOWN
+   866→          ctx.fillText(v.toFixed(2), x, 4); x += ctx.measureText(v.toFixed(2)).width + 8
+   867→        }
+   868→        if (c.v > 0) {
+   869→          ctx.fillStyle = '#8b949e'
+   870→          ctx.fillText(`V ${fmtVol(c.v)}`, x, 4); x += ctx.measureText(`V ${fmtVol(c.v)}`).width + 8
+   871→        }
+   872→        ctx.fillStyle = '#56606b'
+   873→        ctx.fillText(fmtAxisTime(idxTime, tf), x, 4)
+   874→        // indicator readouts
+   875→        if (rsiArr) {
+   876→          const i = Math.max(0, Math.min(data.length - 1, Math.round((idxTime - data[0].t) / tfMs)))
+   877→          const v = rsiArr[i]
+   878→          if (v != null) { ctx.fillStyle = v > 70 ? DOWN : v < 30 ? UP : '#f5a623'; ctx.fillText(`RSI ${v.toFixed(1)}`, x, 4) }
+   879→        }
+   880→      }
+   881→      // focus candle: hovered > synced > last
+   882→      let focus: { c: Candle; t: number } | null = { c: lastC, t: lastT }
+   883→      const drawCrossAt = (slotIdx: number, own: boolean, syncPrice: number | null) => {
+   884→        if (slotIdx < 0 || slotIdx >= slots) return
+   885→        const x = xOf(slotIdx)
+   886→        ctx.strokeStyle = CROSS
+   887→        ctx.setLineDash([3, 3])
+   888→        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h - axisH); ctx.stroke()
+   889→        if (own && crossRef.current) {
+   890→          const y = Math.min(priceH, Math.max(0, crossRef.current.y))
+   891→          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke()
+   892→          const price = pMax - (crossRef.current.y / priceH) * (pMax - pMin)
+   893→          ctx.fillStyle = '#2a3441'
+   894→          ctx.fillRect(plotW + 2, y - 8, axisW - 4, 16)
+   895→          ctx.fillStyle = '#e6e9ec'
+   896→          ctx.textAlign = 'center'
+   897→          ctx.textBaseline = 'middle'
+   898→          ctx.fillText(price.toFixed(2), plotW + axisW / 2, y)
+   899→        }
+   900→        if (syncPrice != null && syncPrice >= pMin && syncPrice <= pMax) {
+   901→          const sy = yOf(syncPrice)
+   902→          ctx.strokeStyle = 'rgba(255,255,255,0.16)'
+   903→          ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(plotW, sy); ctx.stroke()
+   904→          ctx.fillStyle = '#2a3441'
+   905→          ctx.fillRect(plotW + 2, sy - 8, axisW - 4, 16)
+   906→          ctx.fillStyle = '#e6e9ec'
+   907→          ctx.textAlign = 'center'
+   908→          ctx.textBaseline = 'middle'
+   909→          ctx.fillText(syncPrice.toFixed(2), plotW + axisW / 2, sy)
+   910→        }
+   911→        ctx.setLineDash([])
+   912→        // time bubble
+   913→        const t = timeOfSlot(slotIdx)
+   914→        ctx.fillStyle = '#2a3441'
+   915→        ctx.textAlign = 'center'
+   916→        ctx.textBaseline = 'top'
+   917→        ctx.fillRect(Math.min(plotW - 48, Math.max(0, x - 24)), h - axisH + 2, 48, 14)
+   918→        ctx.fillStyle = '#e6e9ec'
+   919→        ctx.fillText(fmtAxisTime(t, tf), Math.min(plotW - 24, Math.max(24, x)), h - axisH + 4)
+   920→        const c = vis[slotIdx]
+   921→        if (c) focus = { c, t }
+   922→      }
+   923→
+   924→      // own crosshair
+   925→      if (!mini && crossRef.current && crossRef.current.x < plotW && crossRef.current.y < h - axisH) {
+   926→        const slotIdx = Math.min(slots - 1, Math.max(0, Math.floor(crossRef.current.x / cw)))
+   927→        drawCrossAt(slotIdx, true, null)
+   928→      }
+   929→      // synced crosshair from another chart (same interval)
+   930→      const sc = syncCrossRef.current
+   931→      if (!mini && sc) {
+   932→        // sc.slot carries the candle TIME (set by the sync bus)
+   933→        const slot0 = timeOfSlot(0)
+   934→        const slotIdx = Math.round((sc.slot - slot0) / tfMs)
+   935→        drawCrossAt(slotIdx, false, sc.price)
+   936→      }
+   937→
+   938→      // day change reference for the legend %
+   939→      const fc = focus as { c: Candle; t: number } | null
+   940→      if (fc) {
+   941→        const pct = dayRef ? ((fc.c.c - dayRef) / dayRef) * 100 : null
+   942→        drawLegend(fc.c, fc.t, pct)
+   943→      }
+   944→    }
+   945→
+   946→    const loop = () => { draw(); raf = requestAnimationFrame(loop) }
+   947→    raf = requestAnimationFrame(loop)
+   948→    const ro = new ResizeObserver(() => forceRender(n => n + 1))
+   949→    ro.observe(wrap)
+   950→    return () => { cancelAnimationFrame(raf); ro.disconnect() }
+   951→  }, [candles, ghost, barCount, chartType, showVolume, showSMA20, showSMA50, showEMA, showVWAP, showBOLL, showRSI, showMACD, showGhost, ghostStyle, scales, markers, symbol, tf, loading, err, mini])
+   952→
+   953→  // ---- interactions ----
+   954→  const onWheel = (e: React.WheelEvent) => {
+   955→    e.preventDefault()
+   956→    const rect = canvasRef.current!.getBoundingClientRect()
+   957→    const x = e.clientX - rect.left
+   958→    const win = winRef.current
+   959→    const f = e.deltaY > 0 ? 1.15 : 0.87
+   960→    if ((win.plotW > 0 && x >= win.plotW) || e.shiftKey) {
+   961→      priceZoomRef.current = Math.max(0.15, Math.min(10, priceZoomRef.current * f))
+   962→    } else {
+   963→      setBarCount(b => Math.max(25, Math.min(900, Math.round(b * f))))
+   964→    }
+   965→    setDirty(true)
+   966→  }
+   967→  const onMouseDown = (e: React.MouseEvent) => {
+   968→    const rect = canvasRef.current!.getBoundingClientRect()
+   969→    const x = e.clientX - rect.left
+   970→    const y = e.clientY - rect.top
+   971→    const win = winRef.current
+   972→    // baseline drag zone (scales % / pts enabled): grab within 5px of the line
+   973→    const sc = scales
+   974→    const baselineEnabled = sc && (sc.pct || sc.inv || sc.pts) && !mini
+   975→    if (baselineEnabled && x < win.plotW && y <= win.priceH) {
+   976→      const meta = drawMetaRef.current
+   977→      if (meta.yBase >= 0 && Math.abs(y - meta.yBase) <= 5) {
+   978→        baseRef.current = meta.baseline // freeze the (possibly default) baseline
+   979→        dragRef.current = { zone: 'base', startX: e.clientX, startY: e.clientY, startOffset: 0, startPriceOff: 0, startPriceZoom: 1, pxPerPx: (win.pMax - win.pMin) / (win.priceH || 1), moved: 0 }
+   980→        return
+   981→      }
+   982→    }
+   983→    const zone: DragState['zone'] = x >= win.plotW ? 'price' : y >= win.h - win.axisH ? 'time' : 'plot'
+   984→    dragRef.current = {
+   985→      zone,
+   986→      startX: e.clientX,
+   987→      startY: e.clientY,
+   988→      startOffset: offsetRef.current,
+   989→      startPriceOff: priceOffRef.current,
+   990→      startPriceZoom: priceZoomRef.current,
+   991→      pxPerPx: win.priceH > 0 ? (win.pMax - win.pMin) / win.priceH : 1,
+   992→      moved: 0,
+   993→    }
+   994→  }
+   995→  const onMouseMove = (e: React.MouseEvent) => {
+   996→    const rect = canvasRef.current!.getBoundingClientRect()
+   997→    crossRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
+   998→    const win = winRef.current
+   999→    // publish to the sync bus (same-interval charts follow)
+  1000→    if (win.plotW > 0 && candles.length > 1) {
+  1001→      const tfMs = TF_MS[tf as keyof typeof TF_MS] ?? 60_000
+  1002→      const end = candles.length - Math.round(offsetRef.current)
+  1003→      const start = Math.min(end - barCount, candles.length - 2)
+  1004→      const cw = win.plotW / (end - start)
+  1005→      const slotIdx = Math.floor((e.clientX - rect.left) / cw)
+  1006→      const di = start + slotIdx
+  1007→      const lastT = candles[candles.length - 1].t
+  1008→      const t = di < candles.length ? candles[di].t : lastT + (di - (candles.length - 1)) * tfMs
+  1009→      const price = e.clientY - rect.top <= win.priceH
+  1010→        ? win.pMax - ((e.clientY - rect.top) / win.priceH) * (win.pMax - win.pMin)
+  1011→        : null
+  1012→      emitCross({ src: chartId.current, tf, t, price })
+  1013→    }
+  1014→    const d = dragRef.current
+  1015→    if (!d) return
+  1016→    d.moved = Math.max(d.moved, Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY))
+  1017→    if (d.zone === 'base') {
+  1018→      // drag the baseline — % and pts scales follow ("rearrange")
+  1019→      const y = Math.min(win.priceH, Math.max(0, e.clientY - rect.top))
+  1020→      baseRef.current = Number((win.pMax - (y / (win.priceH || 1)) * (win.pMax - win.pMin)).toFixed(2))
+  1021→      return
+  1022→    }
+  1023→    if (d.zone === 'price') {
+  1024→      const f = Math.exp((d.startY - e.clientY) / 180)
+  1025→      priceZoomRef.current = Math.max(0.15, Math.min(10, d.startPriceZoom * f))
+  1026→      return
+  1027→    }
+  1028→    // horizontal pan — negative offset = future space
+  1029→    const cwAvg = Math.max(0.5, (sizeRef.current.w - (mini ? 46 : 58)) / barCount)
+  1030→    const barsMoved = Math.round((e.clientX - d.startX) / cwAvg)
+  1031→    const maxOff = candles.length - 25
+  1032→    offsetRef.current = Math.max(-FUTURE_BARS, Math.min(maxOff, d.startOffset + barsMoved))
+  1033→    if (d.zone === 'plot') {
+  1034→      priceOffRef.current = d.startPriceOff + (e.clientY - d.startY) * d.pxPerPx
+  1035→    }
+  1036→    setDirty(true)
+  1037→  }
+  1038→  const onMouseUp = (e: React.MouseEvent) => {
+  1039→    const d = dragRef.current
+  1040→    dragRef.current = null
+  1041→    if (!d || d.moved >= 4) return
+  1042→    const rect = canvasRef.current!.getBoundingClientRect()
+  1043→    const x = e.clientX - rect.left
+  1044→    const y = e.clientY - rect.top
+  1045→    const win = winRef.current
+  1046→    if (x < win.plotW && y < win.priceH && win.pMax > win.pMin) {
+  1047→      const price = Number((win.pMax - (y / win.priceH) * (win.pMax - win.pMin)).toFixed(2))
+  1048→      // scales baseline pick mode — consumed by the first chart clicked
+  1049→      if (pickRef.current) {
+  1050→        baseRef.current = price
+  1051→        pickRef.current = false
+  1052→        setBaseArmed(false)
+  1053→        window.dispatchEvent(new Event(BASE_SET_EVENT))
+  1054→        return
+  1055→      }
+  1056→      onPriceClick?.(price)
+  1057→    }
+  1058→  }
+  1059→  const onMouseLeave = () => {
+  1060→    crossRef.current = null
+  1061→    dragRef.current = null
+  1062→    emitCross({ src: chartId.current, tf, t: null, price: null })
+  1063→  }
+  1064→  const resetView = () => {
+  1065→    offsetRef.current = 0
+  1066→    priceZoomRef.current = 1
+  1067→    priceOffRef.current = 0
+  1068→    baseRef.current = null // baseline returns to the day-open ref
+  1069→    setBarCount(mini ? 60 : 120)
+  1070→    setDirty(false)
+  1071→  }
+  1072→
+  1073→  return (
+  1074→    <div ref={wrapRef} className={`relative w-full ${height} select-none`} data-chart-root>
+  1075→      <canvas
+  1076→        ref={canvasRef}
+  1077→        className="absolute inset-0 cursor-crosshair"
+  1078→        onWheel={onWheel}
+  1079→        onMouseDown={onMouseDown}
+  1080→        onMouseMove={onMouseMove}
+  1081→        onMouseUp={onMouseUp}
+  1082→        onMouseLeave={onMouseLeave}
+  1083→        onDoubleClick={resetView}
+  1084→      />
+  1085→      <div className="absolute right-16 top-1.5 flex gap-2 text-[9px] text-muted-foreground pointer-events-none">
+  1086→        {showSMA20 && <span className="text-[#4dd0e1]">SMA20</span>}
+  1087→        {showSMA50 && <span className="text-[#b48ce8]">SMA50</span>}
+  1088→        {showEMA && <span className="text-[#ffd166]">EMA9/21</span>}
+  1089→        {showVWAP && <span className="text-[#4dd0e1]">VWAP</span>}
+  1090→        {showBOLL && <span className="text-muted-foreground">BB</span>}
+  1091→        {showGhost && tf !== '1m' && <span className="text-[#e0a63f]">1M GHOST</span>}
+  1092→      </div>
+  1093→      {baseArmed && (
+  1094→        <div className="absolute left-1/2 top-1.5 -translate-x-1/2 px-2 py-0.5 rounded bg-[#e0a63f] text-black text-[9px] font-bold pointer-events-none">
+  1095→          click the chart to set the scales baseline
+  1096→        </div>
+  1097→      )}
+  1098→      {!dirty && !mini && (
+  1099→        <div className="absolute bottom-6 right-14 text-[9px] text-muted-foreground/60 pointer-events-none flex items-center gap-1">
+  1100→          <span className="h-1.5 w-1.5 rounded-full bg-[#00c896] pulse-dot" /> LIVE
+  1101→        </div>
+  1102→      )}
+  1103→      {dirty && (
+  1104→        <button
+  1105→          onClick={resetView}
+  1106→          title="Reset chart to live price action (latest bar)"
+  1107→          className="absolute bottom-6 right-14 px-1.5 py-0.5 rounded bg-primary/80 text-primary-foreground text-[9px] font-bold hover:bg-primary shadow flex items-center gap-1"
+  1108→        >
+  1109→          <span className="text-[8px]">▶</span> LIVE
+  1110→        </button>
+  1111→      )}
+  1112→    </div>
+  1113→  )
+  1114→}
+  1115→

@@ -1,0 +1,619 @@
+     1→'use client'
+     2→
+     3→import { useEffect, useMemo, useState } from 'react'
+     4→import { useQuery } from '@tanstack/react-query'
+     5→import { toast } from 'sonner'
+     6→import { LineChart, Pencil, Plus, Power, Trash2 } from 'lucide-react'
+     7→import { Input } from '@/components/ui/input'
+     8→import { Button } from '@/components/ui/button'
+     9→import { api, fmtMoney } from '../lib/client-api'
+    10→import type { ChainStrikeRow, OptionQuoteCell } from '../lib/client-api'
+    11→import {
+    12→  useTerminal, defaultStrikes, pinStrikePanes,
+    13→  type StrikesCfg, type StrikeRowCfg, type WorkspaceCfg,
+    14→} from '../lib/store'
+    15→
+    16→// ============================================================
+    17→// F&O Strikes panel (right dock tab) — compact build.
+    18→// - Quick-add: [ATM] + [+/-] toggle + [1..5] offset buttons.
+    19→//   Hedge-desk ATM convention: CE ATM = floor(spot/step)*step,
+    20→//   PE ATM = ceil(spot/step)*step (spot 23020 -> CE 23000 / PE 23050).
+    21→// - Per-strike alloc % — CE-side enabled strikes auto-normalize
+    22→//   to 100%, PE-side likewise (independent per side).
+    23→// - Strike rows: enable, alloc%, strike (click -> load into the
+    24→//   CE/PE chart pane), side offset, LTP, day H/L, B/S/X, edit.
+    25→// - Quick deploy: Deploy CE / Deploy PE / Cancel CE / PE Swap.
+    26→// ============================================================
+    27→
+    28→const OFFSETS = [1, 2, 3, 4, 5] as const
+    29→
+    30→/** Re-scale one side's enabled rows so they always sum to 100%. */
+    31→function normalizeSide(rows: StrikeRowCfg[], type: 'CE' | 'PE'): StrikeRowCfg[] {
+    32→  const side = rows.filter(r => r.type === type && r.enabled)
+    33→  if (side.length === 0) return rows
+    34→  const list = side.map(r => ({ ...r }))
+    35→  const n = list.length
+    36→  // zero/unset allocs enter with an equal-share weight, then everything
+    37→  // is proportionally scaled so the side sums to exactly 100
+    38→  for (const r of list) if (!(r.allocPct > 0)) r.allocPct = 100 / n
+    39→  const total = list.reduce((s, r) => s + r.allocPct, 0)
+    40→  for (const r of list) r.allocPct = Math.round((r.allocPct / total) * 1000) / 10
+    41→  // dump rounding drift on the largest allocation
+    42→  const drift = Math.round((100 - list.reduce((s, r) => s + r.allocPct, 0)) * 10) / 10
+    43→  if (drift !== 0) {
+    44→    const big = list.reduce((a, b) => (b.allocPct > a.allocPct ? b : a))
+    45→    big.allocPct = Math.round(Math.max(0, big.allocPct + drift) * 10) / 10
+    46→  }
+    47→  const fixed = new Map(list.map(r => [r.id, r] as const))
+    48→  return rows.map(r => fixed.get(r.id) ?? r)
+    49→}
+    50→
+    51→export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
+    52→  const patchWs = useTerminal(s => s.patchWs)
+    53→  const st: StrikesCfg = useMemo(() => ws.strikes ?? defaultStrikes(), [ws])
+    54→
+    55→  const { data: undData } = useQuery({
+    56→    queryKey: ['optionUnderlyings'],
+    57→    queryFn: () => api.optionUnderlyings(),
+    58→    staleTime: 5 * 60_000,
+    59→  })
+    60→  const underlyings = undData?.underlyings ?? []
+    61→
+    62→  // auto-bind the workspace's F&O symbol on first open
+    63→  useEffect(() => {
+    64→    if (!st.underlying && underlyings.some(u => u.underlying === ws.symbol)) {
+    65→      patchWs(ws.id, { strikes: { ...st, underlying: ws.symbol } })
+    66→    }
+    67→  }, [st.underlying, underlyings, ws.symbol, ws.id, patchWs]) // eslint-disable-line react-hooks/exhaustive-deps
+    68→
+    69→  const underlying = st.underlying
+    70→  const strikesParam = useMemo(() => [...new Set(st.rows.map(r => r.strike))].sort((a, b) => a - b), [st.rows])
+    71→
+    72→  const { data: chainData, refetch: refetchChain } = useQuery({
+    73→    queryKey: ['optionChain', underlying, st.expiry, strikesParam.join(',')],
+    74→    queryFn: () => api.optionChain(underlying!, st.expiry, strikesParam),
+    75→    enabled: !!underlying,
+    76→    refetchInterval: 1000,
+    77→  })
+    78→  const meta = chainData?.meta ?? null
+    79→  const rowByStrike = useMemo(() => {
+    80→    const m = new Map<number, ChainStrikeRow>()
+    81→    for (const r of chainData?.rows ?? []) m.set(r.strike, r)
+    82→    return m
+    83→  }, [chainData])
+    84→
+    85→  const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), refetchInterval: 2000 })
+    86→  const posBySymbol = useMemo(() => {
+    87→    const m = new Map<string, { netQty: number; avgPrice: number; unrealizedPnl: number }>()
+    88→    for (const p of posData?.bySymbol ?? []) m.set(p.symbol, p)
+    89→    return m
+    90→  }, [posData])
+    91→
+    92→  const [specific, setSpecific] = useState('')
+    93→  const [sign, setSign] = useState<1 | -1>(1)
+    94→  const [busy, setBusy] = useState(false)
+    95→  const [expanded, setExpanded] = useState<string | null>(null)
+    96→
+    97→  const setStrikes = (next: Partial<StrikesCfg>) => patchWs(ws.id, { strikes: { ...st, ...next } })
+    98→
+    99→  const addStrike = async (strike: number, type: 'CE' | 'PE') => {
+   100→    if (!underlying) { toast.error('Pick an F&O underlying first'); return }
+   101→    const id = `${strike}:${type}`
+   102→    // read fresh store state (consecutive/parallel adds must not clobber each other)
+   103→    const before = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+   104→    if (before.rows.some(r => r.id === id)) { toast.info(`${strike} ${type} already in list`); return }
+   105→    try {
+   106→      const r = await api.ensureStrike(underlying, strike, st.expiry)
+   107→      if (r.created > 0) toast.success(`Contracts ready — ${r.symbols.join(', ')}`)
+   108→    } catch (e) {
+   109→      toast.error(e instanceof Error ? e.message : 'Failed to create contracts')
+   110→      return
+   111→    }
+   112→    // re-read AFTER the await so an interleaved add is not overwritten
+   113→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? before
+   114→    if (cur.rows.some(r => r.id === id)) { return }
+   115→    const rows = normalizeSide([...cur.rows, { id, strike, type, enabled: true, allocPct: 0 }], type)
+   116→    patchWs(ws.id, { strikes: { ...cur, rows } })
+   117→    setTimeout(() => refetchChain(), 150)
+   118→  }
+   119→
+   120→  /** ATM -> CE@ceAtm + PE@peAtm · offset n -> CE/PE n steps from their side ATM.
+   121→   *  Sequential (not Promise.all) — parallel adds would race on the store. */
+   122→  const addOffset = async (n: number) => {
+   123→    if (!meta) { toast.error('Chain not loaded yet'); return }
+   124→    if (n === 0) {
+   125→      await addStrike(meta.ceAtm, 'CE')
+   126→      await addStrike(meta.peAtm, 'PE')
+   127→      return
+   128→    }
+   129→    const ce = meta.ceAtm + sign * n * meta.step
+   130→    const pe = meta.peAtm + sign * n * meta.step
+   131→    await addStrike(ce, 'CE')
+   132→    await addStrike(pe, 'PE')
+   133→  }
+   134→
+   135→  const addSpecific = async () => {
+   136→    const raw = Number(specific)
+   137→    if (!underlying || !Number.isFinite(raw) || raw <= 0) { toast.error('Enter a valid strike'); return }
+   138→    const step = meta?.step ?? 50
+   139→    const snapped = Math.round(raw / step) * step
+   140→    if (snapped !== raw) toast.info(`Snapped ${raw} → ${snapped} (step ${step})`)
+   141→    setSpecific('')
+   142→    await addStrike(snapped, 'CE')
+   143→    await addStrike(snapped, 'PE')
+   144→  }
+   145→
+   146→  const toggleRow = (row: StrikeRowCfg) => {
+   147→    const rows = st.rows.map(r => (r.id === row.id ? { ...r, enabled: !r.enabled } : r))
+   148→    setStrikes({ rows: normalizeSide(rows, row.type) })
+   149→  }
+   150→
+   151→  const setAlloc = (row: StrikeRowCfg, v: number) => {
+   152→    const clamped = Math.max(0, Math.min(100, Number.isFinite(v) ? v : 0))
+   153→    const rows = st.rows.map(r => (r.id === row.id ? { ...r, allocPct: clamped } : r))
+   154→    setStrikes({ rows: normalizeSide(rows, row.type) })
+   155→  }
+   156→
+   157→  const removeRow = (row: StrikeRowCfg) => {
+   158→    const rows = st.rows.filter(r => r.id !== row.id)
+   159→    setStrikes({ rows: normalizeSide(rows, row.type) })
+   160→    setExpanded(null)
+   161→  }
+   162→
+   163→  const pinToPane = (row: StrikeRowCfg) => {
+   164→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id) ?? ws
+   165→    patchWs(ws.id, pinStrikePanes(cur, row.strike, row.type))
+   166→  }
+   167→
+   168→  // --- order helpers ---
+   169→  const rowsFor = (type: 'CE' | 'PE') => st.rows.filter(r => r.type === type && r.enabled)
+   170→
+   171→  const cellFor = (row: StrikeRowCfg): OptionQuoteCell | null => {
+   172→    const c = rowByStrike.get(row.strike)
+   173→    if (!c) return null
+   174→    return row.type === 'CE' ? c.ce : c.pe
+   175→  }
+   176→
+   177→  const deploy = async (type: 'CE' | 'PE') => {
+   178→    const rows = rowsFor(type)
+   179→    if (rows.length === 0) { toast.error(`No enabled ${type} strikes`); return }
+   180→    setBusy(true)
+   181→    let filled = 0, failed = 0
+   182→    for (const row of rows) {
+   183→      const cell = cellFor(row)
+   184→      if (!cell?.exists || !(row.allocPct > 0)) { failed++; continue }
+   185→      try {
+   186→        const res = await api.placeOrder({
+   187→          symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
+   188→          orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
+   189→        })
+   190→        filled += res.legs.filter(l => l.status === 'FILLED').length
+   191→        if (res.status === 'FAILED') failed++
+   192→      } catch { failed++ }
+   193→    }
+   194→    setBusy(false)
+   195→    filled > 0
+   196→      ? toast.success(`Deploy ${type} — ${filled} legs filled${failed ? `, ${failed} skipped` : ''}`)
+   197→      : toast.error(`Deploy ${type} failed — ${failed} strikes skipped`)
+   198→  }
+   199→
+   200→  const cancelType = async (type: 'CE' | 'PE') => {
+   201→    const syms = rowsFor(type).map(r => cellFor(r)?.symbol).filter((s): s is string => !!s)
+   202→    if (syms.length === 0) { toast.error(`No enabled ${type} strikes`); return }
+   203→    try {
+   204→      const r = await api.cancelAll(syms)
+   205→      r.cancelled > 0 ? toast.success(`Cancelled ${r.cancelled} pending ${type} orders`) : toast.info(`No pending ${type} orders`)
+   206→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Cancel failed') }
+   207→  }
+   208→
+   209→  const peSwap = async () => {
+   210→    const ceRows = rowsFor('CE')
+   211→    const ceSyms = ceRows.map(r => cellFor(r)?.symbol).filter((s): s is string => !!s)
+   212→    setBusy(true)
+   213→    try {
+   214→      if (ceSyms.length > 0) {
+   215→        const so = await api.squareOffAll(false, ceSyms)
+   216→        toast.success(`CE squared off — ${so.filledLegs} legs`)
+   217→      }
+   218→      // flip on: deploy PE on enabled PE rows (auto-add PE ATM if none listed)
+   219→      let peRows = rowsFor('PE')
+   220→      if (peRows.length === 0) {
+   221→        if (meta) {
+   222→          await addStrike(meta.peAtm, 'PE')
+   223→          await new Promise(r => setTimeout(r, 500))
+   224→          const ws2 = useTerminal.getState().workspaces.find(w => w.id === ws.id)
+   225→          peRows = (ws2?.strikes?.rows ?? []).filter(r => r.type === 'PE' && r.enabled)
+   226→        }
+   227→      }
+   228→      let filled = 0, failed = 0
+   229→      const allStrikes = [...new Set(st.rows.map(r => r.strike))]
+   230→      const cd = await api.optionChain(underlying!, st.expiry, allStrikes)
+   231→      const fresh = new Map<number, ChainStrikeRow>(cd.rows.map(r => [r.strike, r]))
+   232→      for (const row of peRows) {
+   233→        const c = fresh.get(row.strike)
+   234→        const cell = row.type === 'PE' ? c?.pe : c?.ce
+   235→        if (!cell?.exists) { failed++; continue }
+   236→        try {
+   237→          const res = await api.placeOrder({
+   238→            symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
+   239→            orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
+   240→          })
+   241→          filled += res.legs.filter(l => l.status === 'FILLED').length
+   242→          if (res.status === 'FAILED') failed++
+   243→        } catch { failed++ }
+   244→      }
+   245→      toast.success(`PE Swap complete — ${filled} legs filled${failed ? `, ${failed} skipped` : ''}`)
+   246→    } catch (e) {
+   247→      toast.error(e instanceof Error ? e.message : 'PE Swap failed')
+   248→    } finally { setBusy(false) }
+   249→  }
+   250→
+   251→  const rowBuy = async (row: StrikeRowCfg) => {
+   252→    const cell = cellFor(row)
+   253→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   254→    try {
+   255→      const res = await api.placeOrder({
+   256→        symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
+   257→        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
+   258→      })
+   259→      res.status === 'FAILED' ? toast.error(`BUY failed — ${res.message}`) : toast.success(`BUY ${row.strike} ${row.type} — ${res.legs.filter(l => l.status === 'FILLED').length}/${res.legs.length} legs`)
+   260→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+   261→  }
+   262→
+   263→  const rowSell = async (row: StrikeRowCfg) => {
+   264→    const cell = cellFor(row)
+   265→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   266→    const pos = posBySymbol.get(cell.symbol)
+   267→    if (pos && pos.netQty > 0) {
+   268→      // long position -> Sell means exit
+   269→      const so = await api.squareOffAll(false, [cell.symbol])
+   270→      toast.success(`Exited long — ${so.filledLegs} legs`)
+   271→      return
+   272→    }
+   273→    try {
+   274→      const res = await api.placeOrder({
+   275→        symbol: cell.symbol, exchange: 'NFO', side: 'SELL', qty: 0,
+   276→        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', capitalPct: row.allocPct,
+   277→      })
+   278→      res.status === 'FAILED' ? toast.error(`SELL failed — ${res.message}`) : toast.success(`SELL ${row.strike} ${row.type} — ${res.legs.filter(l => l.status === 'FILLED').length}/${res.legs.length} legs`)
+   279→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+   280→  }
+   281→
+   282→  const rowExit = async (row: StrikeRowCfg) => {
+   283→    const cell = cellFor(row)
+   284→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   285→    const pos = posBySymbol.get(cell.symbol)
+   286→    if (!pos || pos.netQty === 0) { toast.info('No open position'); return }
+   287→    try {
+   288→      const so = await api.squareOffAll(false, [cell.symbol])
+   289→      so.orders > 0 ? toast.success(`Exit ${row.strike} ${row.type} — ${so.filledLegs} legs`) : toast.info('Nothing to exit')
+   290→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Exit failed') }
+   291→  }
+   292→
+   293→  const ceRows = useMemo(() => st.rows.filter(r => r.type === 'CE').sort((a, b) => a.strike - b.strike), [st.rows])
+   294→  const peRows = useMemo(() => st.rows.filter(r => r.type === 'PE').sort((a, b) => a.strike - b.strike), [st.rows])
+   295→  const sideSum = (type: 'CE' | 'PE') =>
+   296→    Math.round(st.rows.filter(r => r.type === type && r.enabled).reduce((s, r) => s + r.allocPct, 0) * 10) / 10
+   297→
+   298→  const offsetFor = (row: StrikeRowCfg): number | null => {
+   299→    const chainRow = rowByStrike.get(row.strike)
+   300→    if (!chainRow) return null
+   301→    return row.type === 'CE' ? chainRow.offsetCe : chainRow.offsetPe
+   302→  }
+   303→
+   304→  const renderRow = (row: StrikeRowCfg) => {
+   305→    const cell = cellFor(row)
+   306→    const offset = offsetFor(row)
+   307→    const pos = cell?.exists ? posBySymbol.get(cell.symbol) : undefined
+   308→    const lots = pos ? Math.abs(pos.netQty) / (meta?.lotSize || 1) : 0
+   309→    const pinned = (row.type === 'CE' ? ws.panes?.find(p => p.key === 'ce') : ws.panes?.find(p => p.key === 'pe'))?.strike === row.strike
+   310→    return (
+   311→      <div key={row.id} className={expanded === row.id ? 'bg-accent/40' : ''}>
+   312→        <div className="flex items-center gap-1 px-1.5 py-1">
+   313→          <button
+   314→            onClick={() => toggleRow(row)}
+   315→            title={row.enabled ? 'Enabled for deploy — click to disable' : 'Disabled — click to enable'}
+   316→            className={`h-3.5 w-3.5 rounded-sm border flex items-center justify-center shrink-0 ${
+   317→              row.enabled ? 'bg-primary border-primary' : 'border-muted-foreground/40'
+   318→            }`}
+   319→          >
+   320→            {row.enabled && <Power className="h-2.5 w-2.5 text-primary-foreground" />}
+   321→          </button>
+   322→          <AllocInput value={row.allocPct} enabled={row.enabled} onCommit={v => setAlloc(row, v)} />
+   323→          <button
+   324→            onClick={() => pinToPane(row)}
+   325→            title={`Load ${row.strike} ${row.type} into the ${row.type} chart pane`}
+   326→            className={`w-[52px] shrink-0 text-left leading-tight hover:bg-accent/70 rounded px-0.5 -mx-0.5 ${pinned ? 'ring-1 ring-primary/60 rounded' : ''}`}
+   327→          >
+   328→            <span className="block tabular font-semibold text-[11px]">{row.strike}</span>
+   329→            <span className={`block text-[8px] font-bold ${row.type === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>
+   330→              {row.type}{offset == null ? '' : offset === 0 ? ' ·ATM' : offset > 0 ? ` +${offset}` : ` ${offset}`}
+   331→            </span>
+   332→          </button>
+   333→          <div className="flex-1 min-w-0 text-right pr-1">
+   334→            <div className={`tabular ${cell && cell.ltp >= cell.prevClose ? 'term-up' : 'term-down'}`}>
+   335→              {cell?.exists ? fmtMoney(cell.ltp) : '—'}
+   336→            </div>
+   337→            <div className="tabular text-[9px] text-muted-foreground">
+   338→              {cell?.exists ? `${fmtMoney(cell.high, 1)}/${fmtMoney(cell.low, 1)}` : 'H/L —'}
+   339→            </div>
+   340→          </div>
+   341→          {lots > 0 && (
+   342→            <span className={`text-[8px] px-1 rounded ${pos && pos.netQty > 0 ? 'bg-up text-[#00c896]' : 'bg-down text-[#ff4d5e]'}`} title={`${lots} lots @ ${fmtMoney(pos!.avgPrice)}`}>
+   343→              {pos && pos.netQty > 0 ? 'L' : 'S'}{lots}
+   344→            </span>
+   345→          )}
+   346→          <div className="flex gap-0.5 shrink-0">
+   347→            <button onClick={() => rowBuy(row)} className="px-1 py-0.5 rounded bg-up text-[#00c896] hover:brightness-125 text-[9px] font-bold">B</button>
+   348→            <button onClick={() => rowSell(row)} className="px-1 py-0.5 rounded bg-down text-[#ff4d5e] hover:brightness-125 text-[9px] font-bold">S</button>
+   349→            <button onClick={() => rowExit(row)} className="px-1 py-0.5 rounded bg-secondary text-muted-foreground hover:text-foreground text-[9px] font-bold">X</button>
+   350→            <button
+   351→              onClick={() => setExpanded(expanded === row.id ? null : row.id)}
+   352→              className={`p-0.5 rounded ${expanded === row.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+   353→              title="Edit open position"
+   354→            >
+   355→              <Pencil className="h-2.5 w-2.5" />
+   356→            </button>
+   357→          </div>
+   358→        </div>
+   359→
+   360→        {expanded === row.id && (
+   361→          <StrikeRowEditor
+   362→            row={row}
+   363→            cell={cell}
+   364→            lots={lots}
+   365→            pos={pos ?? null}
+   366→            lotSize={meta?.lotSize ?? 1}
+   367→            onApply={async (deltaLots) => {
+   368→              const cell2 = cellFor(row)
+   369→              if (!cell2?.exists) return
+   370→              if (deltaLots > 0) {
+   371→                const res = await api.placeOrder({
+   372→                  symbol: cell2.symbol, exchange: 'NFO', side: 'BUY', qty: deltaLots,
+   373→                  orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
+   374→                })
+   375→                res.status === 'FAILED' ? toast.error(`Add failed — ${res.message}`) : toast.success(`+${deltaLots} lot(s)/leg — ${res.legs.filter(l => l.status === 'FILLED').length} legs`)
+   376→              } else if (deltaLots < 0) {
+   377→                await api.placeOrder({
+   378→                  symbol: cell2.symbol, exchange: 'NFO', side: 'SELL', qty: Math.abs(deltaLots),
+   379→                  orderType: 'MARKET', productType: 'MIS', source: 'MANUAL', reduceOnly: true,
+   380→                })
+   381→                toast.success(`${deltaLots} lot(s)/leg exited`)
+   382→              }
+   383→            }}
+   384→            onExit={async () => {
+   385→              const cell2 = cellFor(row)
+   386→              if (!cell2) return
+   387→              const so = await api.squareOffAll(false, [cell2.symbol])
+   388→              toast.success(`Exited — ${so.filledLegs} legs`)
+   389→            }}
+   390→            onRemove={() => removeRow(row)}
+   391→          />
+   392→        )}
+   393→      </div>
+   394→    )
+   395→  }
+   396→
+   397→  const sideHeader = (type: 'CE' | 'PE') => {
+   398→    const sum = sideSum(type)
+   399→    const n = st.rows.filter(r => r.type === type && r.enabled).length
+   400→    const tint = type === 'CE' ? 'text-[#00c896]' : 'text-[#ff4d5e]'
+   401→    return (
+   402→      <div className="flex items-center gap-1.5 px-1.5 py-0.5 bg-secondary/40 border-b border-border/60 sticky top-0 z-10">
+   403→        <span className={`text-[9px] font-bold ${tint}`}>{type}</span>
+   404→        <span className="text-[8px] text-muted-foreground">
+   405→          {type === 'CE' && meta ? `ATM ${meta.ceAtm}` : meta ? `ATM ${meta.peAtm}` : ''}
+   406→        </span>
+   407→        <div className="flex-1" />
+   408→        <span className={`text-[8px] tabular px-1 rounded ${sum === 100 ? 'bg-up/60 text-[#00c896]' : 'bg-amber-500/15 text-amber-400'}`} title="Enabled strikes alloc sum (auto-normalized to 100%)">
+   409→          Σ {sum}%
+   410→        </span>
+   411→        <span className="text-[8px] text-muted-foreground">{n} on</span>
+   412→      </div>
+   413→    )
+   414→  }
+   415→
+   416→  return (
+   417→    <div className="flex h-full flex-col text-[11px]">
+   418→      {/* underlying + expiry selectors */}
+   419→      <div className="p-1.5 space-y-1 border-b border-border">
+   420→        <div className="flex gap-1">
+   421→          <select
+   422→            value={underlying ?? ''}
+   423→            onChange={e => setStrikes({ underlying: e.target.value || null })}
+   424→            className="h-6 flex-1 min-w-0 rounded bg-secondary/60 px-1 text-[10px] outline-none"
+   425→          >
+   426→            <option value="">F&O underlying…</option>
+   427→            {underlyings.map(u => (
+   428→              <option key={u.underlying} value={u.underlying}>{u.underlying} · L{u.lotSize}</option>
+   429→            ))}
+   430→          </select>
+   431→          <select
+   432→            value={st.expiry ?? ''}
+   433→            onChange={e => setStrikes({ expiry: e.target.value || null })}
+   434→            disabled={!meta}
+   435→            className="h-6 w-[92px] rounded bg-secondary/60 px-1 text-[9px] outline-none"
+   436→          >
+   437→            <option value="">Nearest</option>
+   438→            {(meta?.expiries ?? []).map(x => <option key={x} value={x}>{x}</option>)}
+   439→          </select>
+   440→        </div>
+   441→        <div className="flex items-center justify-between tabular text-[9px]">
+   442→          <span className="text-muted-foreground">
+   443→            Spot <b className={meta && meta.spot >= meta.prevClose ? 'term-up' : 'term-down'}>{meta ? fmtMoney(meta.spot) : '—'}</b>
+   444→          </span>
+   445→          <span className="text-muted-foreground">
+   446→            C<b className="text-[#00c896]">{meta?.ceAtm ?? '—'}</b> P<b className="text-[#ff4d5e]">{meta?.peAtm ?? '—'}</b>
+   447→          </span>
+   448→          <span className="text-muted-foreground">s{meta?.step ?? '—'} L{meta?.lotSize ?? '—'}</span>
+   449→        </div>
+   450→
+   451→        {/* compact quick-add: ATM + sign toggle + offset 1..5 */}
+   452→        {meta && (
+   453→          <div className="space-y-1 pt-0.5">
+   454→            <div className="flex items-center gap-0.5">
+   455→              <button
+   456→                onClick={() => addOffset(0)}
+   457→                title={`Add ATM pair — CE ${meta.ceAtm} + PE ${meta.peAtm}`}
+   458→                className="flex-1 px-0 py-0.5 rounded text-[9px] font-bold bg-primary/25 text-foreground hover:bg-primary/40 transition-colors"
+   459→              >ATM</button>
+   460→              <button
+   461→                onClick={() => setSign(s => (s === 1 ? -1 : 1))}
+   462→                title={`Direction for offset buttons: ${sign === 1 ? 'above ATM (OTM CE / ITM PE)' : 'below ATM (ITM CE / OTM PE)'}`}
+   463→                className="w-6 px-0 py-0.5 rounded text-[9px] font-bold bg-secondary/70 text-foreground hover:bg-accent transition-colors tabular"
+   464→              >{sign === 1 ? '+' : '−'}</button>
+   465→              {OFFSETS.map(o => {
+   466→                const ce = meta.ceAtm + sign * o * meta.step
+   467→                const pe = meta.peAtm + sign * o * meta.step
+   468→                const added = st.rows.some(r => r.id === `${ce}:CE`) && st.rows.some(r => r.id === `${pe}:PE`)
+   469→                return (
+   470→                  <button
+   471→                    key={o}
+   472→                    onClick={() => addOffset(o)}
+   473→                    title={`${sign === 1 ? '+' : '−'}${o} → CE ${ce} · PE ${pe}`}
+   474→                    className={`flex-1 px-0 py-0.5 rounded text-[9px] tabular transition-colors ${
+   475→                      added ? 'bg-primary/25 text-foreground' : 'bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-accent'
+   476→                    }`}
+   477→                  >{o}</button>
+   478→                )
+   479→              })}
+   480→            </div>
+   481→            <div className="flex gap-1">
+   482→              <Input
+   483→                value={specific}
+   484→                onChange={e => setSpecific(e.target.value.replace(/[^0-9.]/g, ''))}
+   485→                onKeyDown={e => e.key === 'Enter' && addSpecific()}
+   486→                placeholder="Specific strike…"
+   487→                className="h-6 flex-1 min-w-0 text-[10px] bg-secondary/60"
+   488→              />
+   489→              <Button size="sm" variant="secondary" className="h-6 px-1.5 text-[10px]" onClick={addSpecific} disabled={!specific}>
+   490→                <Plus className="h-3 w-3" />
+   491→              </Button>
+   492→            </div>
+   493→          </div>
+   494→        )}
+   495→      </div>
+   496→
+   497→      {/* strike rows — grouped CE / PE */}
+   498→      <div className="flex-1 overflow-y-auto">
+   499→        {st.rows.length === 0 && (
+   500→          <div className="p-3 text-center text-[10px] text-muted-foreground leading-relaxed">
+   501→            Tap <b>ATM</b> or an offset number to add<br />CE+PE strikes, or enter a specific strike.<br />
+   502→            <span className="text-[9px]">Click a strike to load it into the chart pane.</span>
+   503→          </div>
+   504→        )}
+   505→        {(ceRows.length > 0 || peRows.length > 0) && (
+   506→          <>
+   507→            {ceRows.length > 0 && <>{sideHeader('CE')}{ceRows.map(renderRow)}</>}
+   508→            {peRows.length > 0 && <div className="h-1 bg-border/40" />}
+   509→            {peRows.length > 0 && <>{sideHeader('PE')}{peRows.map(renderRow)}</>}
+   510→          </>
+   511→        )}
+   512→      </div>
+   513→
+   514→      {/* quick deploy bar */}
+   515→      <div className="border-t border-border p-1.5 space-y-1 bg-card/40">
+   516→        <div className="flex items-center justify-between text-[8px] text-muted-foreground px-0.5">
+   517→          <span>enabled strikes deploy at their alloc %</span>
+   518→          <span><b className="text-[#00c896]">CE Σ{sideSum('CE')}%</b> · <b className="text-[#ff4d5e]">PE Σ{sideSum('PE')}%</b></span>
+   519→        </div>
+   520→        <div className="grid grid-cols-2 gap-1">
+   521→          <Button size="sm" className="h-7 text-[10px] bg-up text-[#00c896] hover:bg-[#00c896] hover:text-black" disabled={busy || !underlying} onClick={() => deploy('CE')}>
+   522→            Deploy CE
+   523→          </Button>
+   524→          <Button size="sm" className="h-7 text-[10px] bg-down text-[#ff4d5e] hover:bg-[#ff4d5e] hover:text-black" disabled={busy || !underlying} onClick={() => deploy('PE')}>
+   525→            Deploy PE
+   526→          </Button>
+   527→          <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={() => cancelType('CE')}>
+   528→            Cancel CE
+   529→          </Button>
+   530→          <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy || !underlying} onClick={peSwap}>
+   531→            PE Swap
+   532→          </Button>
+   533→        </div>
+   534→      </div>
+   535→    </div>
+   536→  )
+   537→}
+   538→
+   539→// ------------------------------------------------------------
+   540→// Per-strike alloc % — local edit state, commits on blur/Enter
+   541→// (re-normalizing on every keystroke would fight the typist)
+   542→// ------------------------------------------------------------
+   543→function AllocInput({ value, enabled, onCommit }: { value: number; enabled: boolean; onCommit: (v: number) => void }) {
+   544→  const [txt, setTxt] = useState(String(value))
+   545→  const [focus, setFocus] = useState(false)
+   546→  useEffect(() => { if (!focus) setTxt(String(Math.round(value * 10) / 10)) }, [value, focus])
+   547→  return (
+   548→    <input
+   549→      value={txt}
+   550→      disabled={!enabled}
+   551→      onChange={e => setTxt(e.target.value.replace(/[^0-9.]/g, ''))}
+   552→      onFocus={() => setFocus(true)}
+   553→      onBlur={() => { setFocus(false); onCommit(Number(txt)) }}
+   554→      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+   555→      title="Alloc % of usable capital — side auto-normalizes to 100%"
+   556→      className="h-4.5 w-9 shrink-0 rounded bg-secondary/60 text-center text-[9px] tabular outline-none focus:ring-1 ring-primary/60 disabled:opacity-40"
+   557→    />
+   558→  )
+   559→}
+   560→
+   561→// ------------------------------------------------------------
+   562→// Inline "edit open position" editor
+   563→// ------------------------------------------------------------
+   564→function StrikeRowEditor({ row, cell, lots, pos, lotSize, onApply, onExit, onRemove }: {
+   565→  row: StrikeRowCfg
+   566→  cell: OptionQuoteCell | null
+   567→  lots: number
+   568→  pos: { netQty: number; avgPrice: number; unrealizedPnl: number } | null
+   569→  lotSize: number
+   570→  onApply: (deltaLots: number) => Promise<void>
+   571→  onExit: () => Promise<void>
+   572→  onRemove: () => void
+   573→}) {
+   574→  const [delta, setDelta] = useState('')
+   575→  const [busy, setBusy] = useState(false)
+   576→  useEffect(() => setDelta(''), [lots])
+   577→
+   578→  return (
+   579→    <div className="px-2 pb-2 pt-1 space-y-1.5 border-t border-border/40 bg-secondary/20">
+   580→      <div className="flex items-center justify-between text-[10px]">
+   581→        <span className="text-muted-foreground">Position — {cell?.symbol ?? row.type}</span>
+   582→        <span className="tabular">
+   583→          {pos ? (
+   584→            <>
+   585→              {pos.netQty > 0 ? 'LONG' : 'SHORT'} {lots} lot(s) @ {fmtMoney(pos.avgPrice)} ·{' '}
+   586→              <b className={pos.unrealizedPnl >= 0 ? 'term-up' : 'term-down'}>{fmtMoney(pos.unrealizedPnl)}</b>
+   587→            </>
+   588→          ) : 'flat'}
+   589→        </span>
+   590→      </div>
+   591→      <div className="flex items-center gap-1 text-[10px]">
+   592→        <span className="text-muted-foreground">Δ Lots /leg</span>
+   593→        <Input
+   594→          value={delta}
+   595→          onChange={e => setDelta(e.target.value.replace(/[^0-9-]/g, ''))}
+   596→          placeholder="+2 / -1"
+   597→          className="h-6 w-16 text-[10px] bg-secondary/60"
+   598→        />
+   599→        <Button
+   600→          size="sm" variant="secondary" className="h-6 px-2 text-[10px]" disabled={busy || !delta || delta === '-' || delta === '+0'}
+   601→          onClick={async () => { setBusy(true); await onApply(Number(delta)); setBusy(false) }}
+   602→        >Apply</Button>
+   603→        <span className="text-[9px] text-muted-foreground">+ buys, − exits (per enabled account) · now {lots} lot(s) agg</span>
+   604→        <div className="flex-1" />
+   605→        <Button
+   606→          size="sm" variant="secondary" className="h-6 px-2 text-[10px] text-[#ff4d5e]" disabled={busy || !pos}
+   607→          onClick={async () => { setBusy(true); await onExit(); setBusy(false) }}
+   608→        >Exit full</Button>
+   609→        <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px] text-muted-foreground hover:text-[#ff4d5e]" onClick={onRemove}>
+   610→          <Trash2 className="h-3 w-3" />
+   611→        </Button>
+   612→      </div>
+   613→      <div className="flex items-center gap-1 text-[10px]">
+   614→        <span className="text-[9px] text-muted-foreground">alloc {row.allocPct}% · lot {lotSize} · orders fan out to all enabled accounts</span>
+   615→      </div>
+   616→    </div>
+   617→  )
+   618→}
+   619→

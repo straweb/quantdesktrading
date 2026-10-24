@@ -1,0 +1,636 @@
+     1→'use client'
+     2→
+     3→import { useMemo, useState } from 'react'
+     4→import { useQuery, useQueryClient } from '@tanstack/react-query'
+     5→import { toast } from 'sonner'
+     6→import { Activity, Calculator, Layers, Trophy, Wallet, Zap, Plus, Trash2, RefreshCw } from 'lucide-react'
+     7→import { Input } from '@/components/ui/input'
+     8→import { Button } from '@/components/ui/button'
+     9→import { Switch } from '@/components/ui/switch'
+    10→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+    11→import { api, fmtInr, fmtTime } from '../lib/client-api'
+    12→import type { PortfolioResp, GttRuleRow, MarginResp } from '../lib/client-api'
+    13→import { useSyncChannel, type SyncCore, type SyncAdmin } from '../lib/sync'
+    14→
+    15→// ============================================================
+    16→// Dashboard — portfolio, GTT, margin calculator and session
+    17→// metrics. Data flows through the websocket sync hub (1s) plus
+    18→// on-demand REST (portfolio / GTT / margin).
+    19→// ============================================================
+    20→
+    21→function fmtCompact(n: number | null | undefined): string {
+    22→  if (n == null || isNaN(n)) return '—'
+    23→  const abs = Math.abs(n)
+    24→  if (abs >= 1e7) return `₹${(n / 1e7).toFixed(2)}Cr`
+    25→  if (abs >= 1e5) return `₹${(n / 1e5).toFixed(2)}L`
+    26→  if (abs >= 1000) return `₹${(n / 1000).toFixed(1)}k`
+    27→  return `₹${Math.round(n)}`
+    28→}
+    29→
+    30→export function DashboardView() {
+    31→  const core = useSyncChannel<SyncCore>('sync:core')
+    32→  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+    33→  const { data: portfolio } = useQuery({ queryKey: ['portfolio'], queryFn: () => api.portfolio(), refetchInterval: 30_000 })
+    34→
+    35→  const s = core?.session
+    36→  const accounts = core?.accounts ?? []
+    37→  const totalDeployed = accounts.reduce((x, a) => x + a.deployed, 0)
+    38→  const totalUsable = accounts.reduce((x, a) => x + a.usableCapital, 0)
+    39→  const openOrders = (core?.orders ?? []).filter(o => o.status === 'OPEN' || o.status === 'PENDING').length
+    40→  const totalOrders = (core?.orders ?? []).length
+    41→  const fillRate = totalOrders > 0 ? (totalOrders - openOrders) / totalOrders * 100 : null
+    42→
+    43→  // realized P&L curve (cumulative over the session's trades, oldest first)
+    44→  const pnlCurve = useMemo(() => {
+    45→    const trades = [...(core?.trades ?? [])].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
+    46→    let cum = 0
+    47→    const pts: { t: string; v: number }[] = []
+    48→    for (const t of trades) {
+    49→      if (t.realizedPnl == null) continue
+    50→      cum += t.realizedPnl
+    51→      pts.push({ t: t.ts, v: cum })
+    52→    }
+    53→    return pts
+    54→  }, [core])
+    55→
+    56→  return (
+    57→    <div className="h-full overflow-y-auto">
+    58→      <div className="p-3 space-y-3 max-w-[1500px] mx-auto">
+    59→        {/* KPI row — MASTER (admin) session metrics across all accounts */}
+    60→        <div className="grid grid-cols-3 md:grid-cols-7 gap-2">
+    61→          <Kpi icon={Activity} label="Net P&L" value={s ? fmtInr(s.net) : '—'} tone={(s?.net ?? 0) >= 0 ? 'up' : 'down'} sub={s ? `realized ${fmtCompact(s.realized)} · open ${fmtCompact(s.unrealized)}` : ''} />
+    62→          <Kpi icon={Wallet} label="Pocket @LTP" value={s ? fmtInr(s.pocket ?? s.net) : '—'} tone={(s?.pocket ?? s?.net ?? 0) >= 0 ? 'up' : 'down'} sub="NET after ALL charges if exited at LTP now" />
+    63→          <Kpi icon={Trophy} label="Win rate" value={s?.winRate != null ? `${s.winRate.toFixed(0)}%` : '—'} tone={(s?.winRate ?? 0) >= 50 ? 'up' : 'neutral'} sub={s ? `${s.wins}W / ${s.closes - s.wins}L of ${s.closes} closes` : ''} />
+    64→          <Kpi icon={Zap} label="Points" value={s ? `${s.pts >= 0 ? '+' : ''}${s.pts.toFixed(1)}` : '—'} tone={(s?.pts ?? 0) >= 0 ? 'up' : 'down'} sub={`${s?.trades ?? 0} trades`} />
+    65→          <Kpi icon={Wallet} label="Margin used" value={fmtCompact(totalDeployed)} tone="neutral" sub={`usable ${fmtCompact(totalUsable)} across ${accounts.length} accounts`} />
+    66→          <Kpi icon={Layers} label="Charges" value={s ? fmtCompact(s.charges) : '—'} tone="neutral" sub="STT · GST · brokerage · stamp" />
+    67→          <Kpi icon={Calculator} label="Fill rate" value={fillRate != null ? `${fillRate.toFixed(0)}%` : '—'} tone="neutral" sub={`${openOrders} open of ${totalOrders} orders`} />
+    68→        </div>
+    69→
+    70→        {/* MASTER dashboard — live system health (feed engine, sessions, universe, safety) */}
+    71→        <SystemHealth adm={adm} />
+    72→
+    73→        {/* ACCOUNT dashboards — one card per broker account, click for the
+    74→            full per-account detail (funds, positions, orders, logs, session) */}
+    75→        <AccountDashboards core={core} adm={adm} />
+    76→
+    77→        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+    78→          {/* realized P&L curve */}
+    79→          <Card title="Realized P&L — this session">
+    80→            <PnlCurve pts={pnlCurve} />
+    81→          </Card>
+    82→
+    83→          {/* per-account metrics */}
+    84→          <Card title="Accounts">
+    85→            <table className="w-full text-[10px] tabular">
+    86→              <thead className="text-[9px] uppercase tracking-wide text-muted-foreground">
+    87→                <tr><Th>Account</Th><Th>Usable</Th><Th>Deployed</Th><Th>Realized</Th><Th>Charges</Th><Th>Open</Th></tr>
+    88→              </thead>
+    89→              <tbody>
+    90→                {accounts.map(a => (
+    91→                  <tr key={a.id} className="border-b border-border/40">
+    92→                    <Td>
+    93→                      <span className="font-medium">{a.label}</span>
+    94→                      <span className="text-muted-foreground ml-1.5">{a.brokerType}</span>
+    95→                    </Td>
+    96→                    <Td className="text-[#00c896]">{fmtCompact(a.usableCapital)}</Td>
+    97→                    <Td>{fmtCompact(a.deployed)}</Td>
+    98→                    <Td className={a.realizedPnl >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(a.realizedPnl)}</Td>
+    99→                    <Td className="text-muted-foreground">{fmtCompact(a.chargesPaid)}</Td>
+   100→                    <Td>{a.openPositions}p / {a.openOrders}o</Td>
+   101→                  </tr>
+   102→                ))}
+   103→                {accounts.length === 0 && <tr><Td className="text-muted-foreground" >no accounts</Td></tr>}
+   104→              </tbody>
+   105→            </table>
+   106→            {(s?.topSymbols.length ?? 0) > 0 && (
+   107→              <div className="mt-2 flex flex-wrap gap-1">
+   108→                {s!.topSymbols.map(sym => (
+   109→                  <span key={sym.symbol} className={`px-1 py-0.5 rounded text-[9px] tabular ${sym.pts >= 0 ? 'bg-up text-[#00c896]' : 'bg-down text-[#ff4d5e]'}`}>
+   110→                    {sym.symbol} {sym.pts >= 0 ? '+' : ''}{sym.pts.toFixed(1)}
+   111→                  </span>
+   112→                ))}
+   113→              </div>
+   114→            )}
+   115→          </Card>
+   116→        </div>
+   117→
+   118→        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+   119→          <PortfolioCard portfolio={portfolio} />
+   120→          <MarginCalculator accounts={accounts.map(a => ({ id: a.id, label: a.label, brokerType: a.brokerType }))} />
+   121→        </div>
+   122→
+   123→        <GttManager />
+   124→      </div>
+   125→    </div>
+   126→  )
+   127→}
+   128→
+   129→// ---------------- building blocks ----------------
+   130→
+   131→function Kpi({ icon: Icon, label, value, sub, tone }: { icon: typeof Activity; label: string; value: string; sub?: string; tone: 'up' | 'down' | 'neutral' }) {
+   132→  return (
+   133→    <div className="rounded border border-border bg-card p-2.5">
+   134→      <div className="flex items-center gap-1 text-[8px] uppercase tracking-wide text-muted-foreground">
+   135→        <Icon className="h-3 w-3" /> {label}
+   136→      </div>
+   137→      <div className={`tabular font-bold text-base mt-0.5 ${tone === 'up' ? 'term-up' : tone === 'down' ? 'term-down' : ''}`}>{value}</div>
+   138→      {sub && <div className="text-[8px] text-muted-foreground leading-tight mt-0.5">{sub}</div>}
+   139→    </div>
+   140→  )
+   141→}
+   142→
+   143→function Card({ title, children }: { title: string; children: React.ReactNode }) {
+   144→  return (
+   145→    <div className="rounded border border-border bg-card p-2.5">
+   146→      <div className="text-[9px] uppercase tracking-wide text-muted-foreground mb-1.5">{title}</div>
+   147→      {children}
+   148→    </div>
+   149→  )
+   150→}
+   151→function Th({ children }: { children: React.ReactNode }) { return <th className="text-left font-medium px-1.5 py-1 whitespace-nowrap">{children}</th> }
+   152→function Td({ children, className = '' }: { children: React.ReactNode; className?: string }) { return <td className={`px-1.5 py-1 whitespace-nowrap ${className}`}>{children}</td> }
+   153→
+   154→// ---------------- MASTER dashboard — system health strip ----------------
+   155→// Live admin overview from the sync:admin websocket: feed engine state,
+   156→// per-broker session presence, symbol universe, copy-trade safety switches.
+   157→function SystemHealth({ adm }: { adm: SyncAdmin | null }) {
+   158→  const feed = adm?.feed
+   159→  const meta = adm?.accountsMeta ?? []
+   160→  const tickAge = feed?.lastTickTs != null ? Math.max(0, Math.round((Date.now() - feed.lastTickTs) / 1000)) : null
+   161→  const liveErr = feed?.sourceIsLive ? feed.lastError : null
+   162→  return (
+   163→    <Card title="Master — system health">
+   164→      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+   165→        <HealthCell
+   166→          label="Feed engine"
+   167→          main={feed == null ? '—' : feed.sourceIsLive ? (feed.fresh ? 'TICKING' : 'STALLED') : 'SIM FEED'}
+   168→          tone={feed == null ? 'neutral' : feed.sourceIsLive && !feed.fresh ? 'warn' : 'ok'}
+   169→          sub={feed == null ? 'websocket connecting…' : feed.sourceIsLive
+   170→            ? `${feed.symbols} symbols · last tick ${tickAge != null ? `${tickAge}s` : '—'} · ${feed.polls} polls${liveErr ? ` · ${liveErr}` : ''}`
+   171→            : `built-in sim · ${feed.symbols ?? 0} symbols`}
+   172→        />
+   173→        <HealthCell
+   174→          label="Broker sessions"
+   175→          main={meta.length === 0 ? '—' : `${meta.filter(m => m.hasCreds).length}/${meta.length} live`}
+   176→          tone={meta.length === 0 ? 'neutral' : meta.filter(m => m.brokerType !== 'SIMFEED' && m.isActive && !m.hasCreds).length > 0 ? 'warn' : 'ok'}
+   177→          sub={meta.map(m => `${m.label}${m.hasCreds ? '' : ' (no session)'}`).join(' · ') || 'no live broker accounts'}
+   178→        />
+   179→        <HealthCell
+   180→          label="Symbol universe"
+   181→          main={adm ? `${adm.syncInfo.counts.symbols}` : '—'}
+   182→          tone="neutral"
+   183→          sub={adm ? `${adm.syncInfo.counts.mappings} broker mappings · synced ${adm.syncInfo.lastSync ? fmtTime(adm.syncInfo.lastSync) : 'never'}` : ''}
+   184→        />
+   185→        <HealthCell
+   186→          label="Copy trade + recorder"
+   187→          main={adm ? `${adm.copyTrade?.enabled ? 'COPY ON' : 'COPY OFF'}${adm.copyTrade?.killSwitch ? ' · KILL' : ''} · REC ${adm.tickRecorder?.enabled ? 'ON' : 'OFF'}` : '—'}
+   188→          tone={adm?.copyTrade?.killSwitch ? 'warn' : 'neutral'}
+   189→          sub={adm?.copyTrade ? `share ${adm.copyTrade.capitalSharePct}% · slippage ${adm.copyTrade.slippagePct}% · ${adm.tickRecorder?.symbols.join('/') ?? ''}` : ''}
+   190→        />
+   191→      </div>
+   192→    </Card>
+   193→  )
+   194→}
+   195→
+   196→function HealthCell({ label, main, sub, tone }: { label: string; main: string; sub?: string; tone: 'ok' | 'warn' | 'neutral' }) {
+   197→  return (
+   198→    <div className="rounded bg-secondary/40 p-2">
+   199→      <div className="text-[8px] uppercase tracking-wide text-muted-foreground">{label}</div>
+   200→      <div className={`tabular font-bold text-xs mt-0.5 ${tone === 'ok' ? 'text-[#00c896]' : tone === 'warn' ? 'text-[#e0a63f]' : ''}`}>{main}</div>
+   201→      {sub && <div className="text-[8px] text-muted-foreground leading-tight mt-0.5 break-words">{sub}</div>}
+   202→    </div>
+   203→  )
+   204→}
+   205→
+   206→// ---------------- ACCOUNT dashboards — cards + drill-down ----------------
+   207→// One card per broker account (realtime from sync:core + sync:admin).
+   208→// Click a card → full per-account dashboard: funds, positions, orders,
+   209→// trades, session stats and raw broker logs. No REST polling anywhere.
+   210→function AccountDashboards({ core, adm }: { core: SyncCore | null; adm: SyncAdmin | null }) {
+   211→  const [sel, setSel] = useState<string | null>(null)
+   212→  const accounts = core?.accounts ?? []
+   213→  if (!core || accounts.length === 0) {
+   214→    return <Card title="Account dashboards"><div className="text-[10px] text-muted-foreground py-2 text-center">waiting for the websocket sync hub…</div></Card>
+   215→  }
+   216→  return (
+   217→    <div className="space-y-2">
+   218→      <div className="flex items-center justify-between">
+   219→        <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Account dashboards — click a card for the full per-account view</div>
+   220→        {sel && <button className="text-[10px] text-muted-foreground hover:text-foreground underline decoration-dotted" onClick={() => setSel(null)}>collapse</button>}
+   221→      </div>
+   222→      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+   223→        {accounts.map(a => (
+   224→          <AccountCard key={a.id} acc={a} meta={adm?.accountsMeta.find(m => m.id === a.id)} open={sel === a.id} onOpen={() => setSel(sel === a.id ? null : a.id)} />
+   225→        ))}
+   226→      </div>
+   227→      {sel && <AccountDetail accountId={sel} core={core} adm={adm} />}
+   228→    </div>
+   229→  )
+   230→}
+   231→
+   232→function AccountCard({ acc, meta, open, onOpen }: { acc: SyncCore['accounts'][number]; meta?: SyncAdmin['accountsMeta'][number]; open: boolean; onOpen: () => void }) {
+   233→  const net = acc.realizedPnl
+   234→  return (
+   235→    <button
+   236→      onClick={onOpen}
+   237→      className={`text-left rounded border p-2.5 bg-card transition-colors ${open ? 'border-primary/60 bg-primary/5' : 'border-border hover:border-primary/40'}`}
+   238→    >
+   239→      <div className="flex items-center gap-1.5">
+   240→        <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${acc.isActive ? 'bg-[#00c896]' : 'bg-[#ff4d5e]'}`} title={acc.isActive ? 'connected' : 'disconnected'} />
+   241→        <span className="font-bold text-[11px] truncate">{acc.label}</span>
+   242→        <span className="text-[8px] uppercase tracking-wide text-muted-foreground shrink-0">{acc.brokerType}</span>
+   243→        {meta && !meta.hasCreds && acc.brokerType !== 'SIMFEED' && (
+   244→          <span className="ml-auto text-[7px] font-bold px-1 rounded bg-[#e0a63f]/15 text-[#e0a63f] shrink-0" title="no broker session — create it in Admin">NO SESSION</span>
+   245→        )}
+   246→      </div>
+   247→      <div className="grid grid-cols-3 gap-1 mt-1.5 text-[9px] tabular">
+   248→        <div>
+   249→          <div className="text-[7px] uppercase text-muted-foreground">usable</div>
+   250→          <div className="font-bold text-[#00c896]">{fmtCompact(acc.usableCapital)}{acc.capitalBase === 'AVAILABLE_CASH_PCT' && <span className="text-[#e0a63f] text-[8px]"> {acc.capitalPct}%</span>}</div>
+   251→        </div>
+   252→        <div>
+   253→          <div className="text-[7px] uppercase text-muted-foreground">deployed</div>
+   254→          <div className="font-bold">{fmtCompact(acc.deployed)}</div>
+   255→        </div>
+   256→        <div>
+   257→          <div className="text-[7px] uppercase text-muted-foreground">realized</div>
+   258→          <div className={`font-bold ${net >= 0 ? 'term-up' : 'term-down'}`}>{fmtCompact(net)}</div>
+   259→        </div>
+   260→      </div>
+   261→      <div className="flex items-center gap-2 mt-1 text-[8px] text-muted-foreground tabular">
+   262→        <span>{acc.openPositions} pos</span>
+   263→        <span>{acc.openOrders} open ord</span>
+   264→        <span className="ml-auto">{acc.capitalBase === 'AVAILABLE_CASH_PCT' ? '% of cash' : 'fixed ₹'}</span>
+   265→      </div>
+   266→    </button>
+   267→  )
+   268→}
+   269→
+   270→/** Full per-account dashboard (drill-down) — everything from the two sync
+   271→ *  channels, zero polling: funds, positions, orders, session stats, logs. */
+   272→function AccountDetail({ accountId, core, adm }: { accountId: string; core: SyncCore; adm: SyncAdmin | null }) {
+   273→  const acc = core.accounts.find(a => a.id === accountId)
+   274→  const fund = core.funds.find(f => f.accountId === accountId)
+   275→  const positions = core.positions.filter(p => p.accountId === accountId)
+   276→  const orders = core.orders.filter(o => o.accountId === accountId).slice(0, 8)
+   277→  const sess = core.session.perAccount.find(p => p.accountId === accountId)
+   278→  const logs = (adm?.brokerLogs ?? []).filter(l => l.accountId === accountId).slice(0, 10)
+   279→  const meta = adm?.accountsMeta.find(m => m.id === accountId)
+   280→  if (!acc) return null
+   281→  const net = sess ? sess.realized + sess.unrealized : acc.realizedPnl
+   282→  return (
+   283→    <div className="rounded border border-primary/40 bg-card p-2.5 space-y-2.5">
+   284→      <div className="flex flex-wrap items-center gap-2">
+   285→        <span className="font-bold text-xs">{acc.label}</span>
+   286→        <span className="text-[9px] uppercase tracking-wide text-muted-foreground">{acc.brokerType} · {acc.clientId ?? 'no client id'}</span>
+   287→        <span className={`px-1.5 rounded text-[8px] font-bold ${acc.isActive ? 'bg-[#00c896]/15 text-[#00c896]' : 'bg-[#ff4d5e]/15 text-[#ff4d5e]'}`}>{acc.isActive ? 'CONNECTED' : 'DISCONNECTED'}</span>
+   288→        <span className="px-1.5 rounded text-[8px] font-bold bg-secondary text-muted-foreground">{acc.isOrderEnabled ? 'ORDERS ON' : 'ORDERS OFF'}</span>
+   289→        {acc.isCopyMaster && <span className="px-1.5 rounded text-[8px] font-bold bg-[#4dd0e1]/15 text-[#4dd0e1]">COPY MASTER</span>}
+   290→        <div className="flex-1" />
+   291→        <span className="text-[9px] tabular text-muted-foreground">
+   292→          {sess ? `${sess.closes} closes · ${sess.closes ? ((sess.wins / sess.closes) * 100).toFixed(0) : '—'}% WR · ` : ''}
+   293→          net <b className={net >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(net)}</b>
+   294→        </span>
+   295→      </div>
+   296→
+   297→      <div className="grid grid-cols-2 md:grid-cols-6 gap-1.5">
+   298→        <HealthCell label="Available cash" main={fmtCompact(fund?.cash ?? acc.availableCash)} tone="neutral" sub={acc.capitalBase === 'AVAILABLE_CASH_PCT' ? `${acc.capitalPct}% base → ${fmtCompact(acc.initialCapital)}` : `fixed initial ${fmtCompact(acc.initialCapital)}`} />
+   299→        <HealthCell label="Deployed" main={fmtCompact(acc.deployed)} tone="neutral" sub={`${acc.openPositions} open positions`} />
+   300→        <HealthCell label="Realized" main={fmtCompact(acc.realizedPnl)} tone={acc.realizedPnl >= 0 ? 'ok' : 'warn'} sub={`charges ${fmtCompact(acc.chargesPaid)}`} />
+   301→        <HealthCell label="Session pts" main={sess ? `${sess.pts >= 0 ? '+' : ''}${sess.pts.toFixed(1)}` : '—'} tone={(sess?.pts ?? 0) >= 0 ? 'ok' : 'warn'} sub={`${sess?.trades ?? 0} trades`} />
+   302→        <HealthCell label="Unrealized" main={fmtCompact(sess?.unrealized ?? 0)} tone={(sess?.unrealized ?? 0) >= 0 ? 'ok' : 'warn'} sub="open positions at LTP" />
+   303→        <HealthCell label="Pocket @LTP" main={fmtCompact(acc.pocket ?? (net))} tone={(acc.pocket ?? net) >= 0 ? 'ok' : 'warn'} sub="NET after ALL charges if exited now" />
+   304→      </div>
+   305→
+   306→      <div className="grid grid-cols-1 lg:grid-cols-2 gap-2.5">
+   307→        <div>
+   308→          <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-1">positions</div>
+   309→          <div className="max-h-40 overflow-y-auto">
+   310→            <table className="w-full text-[10px] tabular">
+   311→              <thead className="text-[8px] uppercase text-muted-foreground"><tr><Th>Symbol</Th><Th>Qty</Th><Th>Avg</Th><Th>LTP</Th><Th>P&L</Th><Th>Net @LTP</Th></tr></thead>
+   312→              <tbody>
+   313→                {positions.map((p, i) => (
+   314→                  <tr key={`${p.symbol}-${i}`} className="border-b border-border/30">
+   315→                    <Td className="font-medium">{p.symbol}</Td>
+   316→                    <Td className={p.netQty > 0 ? 'term-up' : p.netQty < 0 ? 'term-down' : ''}>{p.netQty}</Td>
+   317→                    <Td>{p.avgPrice.toFixed(2)}</Td>
+   318→                    <Td>{p.ltp.toFixed(2)}</Td>
+   319→                    <Td className={p.unrealizedPnl >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(p.unrealizedPnl)}</Td>
+   320→                    <Td className={((p as unknown as { netIfExit?: number }).netIfExit ?? p.unrealizedPnl) >= 0 ? 'text-[#00c896]' : 'text-[#ff4d5e]'}>{fmtCompact((p as unknown as { netIfExit?: number }).netIfExit ?? p.unrealizedPnl)}</Td>
+   321→                  </tr>
+   322→                ))}
+   323→                {positions.length === 0 && <tr><Td className="text-muted-foreground">flat — no open positions</Td></tr>}
+   324→              </tbody>
+   325→            </table>
+   326→          </div>
+   327→        </div>
+   328→        <div>
+   329→          <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-1">recent orders</div>
+   330→          <div className="max-h-40 overflow-y-auto space-y-0.5">
+   331→            {orders.map(o => (
+   332→              <div key={o.id} className="flex items-center gap-1.5 text-[10px] tabular px-1 py-0.5 rounded bg-secondary/30">
+   333→                <span className={`font-bold ${o.side === 'BUY' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{o.side}</span>
+   334→                <span className="font-medium truncate max-w-[130px]">{o.symbol}</span>
+   335→                <span className="text-muted-foreground">{o.qty} {o.orderType}</span>
+   336→                <span className={`ml-auto px-1 rounded text-[8px] ${o.status === 'FILLED' ? 'bg-[#00c896]/15 text-[#00c896]' : o.status === 'OPEN' || o.status === 'PENDING' ? 'bg-[#f5a623]/15 text-[#f5a623]' : 'bg-[#ff4d5e]/15 text-[#ff4d5e]'}`}>{o.status}</span>
+   337→              </div>
+   338→            ))}
+   339→            {orders.length === 0 && <div className="text-[10px] text-muted-foreground py-1">no orders yet</div>}
+   340→          </div>
+   341→        </div>
+   342→      </div>
+   343→
+   344→      <div>
+   345→        <div className="text-[8px] uppercase tracking-wide text-muted-foreground mb-1">broker logs (latest calls)</div>
+   346→        <div className="max-h-28 overflow-y-auto divide-y divide-border/40">
+   347→          {logs.map((l, i) => (
+   348→            <div key={i} className="flex items-start gap-1.5 text-[9px] tabular py-0.5">
+   349→              <span className="text-muted-foreground shrink-0">{l.ts.slice(11, 19)}</span>
+   350→              <span className={`shrink-0 font-bold ${l.level === 'ERROR' ? 'text-[#ff4d5e]' : l.level === 'WARN' ? 'text-[#e0a63f]' : 'text-muted-foreground'}`}>{l.level}</span>
+   351→              <span className="min-w-0 flex-1 break-all">{l.message}</span>
+   352→            </div>
+   353→          ))}
+   354→          {logs.length === 0 && <div className="text-[9px] text-muted-foreground py-1">{meta?.hasCreds === false ? 'no broker session — create one in Admin → Session' : 'no broker calls logged yet'}</div>}
+   355→        </div>
+   356→      </div>
+   357→    </div>
+   358→  )
+   359→}
+   360→
+   361→/** Tiny SVG line chart — cumulative realized P&L. */
+   362→function PnlCurve({ pts }: { pts: { t: string; v: number }[] }) {
+   363→  if (pts.length < 2) {
+   364→    return <div className="h-24 flex items-center justify-center text-[10px] text-muted-foreground">no closed trades yet this session</div>
+   365→  }
+   366→  const W = 480, H = 96, P = 4
+   367→  const vs = pts.map(p => p.v)
+   368→  const min = Math.min(0, ...vs), max = Math.max(0, ...vs)
+   369→  const span = max - min || 1
+   370→  const x = (i: number) => P + (i / (pts.length - 1)) * (W - 2 * P)
+   371→  const y = (v: number) => H - P - ((v - min) / span) * (H - 2 * P)
+   372→  const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ')
+   373→  const last = vs[vs.length - 1]
+   374→  const col = last >= 0 ? '#00c896' : '#ff4d5e'
+   375→  return (
+   376→    <div>
+   377→      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-24">
+   378→        <line x1={P} x2={W - P} y1={y(0)} y2={y(0)} stroke="rgba(255,255,255,0.15)" strokeDasharray="3,3" />
+   379→        <path d={d} fill="none" stroke={col} strokeWidth="1.6" />
+   380→      </svg>
+   381→      <div className={`text-[9px] tabular ${last >= 0 ? 'term-up' : 'term-down'}`}>
+   382→        cumulative {fmtInr(last)} over {pts.length} closes · last {fmtTime(pts[pts.length - 1].t)}
+   383→      </div>
+   384→    </div>
+   385→  )
+   386→}
+   387→
+   388→// ---------------- portfolio ----------------
+   389→
+   390→function PortfolioCard({ portfolio }: { portfolio?: PortfolioResp }) {
+   391→  const qc = useQueryClient()
+   392→  const [busy, setBusy] = useState(false)
+   393→  const refresh = async () => {
+   394→    setBusy(true)
+   395→    await qc.invalidateQueries({ queryKey: ['portfolio'] })
+   396→    setBusy(false)
+   397→  }
+   398→  const rows = (portfolio?.portfolio ?? []).flatMap(a =>
+   399→    a.holdings.map(h => ({ ...h, accountLabel: a.accountLabel, brokerType: a.brokerType, live: a.live })),
+   400→  )
+   401→  const totValue = rows.reduce((s, h) => s + h.value, 0)
+   402→  const totPnl = rows.reduce((s, h) => s + h.pnl, 0)
+   403→  return (
+   404→    <Card title="Portfolio (holdings)">
+   405→      <div className="flex items-center gap-2 mb-1.5">
+   406→        <span className="text-[9px] text-muted-foreground tabular">
+   407→          {rows.length} holdings · value {fmtCompact(totValue)} ·{' '}
+   408→          <span className={totPnl >= 0 ? 'term-up' : 'term-down'}>P&L {fmtCompact(totPnl)}</span>
+   409→        </span>
+   410→        <div className="flex-1" />
+   411→        <Button size="sm" variant="secondary" className="h-5 px-1.5 text-[9px]" onClick={refresh} disabled={busy}>
+   412→          <RefreshCw className={`h-2.5 w-2.5 ${busy ? 'animate-spin' : ''}`} /> refresh
+   413→        </Button>
+   414→      </div>
+   415→      {rows.length === 0 ? (
+   416→        <div className="text-[10px] text-muted-foreground py-3 text-center leading-relaxed">
+   417→          No holdings rows. Live broker accounts pull their real Holdings API;<br />
+   418→          sandbox accounts have no demat — open positions are in the terminal.
+   419→        </div>
+   420→      ) : (
+   421→        <div className="max-h-56 overflow-y-auto">
+   422→          <table className="w-full text-[10px] tabular">
+   423→            <thead className="text-[9px] uppercase tracking-wide text-muted-foreground sticky top-0 bg-card">
+   424→              <tr><Th>Account</Th><Th>Symbol</Th><Th>Qty</Th><Th>Avg ₹</Th><Th>LTP ₹</Th><Th>Value</Th><Th>P&L</Th></tr>
+   425→            </thead>
+   426→            <tbody>
+   427→              {rows.map((h, i) => (
+   428→                <tr key={`${h.accountLabel}-${h.symbol}-${i}`} className="border-b border-border/40">
+   429→                  <Td className="text-muted-foreground">{h.accountLabel}</Td>
+   430→                  <Td className="font-medium">{h.symbol}</Td>
+   431→                  <Td>{h.qty}</Td>
+   432→                  <Td>{h.avgPrice.toFixed(2)}</Td>
+   433→                  <Td>{h.ltp.toFixed(2)}</Td>
+   434→                  <Td>{fmtCompact(h.value)}</Td>
+   435→                  <Td className={h.pnl >= 0 ? 'term-up' : 'term-down'}>{fmtCompact(h.pnl)}</Td>
+   436→                </tr>
+   437→              ))}
+   438→            </tbody>
+   439→          </table>
+   440→        </div>
+   441→      )}
+   442→      {(portfolio?.positions.length ?? 0) > 0 && (
+   443→        <div className="mt-1.5 pt-1.5 border-t border-border/40 text-[9px] text-muted-foreground">
+   444→          open positions:{' '}
+   445→          {portfolio!.positions.map(p => (
+   446→            <span key={`${p.accountLabel}-${p.symbol}`} className="mr-2 tabular">
+   447→              {p.accountLabel.split(' ')[0]}·{p.symbol} <b className={p.netQty > 0 ? 'term-up' : 'term-down'}>{p.netQty > 0 ? '+' : ''}{p.netQty}</b>
+   448→            </span>
+   449→          ))}
+   450→        </div>
+   451→      )}
+   452→    </Card>
+   453→  )
+   454→}
+   455→
+   456→// ---------------- margin calculator ----------------
+   457→
+   458→function MarginCalculator({ accounts }: { accounts: { id: string; label: string; brokerType: string }[] }) {
+   459→  const [accountId, setAccountId] = useState('')
+   460→  const [symbol, setSymbol] = useState('NIFTY')
+   461→  const [side, setSide] = useState<'BUY' | 'SELL'>('BUY')
+   462→  const [qty, setQty] = useState('1')
+   463→  const [price, setPrice] = useState('')
+   464→  const [out, setOut] = useState<MarginResp | null>(null)
+   465→  const [busy, setBusy] = useState(false)
+   466→  const active = accountId || accounts[0]?.id || ''
+   467→
+   468→  const run = async () => {
+   469→    if (!active || !symbol || !Number(qty) || !Number(price)) { toast.error('Fill account, symbol, qty and price'); return }
+   470→    setBusy(true)
+   471→    try {
+   472→      const r = await api.marginCalc({ accountId: active, symbol, side, qty: Number(qty), price: Number(price), productType: 'MIS' })
+   473→      setOut(r)
+   474→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Margin calc failed') }
+   475→    setBusy(false)
+   476→  }
+   477→
+   478→  return (
+   479→    <Card title="Margin calculator">
+   480→      <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+   481→        <Select value={active} onValueChange={setAccountId}>
+   482→          <SelectTrigger className="h-6 w-36 text-[10px]"><SelectValue placeholder="Account" /></SelectTrigger>
+   483→          <SelectContent>
+   484→            {accounts.map(a => <SelectItem key={a.id} value={a.id}>{a.label} · {a.brokerType}</SelectItem>)}
+   485→          </SelectContent>
+   486→        </Select>
+   487→        <Input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} placeholder="symbol" className="h-6 w-32 text-[10px] tabular bg-secondary/60" />
+   488→        <button onClick={() => setSide(side === 'BUY' ? 'SELL' : 'BUY')} className={`px-2 py-0.5 rounded text-[9px] font-bold ${side === 'BUY' ? 'bg-[#00c896]/20 text-[#00c896]' : 'bg-[#ff4d5e]/20 text-[#ff4d5e]'}`}>{side}</button>
+   489→        <Input value={qty} onChange={e => setQty(e.target.value.replace(/[^0-9]/g, ''))} placeholder="qty" className="h-6 w-16 text-[10px] tabular bg-secondary/60" />
+   490→        <Input value={price} onChange={e => setPrice(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="price ₹" className="h-6 w-24 text-[10px] tabular bg-secondary/60" />
+   491→        <Button size="sm" className="h-6 px-2 text-[10px]" onClick={run} disabled={busy}>{busy ? '…' : 'Calc'}</Button>
+   492→      </div>
+   493→      {out?.error && <div className="text-[9px] text-[#ff4d5e] mt-1.5">{out.error}</div>}
+   494→      {out?.estimate && (
+   495→        <div className="mt-2 grid grid-cols-2 gap-1.5 text-[10px]">
+   496→          <div className="rounded bg-secondary/50 p-1.5">
+   497→            <div className="text-[8px] text-muted-foreground">REQUIRED</div>
+   498→            <div className="tabular font-bold">{fmtCompact(out.estimate.required)}</div>
+   499→            {out.estimate.span != null && <div className="text-[8px] text-muted-foreground">span {fmtCompact(out.estimate.span)} · exp {fmtCompact(out.estimate.exposure ?? 0)}</div>}
+   500→          </div>
+   501→          <div className="rounded bg-secondary/50 p-1.5">
+   502→            <div className="text-[8px] text-muted-foreground">AVAILABLE</div>
+   503→            <div className={`tabular font-bold ${((out.estimate.available ?? out.usable ?? 0) >= out.estimate.required) ? 'text-[#00c896]' : 'text-[#f5a623]'}`}>
+   504→              {fmtCompact(out.estimate.available ?? out.usable)}
+   505→            </div>
+   506→            <div className="text-[8px] text-muted-foreground">{out.live ? 'live broker API' : 'estimate'} · {out.estimate.detail ?? ''}</div>
+   507→          </div>
+   508→        </div>
+   509→      )}
+   510→      {/* P&L details — round-trip charges from the account's OWN schedule +
+   511→          breakeven + net outcome at ±1%; shows the REAL profit after
+   512→          brokerage, STT, txn, GST, SEBI and stamp */}
+   513→      {out?.pnl && (
+   514→        <div className="mt-2 rounded border border-[#f5a623]/40 bg-[#f5a623]/5 p-2 space-y-1 text-[9px]">
+   515→          <div className="flex items-center justify-between">
+   516→            <span className="font-bold text-[#f5a623] text-[10px]">P&L DETAILS — after all charges</span>
+   517→            <span className="text-muted-foreground">{out.pnl.instrument} · {out.pnl.qtyUnits} units · {out.pnl.scheduleSource === 'custom' ? 'your rates' : 'default rates'}</span>
+   518→          </div>
+   519→          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 tabular">
+   520→            <div>
+   521→              <div className="text-[8px] text-muted-foreground">BUY SIDE CHARGES</div>
+   522→              <div className="font-bold">{fmtCompact(out.pnl.buyCharges.total)}</div>
+   523→              <div className="text-[8px] text-muted-foreground">brk {fmtCompact(out.pnl.buyCharges.brokerage)} · stt {fmtCompact(out.pnl.buyCharges.stt)} · stamp {fmtCompact(out.pnl.buyCharges.stamp)}</div>
+   524→            </div>
+   525→            <div>
+   526→              <div className="text-[8px] text-muted-foreground">SELL SIDE CHARGES</div>
+   527→              <div className="font-bold">{fmtCompact(out.pnl.sellCharges.total)}</div>
+   528→              <div className="text-[8px] text-muted-foreground">brk {fmtCompact(out.pnl.sellCharges.brokerage)} · stt {fmtCompact(out.pnl.sellCharges.stt)}</div>
+   529→            </div>
+   530→            <div>
+   531→              <div className="text-[8px] text-muted-foreground">TOTAL ROUND-TRIP</div>
+   532→              <div className="font-bold text-[#ff4d5e]">{fmtCompact(out.pnl.totalCharges)}</div>
+   533→              <div className="text-[8px] text-muted-foreground">gst {fmtCompact(out.pnl.buyCharges.gst + out.pnl.sellCharges.gst)} · txn {fmtCompact(out.pnl.buyCharges.transaction + out.pnl.sellCharges.transaction)}</div>
+   534→            </div>
+   535→            <div>
+   536→              <div className="text-[8px] text-muted-foreground">BREAKEVEN EXIT</div>
+   537→              <div className="font-bold tabular">₹{out.pnl.breakeven}</div>
+   538→              <div className="text-[8px] text-muted-foreground">exit above this = real profit</div>
+   539→            </div>
+   540→          </div>
+   541→          <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+   542→            <div className="rounded bg-secondary/50 px-1.5 py-1">
+   543→              <span className="text-[8px] text-muted-foreground">NET if +1% </span>
+   544→              <span className={`font-bold tabular ${out.pnl.netIfUp1pct >= 0 ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{fmtCompact(out.pnl.netIfUp1pct)}</span>
+   545→            </div>
+   546→            <div className="rounded bg-secondary/50 px-1.5 py-1">
+   547→              <span className="text-[8px] text-muted-foreground">NET if −1% </span>
+   548→              <span className={`font-bold tabular ${out.pnl.netIfDown1pct >= 0 ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{fmtCompact(out.pnl.netIfDown1pct)}</span>
+   549→            </div>
+   550→          </div>
+   551→          <div className="text-[8px] text-muted-foreground">Edit the rates per account: Admin → Broker Accounts → the ₹ calculator button.</div>
+   552→        </div>
+   553→      )}
+   554→    </Card>
+   555→  )
+   556→}
+   557→
+   558→// ---------------- GTT manager ----------------
+   559→
+   560→function GttManager() {
+   561→  const qc = useQueryClient()
+   562→  // GTT rules ride the sync:admin websocket (2s push) — REST fallback
+   563→  const adm = useSyncChannel<SyncAdmin>('sync:admin')
+   564→  const { data: rest } = useQuery({ queryKey: ['gtt'], queryFn: () => api.gttRules(), enabled: !adm, refetchInterval: 3000 })
+   565→  const rules = (adm?.gtt as unknown as GttRuleRow[] | undefined) ?? rest?.rules ?? []
+   566→  const [symbol, setSymbol] = useState('NIFTY')
+   567→  const [side, setSide] = useState<'BUY' | 'SELL'>('BUY')
+   568→  const [qty, setQty] = useState('1')
+   569→  const [trigger, setTrigger] = useState<'ABOVE' | 'BELOW'>('ABOVE')
+   570→  const [triggerPrice, setTriggerPrice] = useState('')
+   571→  const [orderType, setOrderType] = useState<'LIMIT' | 'MARKET'>('LIMIT')
+   572→  const [busy, setBusy] = useState(false)
+   573→
+   574→  const create = async () => {
+   575→    if (!symbol || !Number(triggerPrice) || !Number(qty)) { toast.error('Fill symbol, qty and trigger price'); return }
+   576→    setBusy(true)
+   577→    try {
+   578→      await api.createGtt({ symbol, side, qty: Number(qty), trigger, triggerPrice: Number(triggerPrice), orderType, productType: 'MIS', repeatDaily: true })
+   579→      await qc.invalidateQueries({ queryKey: ['gtt'] })
+   580→      toast.success(`GTT armed — ${side} ${symbol} ${trigger.toLowerCase()} ${triggerPrice}`)
+   581→      setTriggerPrice('')
+   582→    } catch (e) { toast.error(e instanceof Error ? e.message : 'GTT create failed') }
+   583→    setBusy(false)
+   584→  }
+   585→  const toggle = async (r: GttRuleRow, armed: boolean) => {
+   586→    await api.patchGtt(r.id, { armed }).catch(e => toast.error(e instanceof Error ? e.message : 'failed'))
+   587→    void qc.invalidateQueries({ queryKey: ['gtt'] })
+   588→  }
+   589→  const remove = async (id: string) => {
+   590→    await api.deleteGtt(id).catch(e => toast.error(e instanceof Error ? e.message : 'failed'))
+   591→    void qc.invalidateQueries({ queryKey: ['gtt'] })
+   592→  }
+   593→
+   594→  return (
+   595→    <Card title="GTT — good-till-triggered orders (all brokers)">
+   596→      <div className="flex flex-wrap items-center gap-1.5 text-[10px] mb-2">
+   597→        <Input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} placeholder="symbol" className="h-6 w-32 text-[10px] tabular bg-secondary/60" />
+   598→        <button onClick={() => setSide(side === 'BUY' ? 'SELL' : 'BUY')} className={`px-2 py-0.5 rounded text-[9px] font-bold ${side === 'BUY' ? 'bg-[#00c896]/20 text-[#00c896]' : 'bg-[#ff4d5e]/20 text-[#ff4d5e]'}`}>{side}</button>
+   599→        <Input value={qty} onChange={e => setQty(e.target.value.replace(/[^0-9]/g, ''))} placeholder="qty" className="h-6 w-14 text-[10px] tabular bg-secondary/60" />
+   600→        <button
+   601→          onClick={() => setTrigger(trigger === 'ABOVE' ? 'BELOW' : 'ABOVE')}
+   602→          className="px-2 py-0.5 rounded text-[9px] font-bold bg-secondary/70 text-muted-foreground hover:text-foreground"
+   603→          title="Trigger when LTP crosses above / below the trigger price"
+   604→        >
+   605→          {trigger === 'ABOVE' ? '≥' : '≤'}
+   606→        </button>
+   607→        <Input value={triggerPrice} onChange={e => setTriggerPrice(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="trigger ₹" className="h-6 w-24 text-[10px] tabular bg-secondary/60" />
+   608→        <button
+   609→          onClick={() => setOrderType(orderType === 'LIMIT' ? 'MARKET' : 'LIMIT')}
+   610→          className="px-2 py-0.5 rounded text-[9px] font-bold bg-secondary/70 text-muted-foreground hover:text-foreground"
+   611→        >{orderType}</button>
+   612→        <Button size="sm" className="h-6 px-2 text-[10px]" onClick={create} disabled={busy}><Plus className="h-3 w-3" /> Arm GTT</Button>
+   613→      </div>
+   614→      {rules.length === 0 && <div className="text-[10px] text-muted-foreground py-1">No GTT rules — arm one above (fires server-side, works for sim + live accounts).</div>}
+   615→      <div className="space-y-1">
+   616→        {rules.map(r => (
+   617→          <div key={r.id} className="flex items-center gap-2 px-1.5 py-1 rounded bg-secondary/30 text-[10px]">
+   618→            <span className={`font-bold ${r.side === 'BUY' ? 'text-[#00c896]' : 'text-[#ff4d5e]'}`}>{r.side}</span>
+   619→            <span className="font-medium tabular">{r.symbol}</span>
+   620→            <span className="text-muted-foreground tabular">×{r.qty}</span>
+   621→            <span className="text-muted-foreground">when LTP {r.trigger === 'ABOVE' ? '≥' : '≤'} <b className="text-foreground tabular">{r.triggerPrice}</b> ({r.orderType})</span>
+   622→            {r.lastTriggeredAt && (
+   623→              <span className={`text-[9px] ${r.lastStatus === 'SUCCESS' ? 'term-up' : 'term-down'}`}>
+   624→                {r.lastStatus} {fmtTime(r.lastTriggeredAt)}
+   625→              </span>
+   626→            )}
+   627→            <div className="flex-1" />
+   628→            <Switch checked={r.armed} onCheckedChange={v => toggle(r, v)} />
+   629→            <button onClick={() => remove(r.id)} className="p-0.5 text-muted-foreground hover:text-[#ff4d5e]"><Trash2 className="h-3 w-3" /></button>
+   630→          </div>
+   631→        ))}
+   632→      </div>
+   633→    </Card>
+   634→  )
+   635→}
+   636→

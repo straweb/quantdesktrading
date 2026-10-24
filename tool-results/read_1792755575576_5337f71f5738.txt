@@ -1,0 +1,502 @@
+    35→    35→
+    36→    36→/** Re-scale one side's enabled rows so they always sum to 100%.
+    37→    37→ *  PCT mode only — FIXED (₹) allocations are absolute, never normalized. */
+    38→    38→function normalizeSide(rows: StrikeRowCfg[], type: 'CE' | 'PE'): StrikeRowCfg[] {
+    39→    39→  const side = rows.filter(r => r.type === type && r.enabled)
+    40→    40→  if (side.length === 0) return rows
+    41→    41→  const list = side.map(r => ({ ...r }))
+    42→    42→  const n = list.length
+    43→    43→  // zero/unset allocs enter with an equal-share weight, then everything
+    44→    44→  // is proportionally scaled so the side sums to exactly 100
+    45→    45→  for (const r of list) if (!(r.allocPct > 0)) r.allocPct = 100 / n
+    46→    46→  const total = list.reduce((s, r) => s + r.allocPct, 0)
+    47→    47→  for (const r of list) r.allocPct = Math.round((r.allocPct / total) * 1000) / 10
+    48→    48→  // dump rounding drift on the largest allocation
+    49→    49→  const drift = Math.round((100 - list.reduce((s, r) => s + r.allocPct, 0)) * 10) / 10
+    50→    50→  if (drift !== 0) {
+    51→    51→    const big = list.reduce((a, b) => (b.allocPct > a.allocPct ? b : a))
+    52→    52→    big.allocPct = Math.round(Math.max(0, big.allocPct + drift) * 10) / 10
+    53→    53→  }
+    54→    54→  const fixed = new Map(list.map(r => [r.id, r] as const))
+    55→    55→  return rows.map(r => fixed.get(r.id) ?? r)
+    56→    56→}
+    57→    57→
+    58→    58→export function StrikesPanel({ ws }: { ws: WorkspaceCfg }) {
+    59→    59→  const patchWs = useTerminal(s => s.patchWs)
+    60→    60→  const st: StrikesCfg = useMemo(() => ws.strikes ?? defaultStrikes(), [ws])
+    61→    61→
+    62→    62→  const { data: undData } = useQuery({
+    63→    63→    queryKey: ['optionUnderlyings'],
+    64→    64→    queryFn: () => api.optionUnderlyings(),
+    65→    65→    staleTime: 5 * 60_000,
+    66→    66→  })
+    67→    67→  const underlyings = undData?.underlyings ?? []
+    68→    68→
+    69→    69→  // accounts: representative usable capital (first order-enabled) + PnL labels
+    70→    70→  // (via sync:core websocket — REST fallback while the socket is down)
+    71→    71→  const coreAcc = useSyncChannel<SyncCore>('sync:core')
+    72→    72→  const { data: accRest } = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts(), enabled: !coreAcc, refetchInterval: 4000 })
+    73→    73→  const accounts = (coreAcc?.accounts as unknown as AccountRow[] | undefined) ?? accRest?.accounts ?? []
+    74→    74→  const repUsable = useMemo(() => {
+    75→    75→    const on = accounts.filter(a => a.isOrderEnabled)
+    76→    76→    return (on[0] ?? accounts[0])?.usableCapital ?? 0
+    77→    77→  }, [accounts])
+    78→    78→
+    79→    79→  // auto-bind the workspace's F&O symbol on first open
+    80→    80→  useEffect(() => {
+    81→    81→    if (!st.underlying && underlyings.some(u => u.underlying === ws.symbol)) {
+    82→    82→      patchWs(ws.id, { strikes: { ...st, underlying: ws.symbol } })
+    83→    83→    }
+    84→    84→  }, [st.underlying, underlyings, ws.symbol, ws.id, patchWs]) // eslint-disable-line react-hooks/exhaustive-deps
+    85→    85→
+    86→    86→  const underlying = st.underlying
+    87→    87→  const strikesParam = useMemo(() => [...new Set(st.rows.map(r => r.strike))].sort((a, b) => a - b), [st.rows])
+    88→    88→
+    89→    89→  const { data: chainRest, refetch: refetchChain } = useQuery({
+    90→    90→    queryKey: ['optionChain', underlying, st.expiry, strikesParam.join(',')],
+    91→    91→    queryFn: () => api.optionChain(underlying!, st.expiry, strikesParam),
+    92→    92→    enabled: !!underlying,
+    93→    93→    refetchInterval: 8000, // backup only — realtime quotes arrive via sync:chain (1s)
+    94→    94→  })
+    95→    95→  const chainSync = useSyncData<SyncChainResp>(
+    96→    96→    'sync:chain',
+    97→    97→    d => !!d && (d as { meta?: { underlying?: string } }).meta?.underlying === underlying,
+    98→    98→    underlying ? { chains: [{ underlying, expiry: st.expiry ?? null }] } : undefined,
+    99→    99→  )
+   100→   100→  const chainData = mergeChain(chainSync, chainRest)
+   101→   101→  const meta = chainData?.meta ?? null
+   102→   102→  const rowByStrike = useMemo(() => {
+   103→   103→    const m = new Map<number, ChainStrikeRow>()
+   104→   104→    for (const r of chainData?.rows ?? []) m.set(r.strike, r)
+   105→   105→    return m
+   106→   106→  }, [chainData])
+   107→   107→
+   108→   108→  // auto-load the side-ATM pair the first time an F&O workspace binds
+   109→   109→  // (watchlist / search → open workspace lands with ATM CE + PE ready)
+   110→   110→  const autoLoadedRef = useRef<string | null>(null)
+   111→   111→  useEffect(() => {
+   112→   112→    if (!underlying || !meta || st.rows.length > 0) return
+   113→   113→    const key = `${ws.id}:${underlying}:${meta.expiry}`
+   114→   114→    if (autoLoadedRef.current === key) return
+   115→   115→    autoLoadedRef.current = key
+   116→   116→    void (async () => {
+   117→   117→      await addStrike(meta.ceAtm, 'CE')
+   118→   118→      await addStrike(meta.peAtm, 'PE')
+   119→   119→    })()
+   120→   120→  }, [underlying, meta, st.rows.length]) // eslint-disable-line react-hooks/exhaustive-deps
+   121→   121→
+   122→   122→  // positions via the sync hub (fallback REST) — aggregated per symbol
+   123→   123→  const core = useSyncChannel<SyncCore>('sync:core')
+   124→   124→  const { data: posData } = useQuery({ queryKey: ['positions'], queryFn: () => api.positions(), enabled: !core, refetchInterval: 2000 })
+   125→   125→  const posBySymbol = useMemo(() => {
+   126→   126→    const m = new Map<string, { netQty: number; avgPrice: number; unrealizedPnl: number; realizedPnl: number }>()
+   127→   127→    const put = (sym: string, netQty: number, avgPrice: number, unreal: number, realized: number) => {
+   128→   128→      const cur = m.get(sym)
+   129→   129→      if (!cur) { m.set(sym, { netQty, avgPrice, unrealizedPnl: unreal, realizedPnl: realized }); return }
+   130→   130→      const totQty = Math.abs(cur.netQty) + Math.abs(netQty)
+   131→   131→      cur.avgPrice = totQty > 0 ? (cur.avgPrice * Math.abs(cur.netQty) + avgPrice * Math.abs(netQty)) / totQty : avgPrice
+   132→   132→      cur.netQty += netQty
+   133→   133→      cur.unrealizedPnl += unreal
+   134→   134→      cur.realizedPnl += realized
+   135→   135→    }
+   136→   136→    if (core) {
+   137→   137→      for (const p of core.positions) put(p.symbol, p.netQty, p.avgPrice, p.unrealizedPnl, p.realizedPnl)
+   138→   138→    } else {
+   139→   139→      for (const p of posData?.bySymbol ?? []) {
+   140→   140→        put(p.symbol, p.netQty, p.avgPrice, p.unrealizedPnl, (p as unknown as { realizedPnl?: number }).realizedPnl ?? 0)
+   141→   141→      }
+   142→   142→    }
+   143→   143→    return m
+   144→   144→  }, [core, posData])
+   145→   145→
+   146→   146→  // ---- PnL rollup: per account / per side / total (unrealized + realized) ----
+   147→   147→  const pnl = useMemo(() => {
+   148→   148→    const positions = core ? core.positions : (posData?.positions ?? [])
+   149→   149→    let totalU = 0, totalR = 0
+   150→   150→    const byAccount = new Map<string, { label: string; u: number; r: number }>()
+   151→   151→    for (const p of positions) {
+   152→   152→      totalU += p.unrealizedPnl
+   153→   153→      totalR += p.realizedPnl
+   154→   154→      const a = byAccount.get(p.accountId) ?? { label: p.accountLabel, u: 0, r: 0 }
+   155→   155→      a.u += p.unrealizedPnl
+   156→   156→      a.r += p.realizedPnl
+   157→   157→      byAccount.set(p.accountId, a)
+   158→   158→    }
+   159→   159→    return { totalU, totalR, byAccount }
+   160→   160→  }, [core, posData])
+   161→   161→  const sidePnl = (type: 'CE' | 'PE') => {
+   162→   162→    let u = 0
+   163→   163→    for (const row of st.rows.filter(r => r.type === type && r.enabled)) {
+   164→   164→      const cell = cellFor(row)
+   165→   165→      const pos = cell ? posBySymbol.get(cell.symbol) : undefined
+   166→   166→      if (pos) u += pos.unrealizedPnl
+   167→   167→    }
+   168→   168→    return u
+   169→   169→  }
+   170→   170→
+   171→   171→  const [specific, setSpecific] = useState('')
+   172→   172→  const [busy, setBusy] = useState(false)
+   173→   173→  const [expanded, setExpanded] = useState<string | null>(null)
+   174→   174→  // sort + filter (applied to both sides)
+   175→   175→  const [sortBy, setSortBy] = useState<'strike' | 'ltp' | 'chg' | 'pnl'>('strike')
+   176→   176→  const [sortAsc, setSortAsc] = useState(true)
+   177→   177→  const [rowFilter, setRowFilter] = useState<'all' | 'enabled' | 'position'>('all')
+   178→   178→
+   179→   179→  const setStrikes = (next: Partial<StrikesCfg>) => patchWs(ws.id, { strikes: { ...st, ...next } })
+   180→   180→  const allocMode: AllocMode = ws.allocMode ?? 'PCT'
+   181→   181→
+   182→   182→  /** Replace rows + re-normalize the affected side (PCT mode only). Callers build rows from the
+   183→   183→   *  LATEST persisted state (rapid consecutive toggles must not clobber each
+   184→   184→   *  other's change); this re-reads the cfg for the remaining fields. */
+   185→   185→  const commitRows = (nextRows: StrikeRowCfg[], type: 'CE' | 'PE') => {
+   186→   186→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+   187→   187→    patchWs(ws.id, { strikes: { ...cur, rows: allocMode === 'PCT' ? normalizeSide(nextRows, type) : nextRows } })
+   188→   188→  }
+   189→   189→
+   190→   190→  const addStrike = async (strike: number, type: 'CE' | 'PE') => {
+   191→   191→    if (!underlying) { toast.error('Pick an F&O underlying first'); return }
+   192→   192→    const id = `${strike}:${type}`
+   193→   193→    // read fresh store state (consecutive/parallel adds must not clobber each other)
+   194→   194→    const before = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+   195→   195→    if (before.rows.some(r => r.id === id)) { toast.info(`${strike} ${type} already in list`); return }
+   196→   196→    try {
+   197→   197→      const r = await api.ensureStrike(underlying, strike, st.expiry)
+   198→   198→      if (r.created > 0) toast.success(`Contracts ready — ${r.symbols.join(', ')}`)
+   199→   199→    } catch (e) {
+   200→   200→      toast.error(e instanceof Error ? e.message : 'Failed to create contracts')
+   201→   201→      return
+   202→   202→    }
+   203→   203→    // re-read AFTER the await so an interleaved add is not overwritten
+   204→   204→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? before
+   205→   205→    if (cur.rows.some(r => r.id === id)) { return }
+   206→   206→    const rows = normalizeSide([...cur.rows, { id, strike, type, enabled: true, allocPct: 0 }], type)
+   207→   207→    patchWs(ws.id, { strikes: { ...cur, rows } })
+   208→   208→    setTimeout(() => refetchChain(), 150)
+   209→   209→  }
+   210→   210→
+   211→   211→  /** ITM / ATM / OTM quick-add — side-specific strikes (CE ITM counts down
+   212→   212→   *  from the floor ATM, PE ITM counts up from the ceil ATM) + the pair add
+   213→   213→   *  for ATM. Uses the LIVE chain meta so buttons always track spot. */
+   214→   214→  const addLabeled = async (dir: -1 | 0 | 1, n: number) => {
+   215→   215→    if (!meta) { toast.error('Chain not loaded yet'); return }
+   216→   216→    const atm = { ce: meta.ceAtm, pe: meta.peAtm }
+   217→   217→    if (dir === 0) {
+   218→   218→      await addStrike(atm.ce, 'CE')
+   219→   219→      await addStrike(atm.pe, 'PE')
+   220→   220→      return
+   221→   221→    }
+   222→   222→    await addStrike(sideStrikeFor(atm, meta.step, dir, n, 'CE'), 'CE')
+   223→   223→    await addStrike(sideStrikeFor(atm, meta.step, dir, n, 'PE'), 'PE')
+   224→   224→  }
+   225→   225→
+   226→   226→  const addSpecific = async () => {
+   227→   227→    const raw = Number(specific)
+   228→   228→    if (!underlying || !Number.isFinite(raw) || raw <= 0) { toast.error('Enter a valid strike'); return }
+   229→   229→    const step = meta?.step ?? 50
+   230→   230→    const snapped = Math.round(raw / step) * step
+   231→   231→    if (snapped !== raw) toast.info(`Snapped ${raw} → ${snapped} (step ${step})`)
+   232→   232→    setSpecific('')
+   233→   233→    await addStrike(snapped, 'CE')
+   234→   234→    await addStrike(snapped, 'PE')
+   235→   235→  }
+   236→   236→
+   237→   237→  const toggleRow = (row: StrikeRowCfg) => {
+   238→   238→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+   239→   239→    const rows = cur.rows.map(r => (r.id === row.id ? { ...r, enabled: !r.enabled } : r))
+   240→   240→    commitRows(rows, row.type)
+   241→   241→  }
+   242→   242→
+   243→   243→  const setAlloc = (row: StrikeRowCfg, v: number) => {
+   244→   244→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+   245→   245→    let rows: StrikeRowCfg[]
+   246→   246→    if (allocMode === 'FIXED') {
+   247→   247→      const amt = Math.max(0, Number.isFinite(v) ? v : 0)
+   248→   248→      rows = cur.rows.map(r => (r.id === row.id ? { ...r, allocAmt: amt } : r))
+   249→   249→    } else {
+   250→   250→      const clamped = Math.max(0, Math.min(100, Number.isFinite(v) ? v : 0))
+   251→   251→      rows = cur.rows.map(r => (r.id === row.id ? { ...r, allocPct: clamped } : r))
+   252→   252→    }
+   253→   253→    commitRows(rows, row.type)
+   254→   254→  }
+   255→   255→
+   256→   256→  const removeRow = (row: StrikeRowCfg) => {
+   257→   257→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id)?.strikes ?? st
+   258→   258→    const rows = cur.rows.filter(r => r.id !== row.id)
+   259→   259→    commitRows(rows, row.type)
+   260→   260→    setExpanded(null)
+   261→   261→  }
+   262→   262→
+   263→   263→  const pinToPane = (row: StrikeRowCfg) => {
+   264→   264→    const cur = useTerminal.getState().workspaces.find(w => w.id === ws.id) ?? ws
+   265→   265→    patchWs(ws.id, pinStrikePanes(cur, row.strike, row.type))
+   266→   266→    useTerminal.getState().setActiveStrike({ strike: row.strike, type: row.type, wsId: ws.id })
+   267→   267→  }
+   268→   268→
+   269→   269→  // --- order helpers ---
+   270→   270→  const rowsFor = (type: 'CE' | 'PE') => st.rows.filter(r => r.type === type && r.enabled)
+   271→   271→
+   272→   272→  const cellFor = (row: StrikeRowCfg): OptionQuoteCell | null => {
+   273→   273→    const c = rowByStrike.get(row.strike)
+   274→   274→    if (!c) return null
+   275→   275→    return row.type === 'CE' ? c.ce : c.pe
+   276→   276→  }
+   277→   277→
+   278→   278→  /** Sizing params for one strike row in the current alloc mode. */
+   279→   279→  const sizingFor = (row: StrikeRowCfg): Record<string, unknown> =>
+   280→   280→    allocMode === 'FIXED'
+   281→   281→      ? { tag: `abs:${Math.max(0, row.allocAmt ?? 0)}` } // router: absolute ₹ per account
+   282→   282→      : { capitalPct: row.allocPct }
+   283→   283→
+   284→   284→  /** Deploy every enabled strike of one side — the shared core used by
+   285→   285→   *  Deploy buttons AND the swap buttons (after the other side is closed). */
+   286→   286→  const deployRows = async (type: 'CE' | 'PE', rows: StrikeRowCfg[]) => {
+   287→   287→    let strikesOk = 0, strikesFail = 0, fills = 0, skipped = 0
+   288→   288→    // fresh quotes so a swap doesn't deploy off stale LTP cells
+   289→   289→    const allStrikes = [...new Set(rows.map(r => r.strike))]
+   290→   290→    const cd = allStrikes.length ? await api.optionChain(underlying!, st.expiry, allStrikes) : null
+   291→   291→    const fresh = new Map<number, ChainStrikeRow>((cd?.rows ?? []).map(r => [r.strike, r]))
+   292→   292→    for (const row of rows) {
+   293→   293→      const c = fresh.get(row.strike)
+   294→   294→      const cell = c ? (row.type === 'CE' ? c.ce : c.pe) : cellFor(row)
+   295→   295→      const alloc = allocMode === 'FIXED' ? (row.allocAmt ?? 0) : row.allocPct
+   296→   296→      if (!cell?.exists || !(alloc > 0)) { strikesFail++; continue }
+   297→   297→      try {
+   298→   298→        const res = await api.placeOrder({
+   299→   299→          symbol: cell.symbol, exchange: 'NFO', side: 'BUY', qty: 0,
+   300→   300→          orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
+   301→   301→          ...sizingFor(row),
+   302→   302→        })
+   303→   303→        const f = res.legs.filter(l => l.status === 'FILLED').length
+   304→   304→        fills += f
+   305→   305→        skipped += res.legs.length - f
+   306→   306→        f > 0 ? strikesOk++ : strikesFail++
+   307→   307→      } catch { strikesFail++ }
+   308→   308→    }
+   309→   309→    return { strikesOk, strikesFail, fills, skipped, total: rows.length }
+   310→   310→  }
+   311→   311→
+   312→   312→  const deploy = async (type: 'CE' | 'PE') => {
+   313→   313→    const rows = rowsFor(type) // ONLY enabled strikes participate
+   314→   314→    if (rows.length === 0) { toast.error(`No enabled ${type} strikes`); return }
+   315→   315→    setBusy(true)
+   316→   316→    const r = await deployRows(type, rows)
+   317→   317→    setBusy(false)
+   318→   318→    r.strikesOk > 0
+   319→   319→      ? toast.success(`Deploy ${type}: ${r.strikesOk}/${rows.length} enabled strikes · ${r.fills} account fills${r.skipped ? ` · ${r.skipped} legs skipped` : ''}`)
+   320→   320→      : toast.error(`Deploy ${type} failed — no fills (${r.strikesFail} strikes skipped)`)
+   321→   321→  }
+   322→   322→
+   323→   323→  const cancelType = async (type: 'CE' | 'PE') => {
+   324→   324→    const syms = rowsFor(type).map(r => cellFor(r)?.symbol).filter((s): s is string => !!s)
+   325→   325→    if (syms.length === 0) { toast.error(`No enabled ${type} strikes`); return }
+   326→   326→    try {
+   327→   327→      const r = await api.cancelAll(syms)
+   328→   328→      r.cancelled > 0 ? toast.success(`Cancelled ${r.cancelled} pending ${type} orders`) : toast.info(`No pending ${type} orders`)
+   329→   329→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Cancel failed') }
+   330→   330→  }
+   331→   331→
+   332→   332→  const peSwap = async () => swapSide('PE')
+   333→   333→
+   334→   334→  /** SWAP: close every enabled position of side `from`, then deploy the
+   335→   335→   *  opposite side (CE↔PE for FNO; for equities the order pad B/S covers
+   336→   336→   *  buy↔sell). Auto-adds an ATM strike of the target side if none listed. */
+   337→   337→  const swapSide = async (from: 'CE' | 'PE') => {
+   338→   338→    const to = from === 'CE' ? 'PE' : 'CE'
+   339→   339→    const fromSyms = rowsFor(from).map(r => cellFor(r)?.symbol).filter((s): s is string => !!s)
+   340→   340→    setBusy(true)
+   341→   341→    try {
+   342→   342→      let closedLegs = 0
+   343→   343→      if (fromSyms.length > 0) {
+   344→   344→        const so = await api.squareOffAll(false, fromSyms)
+   345→   345→        closedLegs = so.filledLegs
+   346→   346→      }
+   347→   347→      // deploy target side on enabled rows (auto-add side ATM if none listed)
+   348→   348→      let toRows = rowsFor(to)
+   349→   349→      if (toRows.length === 0 && meta) {
+   350→   350→        await addStrike(to === 'CE' ? meta.ceAtm : meta.peAtm, to)
+   351→   351→        await new Promise(r => setTimeout(r, 500))
+   352→   352→        const ws2 = useTerminal.getState().workspaces.find(w => w.id === ws.id)
+   353→   353→        toRows = (ws2?.strikes?.rows ?? []).filter(r => r.type === to && r.enabled)
+   354→   354→      }
+   355→   355→      const r = await deployRows(to, toRows)
+   356→   356→      r.strikesOk > 0
+   357→   357→        ? toast.success(`Swap ${from}→${to}: ${from} flat (${closedLegs} legs) · ${r.strikesOk}/${toRows.length} ${to} strikes · ${r.fills} fills${r.skipped ? ` · ${r.skipped} skipped` : ''}`)
+   358→   358→        : toast.error(`Swap ${from}→${to} — ${from} flat but no ${to} fills`)
+   359→   359→    } catch (e) {
+   360→   360→      toast.error(e instanceof Error ? e.message : `Swap ${from}→${to} failed`)
+   361→   361→    } finally { setBusy(false) }
+   362→   362→  }
+   363→   363→
+   364→   364→  /** EXIT ALL — square off every open position across all symbols/accounts. */
+   365→   365→  const exitAll = async () => {
+   366→   366→    setBusy(true)
+   367→   367→    try {
+   368→   368→      const so = await api.squareOffAll(false)
+   369→   369→      so.orders > 0
+   370→   370→        ? toast.success(`Exit All — ${so.orders} orders · ${so.filledLegs} legs closed`)
+   371→   371→        : toast.info('No open positions')
+   372→   372→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Exit All failed') }
+   373→   373→    finally { setBusy(false) }
+   374→   374→  }
+   375→   375→
+   376→   376→  /** B = plain market BUY of THIS strike; S = plain market SELL of THIS strike.
+   377→   377→   *  Sizing = the row's alloc (PCT % of usable capital, or fixed ₹) per account. */
+   378→   378→  const rowOrder = async (row: StrikeRowCfg, side: 'BUY' | 'SELL') => {
+   379→   379→    const cell = cellFor(row)
+   380→   380→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   381→   381→    try {
+   382→   382→      const res = await api.placeOrder({
+   383→   383→        symbol: cell.symbol, exchange: 'NFO', side, qty: 0,
+   384→   384→        orderType: 'MARKET', productType: 'MIS', source: 'MANUAL',
+   385→   385→        ...sizingFor(row),
+   386→   386→      })
+   387→   387→      res.status === 'FAILED'
+   388→   388→        ? toast.error(`${side} failed — ${res.message}`)
+   389→   389→        : toast.success(`${side} ${row.strike} ${row.type} @ MKT — ${res.legs.filter(l => l.status === 'FILLED').length}/${res.legs.length} accounts`)
+   390→   390→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+   391→   391→  }
+   392→   392→
+   393→   393→  const rowExit = async (row: StrikeRowCfg) => {
+   394→   394→    const cell = cellFor(row)
+   395→   395→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   396→   396→    const pos = posBySymbol.get(cell.symbol)
+   397→   397→    if (!pos || pos.netQty === 0) { toast.info('No open position'); return }
+   398→   398→    try {
+   399→   399→      const so = await api.squareOffAll(false, [cell.symbol])
+   400→   400→      so.orders > 0 ? toast.success(`Exit ${row.strike} ${row.type} — ${so.filledLegs} legs`) : toast.info('Nothing to exit')
+   401→   401→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Exit failed') }
+   402→   402→  }
+   403→   403→
+   404→   404→  // --- price-order helpers (entry / target / stoploss at a specific price) ---
+   405→   405→
+   406→   406→  /** LIMIT entry at a specific price — auto-sized by the row's alloc % per account. */
+   407→   407→  const placeEntry = async (row: StrikeRowCfg, side: 'BUY' | 'SELL', price: number) => {
+   408→   408→    const cell = cellFor(row)
+   409→   409→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   410→   410→    if (!Number.isFinite(price) || price <= 0) { toast.error('Enter a valid price'); return }
+   411→   411→    try {
+   412→   412→      const res = await api.placeOrder({
+   413→   413→        symbol: cell.symbol, exchange: 'NFO', side, qty: 0,
+   414→   414→        orderType: 'LIMIT', productType: 'MIS', source: 'MANUAL',
+   415→   415→        capitalPct: row.allocPct, limitPrice: price,
+   416→   416→      })
+   417→   417→      const f = res.legs.filter(l => l.status === 'FILLED').length
+   418→   418→      const r = res.legs.filter(l => l.status === 'OPEN').length
+   419→   419→      if (f + r === 0) toast.error(`Entry failed — ${res.message}`)
+   420→   420→      else toast.success(`${side} ${row.strike} ${row.type} LIMIT @ ${fmtMoney(price)} — ${f} filled${r ? ` · ${r} resting` : ''}`)
+   421→   421→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+   422→   422→  }
+   423→   423→
+   424→   424→  /** Target — reduce-only LIMIT at the price (books the open position there). */
+   425→   425→  const placeTarget = async (row: StrikeRowCfg, price: number) => {
+   426→   426→    const cell = cellFor(row)
+   427→   427→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   428→   428→    if (!Number.isFinite(price) || price <= 0) { toast.error('Enter a valid price'); return }
+   429→   429→    const pos = posBySymbol.get(cell.symbol)
+   430→   430→    if (!pos || pos.netQty === 0) { toast.info('No open position to set a target on'); return }
+   431→   431→    const side = pos.netQty > 0 ? 'SELL' : 'BUY'
+   432→   432→    const lots = Math.abs(pos.netQty) / (meta?.lotSize || 1)
+   433→   433→    try {
+   434→   434→      const res = await api.placeOrder({
+   435→   435→        symbol: cell.symbol, exchange: 'NFO', side, qty: lots,
+   436→   436→        orderType: 'LIMIT', productType: 'MIS', source: 'MANUAL',
+   437→   437→        limitPrice: price, reduceOnly: true, strategyId: 'reduce',
+   438→   438→      })
+   439→   439→      const f = res.legs.filter(l => l.status === 'FILLED').length
+   440→   440→      const r = res.legs.filter(l => l.status === 'OPEN').length
+   441→   441→      if (f + r === 0) toast.error(`Target failed — ${res.message}`)
+   442→   442→      else toast.success(`Target: ${side} ${lots} lot(s) LIMIT @ ${fmtMoney(price)} — resting until hit`)
+   443→   443→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+   444→   444→  }
+   445→   445→
+   446→   446→  /** StopLoss — reduce-only SL-M triggered at the price. */
+   447→   447→  const placeStop = async (row: StrikeRowCfg, price: number) => {
+   448→   448→    const cell = cellFor(row)
+   449→   449→    if (!cell?.exists) { toast.error('Quote unavailable'); return }
+   450→   450→    if (!Number.isFinite(price) || price <= 0) { toast.error('Enter a valid price'); return }
+   451→   451→    const pos = posBySymbol.get(cell.symbol)
+   452→   452→    if (!pos || pos.netQty === 0) { toast.info('No open position to protect'); return }
+   453→   453→    const side = pos.netQty > 0 ? 'SELL' : 'BUY'
+   454→   454→    const lots = Math.abs(pos.netQty) / (meta?.lotSize || 1)
+   455→   455→    try {
+   456→   456→      const res = await api.placeOrder({
+   457→   457→        symbol: cell.symbol, exchange: 'NFO', side, qty: lots,
+   458→   458→        orderType: 'SL-M', productType: 'MIS', source: 'MANUAL',
+   459→   459→        triggerPrice: price, reduceOnly: true, strategyId: 'reduce',
+   460→   460→      })
+   461→   461→      const f = res.legs.filter(l => l.status === 'FILLED').length
+   462→   462→      const r = res.legs.filter(l => l.status === 'OPEN').length
+   463→   463→      if (f + r === 0) toast.error(`SL failed — ${res.message}`)
+   464→   464→      else toast.success(`SL: ${side} ${lots} lot(s) SL-M trigger @ ${fmtMoney(price)} — armed`)
+   465→   465→    } catch (e) { toast.error(e instanceof Error ? e.message : 'Order failed') }
+   466→   466→  }
+   467→   467→
+   468→   468→  // ---- sort + filter machinery (applies to both sides) ----
+   469→   469→  const activeStrike = useTerminal(s => s.activeStrike)
+   470→   470→  const sortRows = (rows: StrikeRowCfg[]) => {
+   471→   471→    const filt = rows.filter(r =>
+   472→   472→      rowFilter === 'all' ? true
+   473→   473→      : rowFilter === 'enabled' ? r.enabled
+   474→   474→      : (() => { const c = cellFor(r); return c?.exists ? (posBySymbol.get(c.symbol)?.netQty ?? 0) !== 0 : false })(),
+   475→   475→    )
+   476→   476→    const val = (r: StrikeRowCfg): number => {
+   477→   477→      const c = cellFor(r)
+   478→   478→      const p = c?.exists ? posBySymbol.get(c.symbol) : undefined
+   479→   479→      switch (sortBy) {
+   480→   480→        case 'ltp': return c?.ltp ?? 0
+   481→   481→        case 'chg': return c?.changePct ?? 0
+   482→   482→        case 'pnl': return p ? p.unrealizedPnl + (p.realizedPnl ?? 0) : Number.NEGATIVE_INFINITY
+   483→   483→        default: return r.strike
+   484→   484→      }
+   485→   485→    }
+   486→   486→    return [...filt].sort((a, b) => (sortAsc ? val(a) - val(b) : val(b) - val(a)))
+   487→   487→  }
+   488→   488→  const ceRows = useMemo(() => sortRows(st.rows.filter(r => r.type === 'CE')), [st.rows, sortBy, sortAsc, rowFilter, rowByStrike, posBySymbol]) // eslint-disable-line react-hooks/exhaustive-deps
+   489→   489→  const peRows = useMemo(() => sortRows(st.rows.filter(r => r.type === 'PE')), [st.rows, sortBy, sortAsc, rowFilter, rowByStrike, posBySymbol]) // eslint-disable-line react-hooks/exhaustive-deps
+   490→   490→  const sideSum = (type: 'CE' | 'PE') => {
+   491→   491→    const on = st.rows.filter(r => r.type === type && r.enabled)
+   492→   492→    if (allocMode === 'FIXED') return on.reduce((s, r) => s + (r.allocAmt ?? 0), 0)
+   493→   493→    return Math.round(on.reduce((s, r) => s + r.allocPct, 0) * 10) / 10
+   494→   494→  }
+   495→   495→
+   496→   496→  const offsetFor = (row: StrikeRowCfg): number | null => {
+   497→   497→    const chainRow = rowByStrike.get(row.strike)
+   498→   498→    if (!chainRow) return null
+   499→   499→    return row.type === 'CE' ? chainRow.offsetCe : chainRow.offsetPe
+   500→   500→  }
+   501→   501→
+   502→   502→  const renderRow = (row: StrikeRowCfg) => {
+   503→   503→    const cell = cellFor(row)
+   504→   504→    const offset = offsetFor(row)
+   505→   505→    const pos = cell?.exists ? posBySymbol.get(cell.symbol) : undefined
+   506→   506→    const lots = pos ? Math.abs(pos.netQty) / (meta?.lotSize || 1) : 0
+   507→   507→    const pinned = (row.type === 'CE' ? ws.panes?.find(p => p.key === 'ce') : ws.panes?.find(p => p.key === 'pe'))?.strike === row.strike
+   508→   508→    const isActive = activeStrike?.wsId === ws.id && activeStrike.strike === row.strike && activeStrike.type === row.type
+   509→   509→    // planned sizing: rupee amount + the lots it will place (at the live premium)
+   510→   510→    const lotSize = meta?.lotSize || 1
+   511→   511→    const ltpSafe = cell?.exists && cell.ltp > 0 ? cell.ltp : 0
+   512→   512→    const planAmt = allocMode === 'FIXED' ? (row.allocAmt ?? 0) : (row.allocPct / 100) * repUsable
+   513→   513→    const planLots = ltpSafe > 0 ? Math.floor(planAmt / (ltpSafe * lotSize)) : 0
+   514→   514→    const perLot = ltpSafe * lotSize
+   515→   515→    const strikePnl = pos ? pos.unrealizedPnl + (pos.realizedPnl ?? 0) : null
+   516→   516→    const chgPts = cell?.exists && cell.prevClose ? cell.ltp - cell.prevClose : 0
+   517→   517→    const label = sideOffsetLabel(offset, row.type)
+   518→   518→    return (
+   519→   519→      <div key={row.id} className={expanded === row.id ? 'bg-accent/40' : ''}>
+   520→   520→        {/* line 1 — enable · strike+LIVE ITM/OTM label · alloc slider (max width) · LTP/chg/H-L */}
+   521→   521→        <div className="flex items-center gap-1 px-1.5 pt-1 pb-0.5">
+   522→   522→          <button
+   523→   523→            onClick={() => toggleRow(row)}
+   524→   524→            title={row.enabled ? 'Enabled for deploy — click to disable' : 'Disabled — click to enable'}
+   525→   525→            className={`h-3.5 w-3.5 rounded-sm border flex items-center justify-center shrink-0 ${
+   526→   526→              row.enabled ? 'bg-primary border-primary' : 'border-muted-foreground/40'
+   527→   527→            }`}
+   528→   528→          >
+   529→   529→            {row.enabled && <Power className="h-2.5 w-2.5 text-primary-foreground" />}
+   530→   530→          </button>
+   531→   531→          <button
+   532→   532→            onClick={() => pinToPane(row)}
+   533→   533→            title={`Load ${row.strike} ${row.type} into the ${row.type} chart pane${isActive ? ' (now on the chart)' : ''}`}
+   534→   534→            className={`w-[64px] shrink-0 text-left leading-tight hover:bg-accent/70 rounded px-0.5 -mx-0.5 ${
+
+[showing lines 35-534 of 1053; use offset=535 with limit to continue reading]

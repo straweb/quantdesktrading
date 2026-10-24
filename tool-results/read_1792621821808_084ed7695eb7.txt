@@ -1,0 +1,178 @@
+     1→# Worklog
+     2→
+     3→---
+     4→Task ID: 1
+     5→Agent: main (Z.ai)
+     6→Task: Build multi-broker trading terminal (sim feed, ICICI Breeze, Dhan, Shoonya) with copy trading, capital sizing house rules, from-scratch chart, admin, master contracts sync, python strategy builder. Reference: straweb/hedging (OpenAlgo fork, hedging branch) — adapted to Next.js 16 + TS sandbox runtime (Flask backend replaced by service-oriented Next.js API + mini-services; frontend stack identical: React 19 + TS + Tailwind 4 + shadcn/ui).
+     7→
+     8→Work Log:
+     9→- Initialized fullstack env (init script), inspected package.json / Caddyfile / dev.sh
+    10→- Runtimes: Node 24.21 (Next dev), Bun 1.3.14 (mini-services), Python 3.12
+    11→- Plan: Prisma master DB + per-broker SQLite via node:sqlite (db/brokers/{type}/{accountId}.db)
+    12→- Architecture: brokers/ plugin folder (OpenAlgo style), services/ modules, mini-services/market-feed on port 3003 (socket.io), strategy scheduler via instrumentation.ts
+    13→- Built Prisma master schema (BrokerAccount, CapitalConfig, SymbolMaster, SymbolMapping, CopyTradeConfig, Strategy, StrategyLog, SyncLog, OrderAudit) + db push
+    14→- Core: charges engine (STT/GST/stamp/txn per segment), capital sizing service with 3 house modes (PROFIT_ONLY, INITIAL_PLUS_PNL, INITIAL_WITH_LOSS_REDUCTION), crypto (AES-256-GCM creds, scrypt passwords, HMAC sessions)
+    15→- brokers/: registry + simfeed/dhan/shoonya/icici_breeze adapters (real API shapes for Dhan v2, Noren, Breeze; sandbox fallback fills via shared execution engine writing orders/trades/positions/funds per-account SQLite DBs)
+    16→- Services: symbol master sync (216 symbols: indices/eq/futs/NIFTY weeklies/BANKNIFTY monthlies; 864 broker mappings), copy-trading order router (fan-out + per-account sizing), bootstrap seeding, strategy engine (1s scheduler, time-based entry/exit, SL/target/trailing, python export to /strategies)
+    17→- mini-services/market-feed: socket.io :3003 + REST :3004, deterministic 3-day 1m backfill, live ticks 250ms with mean reversion, TF aggregation 1m..1d, depth
+    18→- API routes: auth, accounts CRUD, copytrade, symbols(+sync/resolve), orders(+squareoff/cancel-all), positions/trades/funds aggregates, strategies CRUD+python, market proxies, status, audit, broker-logs
+    19→- Frontend SPA: auth gate, top bar (Terminal/Strategy/Admin + FEED LIVE status), workspace tabs (persisted), from-scratch canvas chart (candles/line/area, volume, crosshair OHLCV legend, wheel zoom, drag pan, SMA20/50, position avg-price markers, last-price label, click-to-set-limit), watchlist+depth, order pad (AUTO house sizing preview per account), bottom panel (orders/trades/positions/funds/broker-logs), quick buttons (B/S, cancel all, square off all, kill switch badge), admin view, strategy builder UI + python viewer
+    20→- Fixed: TDZ circular registry import (brokers/index.ts), @brokers/* tsconfig alias, missing createHmac import, symbolMap.masterSymbol destructure bug, socket path conflict (REST split to :3004), scheduler lazy-start via bootstrap(), reduceOnly bypass for exits/square-offs (capital checks must never block exits), absolute capitalAmount clamped to usable (house rule)
+    21→- E2E verified via agent-browser: login, live ticks, chart, order fan-out (203/40/0 units sized per house rules), positions PnL, square-off settlement with charges, admin toggles, strategy create→entry→scheduled exit→python export
+    22→
+    23→Stage Summary:
+    24→- Working terminal: http://localhost:81 (gateway) — FEED LIVE via socket.io, orders fan out to all enabled accounts, per-account SQLite DBs under db/brokers/
+    25→- Key artifacts: brokers/ (4 adapters + execution engine), src/lib/services/ (capital, order-router, symbol, strategy, bootstrap), mini-services/market-feed, strategies/*.py exports
+    26→- Verified: PROFIT_ONLY acct = 0 usable after losses (skips legs), loss-reducing acct = initial − losses incl charges, initial+PnL acct compounds; exits always bypass capital checks
+    27→- Default login: admin / admin123
+    28→
+    29→---
+    30→Task ID: 2
+    31→Agent: main (Z.ai)
+    32→Task: Fix user-reported issues in preview tab — React hydration error + login with admin/admin123 failing.
+    33→
+    34→Work Log:
+    35→- Diagnosed: backend auth fine (login 200 via :3000 and :81), admin user seeded; failure was client-side
+    36→- Root causes found: (a) zustand persist rehydrated synchronously from localStorage before first client render → hydration mismatch when logged-in tab had divergent persisted workspaces; (b) sonner Toaster used next-themes useTheme() without a mounted ThemeProvider (hydration risk); (c) stale preview tab after dev-server restart → dead HMR chunks + hardening gaps (gateway HTML error pages returned unparseable responses to login fetch)
+    37→- Fixed store.ts: persist skipHydration:true + manual useTerminal.persist.rehydrate() in Shell useEffect
+    38→- Fixed sonner.tsx: pinned theme="dark" (no next-themes useTheme)
+    39→- Fixed layout.tsx: suppressHydrationWarning on <body> (browser-extension attribute injection guard)
+    40→- Hardened client-api.ts: fetchJson wrapper — cache:'no-store', readable gateway-502 errors, 1 auto-retry on transient 5xx/network errors
+    41→- Hardened auth routes: login/me now force-dynamic + nodejs runtime, always-JSON error responses (503 fallback), cookie secure flag set protocol-aware (x-forwarded-proto) so HTTPS preview and HTTP localhost both work
+    42→
+    43→Stage Summary:
+    44→- E2E verified: fresh login admin/admin123 OK (:3000 + :81), wrong password shows "Invalid credentials", divergent localStorage reload → ZERO hydration errors, logout→login cycle OK, console clean
+    45→- All fixes are SSR-safe; persisted workspaces rehydrate post-mount (1-frame default flash, acceptable)
+    46→
+    47→---
+    48→Task ID: 3
+    49→Agent: main (Z.ai)
+    50→Task: F&O strikes panel — dynamic strike add (CE/PE ATM±1-5 + specific strike), quick deploy bar (Deploy CE/PE, Cancel CE, PE Swap) with % allocation sizing, strike rows (LTP, day H/L, B/S/X, edit open position), spot chart + default-open ATM CE (left) / PE (right) mini charts.
+    51→
+    52→Work Log:
+    53→- symbol-service: seeded stock options for 10 F&O equities (monthly expiry, price-based strike step via strikeStepFor), exported optionPremium/strikeStepFor; resync grew universe 216→636 symbols, 2544 broker mappings
+    54→- option-service.ts (new): listOptionUnderlyings (12 F&O underlyings), getChainMeta (spot→ATM via min-gap step, expiries, lot), getChainQuotes (batch per-strike CE/PE LTP+H/L+chg), ensureOptionContracts (dynamic master rows + broker mappings + feed universe publication for any user strike)
+    55→- API: /api/options/underlyings, /api/options/chain (?underlying&expiry&strikes, includes atmRow for minis), /api/options/ensure-strike (POST)
+    56→- order-router: capitalPct param → sharePct sizing (per-account % of usable capital); reduceOnly legs now CAPPED at each account's own held qty (never flips flat account short — found live in E2E); squareOffAll + cancelAllOrders accept symbols filter; routes updated
+    57→- strikes-panel.tsx (new, right dock tab): underlying/expiry selectors, Spot/ATM/step/lot bar, CE+PE quick-add rows [-5..ATM..+5], specific-strike input (snaps to step, creates contracts on demand), rows w/ enable toggle + alloc% + strike + offset + LTP + H/L + position badge (L/S lots) + B/S/X + inline editor (position info, Δ lots/leg apply, exit full, remove, per-row alloc%); deploy bar: Deploy CE / Deploy PE (capitalPct per enabled strike), Cancel CE (filtered cancel), PE Swap (square-off CE syms → deploy PE, auto-adds ATM PE if list empty)
+    58→- option-mini-charts.tsx (new): 132px strip under spot chart for F&O underlyings — ATM CE left, ATM PE right, mini-mode CanvasChart (1m, no volume/crosshair/time axis), header shows strike/type/expiry/lot/LTP/chg, click loads option into main chart; ATM follows spot re-keying
+    59→- canvas-chart: added mini prop (thinner axes, fewer ticks, no crosshair/volume/time labels); terminal-view: RightDock tabs (Strikes | Order Pad, QuickButtons always visible), ATM toggle for minis, optionUnderlyings query gates the strip
+    60→- store: WorkspaceCfg.strikes (per-workspace persisted strike list: underlying, expiry, allocPct, rows[]) + showOptionMinis; mkWs defaults
+    61→
+    62→Stage Summary:
+    63→- E2E verified via browser: NIFTY chain (spot 24,499 → ATM 24500 step 50 lot 75), CE ATM + PE +1 add, Deploy CE → 34/6 lots on 2 accounts by house rules, PE Swap → CE flat + PE 1350@87.2, Δ-3/leg reduce capped per account (router fix), Exit full → all flat, dynamic 25200 contracts created+quoted, mini charts live both sides
+    64→- Console clean, no hydration errors, FEED LIVE on gateway path (:81). FEED DOWN on :3000 direct is expected (socket.io proxies only via Caddy XTransformPort)
+    65→
+    66→
+    67→---
+    68→Task ID: 4
+    69→Agent: main (Z.ai)
+    70→Task: Multi-layout chart panes per workspace + compact strike quick-add (ATM + offset buttons) + per-side 100% auto-normalized alloc + per-account capital chips in top bar.
+    71→
+    72→Work Log:
+    73→- option-service: hedge-desk dual-ATM convention — ceAtm = floor(spot/step)*step, peAtm = ceil(spot/step)*step (spot 24520 -> CE 24500 / PE 24550); ChainMeta gained ceAtm/peAtm, ChainStrikeRow gained offsetCe/offsetPe (live side-relative offsets)
+    74→- /api/options/chain: response now includes atmCe/atmPe quote cells (side-ATM contracts) alongside legacy atmRow
+    75→- store: WorkspaceCfg.layout ('single' | 'spot-atm' | 'grid4') + PaneCfg[] (ce/pe/extra, strike:null = follow live ATM); helpers wsLayout/wsPanes/pinStrikePanes/unpinPane; legacy showOptionMinis migrated via fallback
+    76→- strikes-panel rework (compact): quick-add row [ATM][+/- toggle][1..5] — ATM adds CE@ceAtm+PE@peAtm, offset n adds both sides n steps from their side ATM; specific-strike input kept; rows grouped CE/PE with sticky side headers (ATM + Σ% badge + count); per-row alloc% input (commit on blur/Enter) with normalizeSide() — enabled rows per side always sum to exactly 100 (proportional scaling, drift dumped on largest); click strike cell -> pins into CE/PE pane + mirrors scratch pane (ring highlight); deploy bar shows CE Σ/PE Σ; removed global allocPct
+    77→- fixed parallel-add race: addOffset/addSpecific now sequential + addStrike re-reads store after ensureStrike await (CE row was being clobbered by PE add)
+    78→- option-panes.tsx (new, replaces option-mini-charts): OptionPane (ce/pe/extra) — header (strike/type/side-offset/underlying/expiry/lot/LTP/chg%, ATM-follow badge vs PIN badge + unpin, set-active-symbol button), body = CanvasChart 1m; scratch pane defaults to underlying spot; WorkspacePanes renders 'single' | 'spot-atm' (spot top + CE|PE row) | 'grid4' (spot/CE/PE/scratch)
+    79→- terminal-view: layout selector [1][S+2][2×2] in toolbar; center region via WorkspacePanes; right dock compacted 23% -> 18% default; panel sizes now sum to 100 (killed layout-normalization warning)
+    80→- app-shell: CapitalChips top-right — one chip per account (dot = order-routing state, label, compact usable ₹ format k/L/Cr); popover: order-routing Switch (instant PATCH), capital size input, sizing-mode Select (short labels + detail), realized PnL, Apply
+    81→- /api/accounts GET: added missing `mode` field (was only modeLabel — Select rendered empty)
+    82→- E2E verified via agent-browser: ATM + offsets add both sides w/ live side-relative offsets; PE side normalized 25/25/50 after adds; Deploy CE -> 24500CE legs at 100% usable (SIM Master 20700 qty, Trader 3 4275, zero-usable acct skipped); row click pins CE pane (stays pinned while ATM re-keys), PE click pins PE + scratch mirrors; unpin -> ATM follow; 2x2 + single layouts OK; capital chip: initial 500000->300000 saved, mode PROFIT_ONLY->INITIAL_WITH_LOSS_REDUCTION -> usable ₹2.98L (300k − 2.2k realized loss); console clean, no hydration errors
+    83→
+    84→Stage Summary:
+    85→- Default FNO workspace = S+2 layout: spot top, live side-ATM CE (left) / PE (right) panes below; strike rows load into panes on click
+    86→- Alloc semantics: each side independently auto-normalizes to 100% of per-account usable capital; deploy/cancel/swap per side unchanged
+    87→- Capital chips give one-click account enable/disable + capital sizing without leaving the terminal
+    88→
+    89→---
+    90→Task ID: 5
+    91→Agent: main (Z.ai)
+    92→Task: User-reported fixes + features — chart volume everywhere, independent price/time axis zoom, free 4-way chart drag, remove bottom-right quick buttons, resizable chart panes, N stacked depth panels bottom-left, deploy-enabled-only toast clarity, plain market B/S on strike rows, Entry/Target/StopLoss price inputs (+ resting-order monitor so they actually fire), feed chip with switchable source account.
+    93→
+    94→Work Log:
+    95→- canvas-chart rework: shared window calc (winRef) for accurate px->price mapping; wheel on price axis / Shift+wheel = price-scale-only zoom (0.15-10x), wheel elsewhere = time zoom; drag plot = free pan left/right/top/bottom (priceOffRef), drag price axis = squeeze/stretch, drag time axis = time pan; dbl-click resets; volume histogram in ALL modes (mini panes get 14% band) + Vol vMax label
+    96→- option-panes: spot-atm + grid4 layouts rebuilt on react-resizable-panels (all pane dividers draggable); pane charts now follow ws.showVolume (volume was hard-disabled before — the "missing volume" report)
+    97→- terminal-view: removed QuickButtons bar (B/S, Positions, Orders, Copy ON, Cancel All, Square Off All) from right dock; deleted QuickButtons component
+    98→- store: DepthPanelCfg {id,symbol,height} per workspace; watchlist: DepthStack — [+] adds depth panel for selected symbol (max 6), X removes, drag top grip resizes 96-460px (committed on mouseup), stack scrolls with max-h 72% so watchlist shrinks
+    99→- strikes-panel: deploy toast now "Deploy CE: N/M enabled strikes · X account fills" (was ambiguous per-leg count); rowSell de-hijacked — S = plain market SELL of that strike (old code silently exited longs); row mutations (toggle/alloc/remove) read fresh store state (stale-closure fix)
+   100→- StrikeRowEditor: "orders at price" desk — Entry (B@/S@ LIMIT at price, alloc%-sized), Target (reduce-only LIMIT, auto side), StopLoss (reduce-only SL-M trigger); resting orders return master status FAILED (0 fills) so toasts count OPEN legs as success
+   101→- order-monitor.ts (new): 1s loop executes resting LIMIT/SL/SL-M legs on sim-feed crossing via placeMasterOrder(source SYSTEM); 'reduce'-tagged exits (strategyId marker) cap qty at held lots and auto-cancel when the position flattens; wired in instrumentation.ts
+   102→- feed-source: market-feed /feed-source GET/POST persisting db/feed-source.json; /api/feed (auth'd) proxies + mirrors onto BrokerAccount.isLiveDataSource; FeedChip popover in top bar — radio list (Sim + every account), one active at a time, chip shows live source label
+   103→- sim feed: synthetic index volume (separate PRNG stream so price paths are byte-identical) + per-tick volume accumulation into live candles (was v+=0 forever) calibrated to history scale; timer dedup via g.__feedTimers (bun --hot was stacking intervals across reloads)
+   104→- sandbox infra: mutual watchdogs — feed service respawns `bun run dev` when :3000 is dark; instrumentation respawns the feed when :3004 is dark + re-publishes the 638-symbol universe; spawn envs pin PORT/REST_PORT (Next dev env carries PORT=3000 which hijacked the feed socket port -> :3003 silently missing, frozen ticks)
+   105→
+   106→Stage Summary:
+   107→- E2E verified: deploy with 1 of 2 CE enabled -> exactly 1 master order + "1/1 enabled strikes · 3 account fills"; plain row SELL routes as new order (no exit hijack); Entry LIMIT @30 rested OPEN (auto-sized per account), Target/SL armed per-account at held qty; monitor fired an SL-M trigger within 1s (3 SYSTEM fills) and auto-cancelled orphaned exits when flat; feed chip switched source to an account and back (persisted to db/feed-source.json); pane dividers resized (CE 120->200px, CE/PE widths re-split); depth panel added/resized/removed; free chart drag + price-axis zoom verified on-canvas; console clean
+   108→- Infra: dev server + feed service now self-heal across sandbox process reaping (tool-session boundaries); verify with curl :3000/api/auth/me, :3004/health, :3003 socket
+   109→- tsc: zero new errors (18 pre-existing in untouched files)
+   110→
+   111→---
+   112→Task ID: 6
+   113→Agent: main (Z.ai)
+   114→Task: User round-3 feedback — chart future space + reset-to-live + always-on legend + synced crosshair + indicator toolbar (straweb scalpingtool style), pane-header depth buttons, full deploy bar (Cancel PE, Swap CE<->PE, Exit All), alloc % slider + fixed-rupee mode, index-level & time-based CE/PE auto rules (server-side engine + API + UI tab), toasts top-left, full live broker API surface (Dhan v2 / Shoonya Noren / ICICI Breeze) + live fill reconciliation.
+   115→
+   116→Work Log:
+   117→- canvas-chart rework: window end may exceed data length — offset clamped to [-50, len-25] so users can pan 50 bars INTO THE FUTURE (blank slots with projected time labels + dashed divider); pMin/pMax survive full-future views via lastRangeRef; ▶LIVE floating button (dirty tracking) + green LIVE dot reset view; legend ALWAYS drawn (symbol · tf · LTP · chg% · O/H/L/C/V · time · RSI readout) with hovered > synced > last focus candle; crosshair SYNC BUS (module pub/sub, same-tf only): hovering one chart draws vertical line + time bubble + synced price bubble + focus legend on every same-interval chart; new indicators — EMA9/21, session VWAP (IST-day reset), Bollinger(20,2) overlays + RSI(14) and MACD(12,26,9) sub-panels (16% slots, stacked, 30/70 + zero guides, legend readouts)
+   118→- option-panes: option panes + scratch now use ws.tf (interval AUTO-LOCKED across all open charts — pre-req for sync); DepthAddButton at the START of every pane header (Layers icon, before title) -> addDepthPanelTo() store helper (dedupe, max 6) shared with the DepthStack [+] button; SpotPaneHeader (depth btn + symbol + LTP/chg via ticks) wraps the spot pane in all layouts; terminal-view toolbar depth button for single layout
+   119→- terminal-view toolbar: MA20/MA50/EMA/VWAP/BB overlay toggles + RSI/MACD sub-panel toggles (persisted per workspace via WorkspaceCfgFlags); spot chart now receives all indicator flags
+   120→- strikes-panel: deploy bar = Deploy CE/PE · Cancel CE/PE · Swap CE->PE · Swap PE->CE · Exit All (grid, destructive Exit All); swapSide(from) squares off the from-side symbols then deploys the to-side via shared deployRows() core (fresh chain fetch, auto-adds side ATM when list empty); AllocCell — % mode with inline range slider + numeric input, FIXED mode = rupee input; workspace allocMode toggle [%/₹]; PCT normalizes per side to 100, FIXED never normalizes; FIXED sizing sends tag "abs:<amt>" -> router absoluteAmount (verified: abs:20000 -> 3 lots/leg @ premium 87.75)
+   121→- auto-rules-service (new): db/auto-rules.json storage, CRUD + 1s engine — INDEX rules edge-trigger on spot crossing ABOVE/BELOW a level (prev-spot map), TIME rules fire at HH:MM IST within a 5-min late-grace window (repeatDaily or once); fire path = getChainMeta -> side-ATM (CE floor / PE ceil convention) + offset*step -> ensureOptionContracts -> placeMasterOrder(source SYSTEM, capitalPct, strategyId auto:<id>); engine state on globalThis (hot-reload-safe singleton) + 30s busy-grace + 20s fireWithTimeout + 60s heartbeat log — a wedged tick can no longer stall the scheduler (root cause of the first silent no-fire); API /api/autorules (GET/POST) + /[id] (PATCH/DELETE)
+   122→- auto-panel.tsx (new, right dock "Auto" tab): rule builder (Index/Time kind, cross toggle, level/time input, BUY/SELL, CE/PE, ATM±3 offset, alloc % slider) + rule list with arm/disarm Switch, last status/message, delete
+   123→- broker live APIs — registry gained optional modifyOrder/getOrderBook/getTradeBook/getPositionsLive/getFunds/getQuote/getOrderStatus/sessionKind + normalized row types (BrokerBookRow etc.); brokers/live-api.ts shared fetch (timeout + status normalize); DHAN v2: place/PUT modify/DELETE cancel/order book/order detail/trades/positions/fundlimit (their "availabelBalance" typo handled)/marketfeed quote; SHOONYA Noren: PlaceOrder/ModifyOrder/CancelOrder/OrderBook/TradeBook/PositionBook/Limits/GetQuote — ALL calls now carry jKey session token (was missing on the old place/cancel = live place would 401); ICICI BREEZE: POST/PUT/PATCH orders (modify action), order book + ?id= detail, /trades, /portfolio/positions, /customer/margins, /quotes (stock|expiry|strike|right token); status normalization (TRADED/COMPLETE/EXECUT->FILLED etc.)
+   124→- live-order-sync (new): 5s loop — for accounts with live credentials, polls the real broker order book and reconciles local OPEN legs: broker FILLED -> applyFill at broker avg price + margin-delta onTradeSettled (single-sourced settlement), CANCELLED/REJECTED -> closed out; sandbox accounts skipped; wired in instrumentation
+   125→- sonner Toaster position="top-left" (notifications top-left)
+   126→- OrderLegResult re-exported from brokers/registry (adapters imported it from there)
+   127→
+   128→Stage Summary:
+   129→- E2E (API): INDEX rule "cross above spot+1 -> BUY CE ATM" FIRED in ~15s with 3/3 account fills; TIME rule fired at exactly HH:MM IST ("SELL 24500 PE — 3/3 fills"); retro/window guards verified (past-window rule correctly never fires); abs:20000 fixed-rupee order = 3 lots on each of 3 accounts; Exit All flattens everything (positions 0)
+   130→- E2E (browser): always-on legend + values on all 3 panes; hover spot at 17:05 -> CE + PE panes drew synced crosshair + 17:05 bubbles + 17:05 candle values in their legends (interval-locked sync working); drag revealed future space (time axis to 20:45) + ▶LIVE reset; RSI/MACD/EMA panels render on spot + option panes with legend readouts; pane-header depth button added CE option depth to the stack (DEPTH 2); Deploy CE filled legs, Swap CE->PE toast "CE flat (3 legs) · 1/1 PE strikes · 3 fills" with SELL CE then BUY PE order rows; Exit All recovered capital chips; Auto tab armed a rule from the UI; ₹/₹ toggle + Σ display; toasts appear TOP-LEFT; console clean, zero page errors
+   131→- tsc: 14 pre-existing errors in untouched files, 0 new
+   132→
+   133→---
+   134→Task ID: 7
+   135→Agent: main (Z.ai)
+   136→Task: User round-4 feedback — chart #ghostCtl (1M ghost hollow/fade) + SCALES (price/%/inverted%/points with draggable + set-by-click baseline), icon-only account chips, depth qty in lots, strike rows reworked (enable → label → % slider, second line ₹amount + lots preview), PnL everywhere (per strike/side/account/total net), position Repeat/Swap/Edit/Exit + order Edit/Cancel/Repeat actions, auto-bot v2 (HH:MM:SS seconds precision, index-range trigger, DEPLOY/CANCEL actions, user-picked strike sets, optional entry/SL/target legs), watchlist tabs (Watch stars / Index with expandable constituents + contribution pts / Eq / Fut / Opt), symbol-click → per-symbol workspace with FNO auto-ATM strikes, session win-rate + pts chip, session tick-recorder DB (NIFTY+SENSEX default, per-session SQLite, admin toggle + symbol add), SENSEX index added.
+   137→
+   138→Work Log:
+   139→- symbol-service: SENSEX added to INDEX_UNIVERSE (base 81,000) + INDEX_CONSTITUENTS weight maps (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/SENSEX); feed DEFAULT_UNIVERSE gained SENSEX; master sync → 639 symbols / 2556 mappings
+   140→- /api/market/index: constituents with live H/LTP/L/Vol/chg% + contribution pts (chgPts × weight/100) + Σ totalPts
+   141→- market-feed (bun): tick recorder — bun:sqlite per-session DB at db/ticks/<IST-date>/session-<HHMMSS>.db (ticks table + meta), 250ms recorder loop, IST-day rollover, config db/ticks/tick-recorder.json (default enabled NIFTY+SENSEX), REST /tick-config GET|POST · /tick-sessions · /tick-sample (replay for future paper trading); hot-reload-safe timer ownership
+   142→- /api/tickrecorder proxy (GET config+sessions, POST toggle/symbols); Admin "Tick Data Recorder" card (RECORDING switch, symbol chips w/ add-remove, current session rows, sessions table)
+   143→- /api/stats/session: session win rate (W/L of closing trades), net pts = Σ(realizedPnl/qty), realized/unrealized/net ₹, charges, per-account breakdown, top pts symbols
+   144→- /api/market/quote enriched with lotSize + instrumentType; DepthPanel renders QTY in LOTS (qty/lot, header shows L<lot>) when instrument has lots, else shares
+   145→- /api/orders/cancel: single-leg cancel (account + orderId) with status guard
+   146→- auto-rules-service v2: kinds TIME|INDEX|INDEX_RANGE; TIME fires HH:MM(:SS) within a 2s window on a NEW 250ms scheduler; range = spot enters [lo,hi] edge-trigger; actions BUY|SELL|DEPLOY|CANCEL — DEPLOY buys the side's strike list, CANCEL cancels pending orders of those symbols; rule.strikes (user-picked set w/ per-strike allocPct) or side-ATM+offset; optional entryPrice (LIMIT entry) / stopLoss (reduce-only SL-M qty 9999 capped at held) / target (reduce-only LIMIT) armed post-fill; in-memory __autoFiredToday guard — the 2s rules cache could double-fire inside a seconds window (found live: 3 fires at 250ms spacing; verified 1 fire after fix + dev-server restart because the old interval closure survives HMR)
+   147→- canvas-chart: 1M GHOST overlay (fetches 1m series when tf>1m, hollow/fade styles, live tick merge into ghost tail, range-inclusive) + SCALES (topmost enabled = right axis: price/pct/inv/pts; others = left measurement column w/ tinted labels) + baseline (default session open, dashed amber line, drag to rearrange via 5px grab zone, "Set baseline" pick-mode bus qd-chart-set-base consumed on next chart click, dbl-click reset); toolbar: 1m ghost toggle + HOLLOW/FADE seg + scales popover
+   148→- store: WorkspaceCfg += showGhost/ghostStyle/scales; watchSymbols (persisted) + toggleWatch; openSymbolWorkspace(symbol, fno) — activates existing per-symbol ws or creates one (FNO → spot-atm layout + strikes pre-bound)
+   149→- watchlist rewrite: tabs Watch(stars)/Index/Eq/Fut/Opt; Index rows expand → ConstituentList (pts contribution sorted, H/LTP/L/Vol/chg%, Σ totalPts header, click constituent opens its own ws); rows open workspaces; search filters Watch/Index tabs too; Watch rows resolve via new /api/symbols?symbols= list param (SENSEX was missing under the old 120-limit browse query)
+   150→- strikes-panel: rows reworked — line1 [enable][strike+offset label][alloc slider+%][LTP+H/L][L/S badge][B/S/X/edit], line2 "≈ ₹amount · N lots" (PCT × rep-usable or FIXED ₹, lots = amt/(ltp×lot)) + per-strike PnL; side headers show side PnL; deploy bar gained PnL strip (Open/Booked/Net + per-account net); ATM CE+PE auto-load when an FNO ws binds (watchlist → ws lands ready); api.accounts query for rep usable
+   151→- bottom-panel: Positions rows → Repeat (re-enter same side/size) / Swap (close + reverse) / Edit (inline Δ lots per account) / Exit; Orders rows → Edit (cancel+replace w/ new qty/price inline) + Cancel for OPEN, Repeat for FILLED/FAILED/CANCELLED; toast feedback via shared useOrderActions
+   152→- auto-panel v2 UI: kind seg Time/Index/Range, HH:MM:SS input, BUY/SELL/DEPLOY/CANCEL + CE/PE, ATM-offset OR Strikes picker (checkbox list of the workspace's side rows w/ per-strike alloc%), alloc slider, optional entry/sl/tgt inputs, daily toggle, summary sentence; rule list shows kind icon, strike count, e/sl/t badges
+   153→- app-shell: CapitalChips now icon-only (broker glyph chip ⚡/D/S/iB + compact ₹; label in tooltip+popover); SessionStatsChip (Trophy WR% + pts) with per-account + per-symbol popover
+   154→
+   155→Stage Summary:
+   156→- E2E verified via agent-browser + API: SENSEX constituents (+pts) expand and clicking opens per-symbol workspaces (FNO gets spot-atm + auto ATM CE/PE rows — NIFTY flow; SENSEX correctly non-FNO since it has no sim chain); ghost 1m hollow candles + left measurement column (+%/pts labels + amber BASE) render on spot + option panes; baseline dragged live; strike rows show ≈₹1,09,691 · 37 lots style previews + strike PnL; PnL strip matches per-account nets; Exit button closed 3 legs w/ top-left toast; auto rule armed via API fired at 01:27:00.852 IST (0.85s from target, 3/3 fills) — triple-fire bug found + fixed + re-verified single fire (183ms from target); tick recorder wrote 13k+ ticks across 2 session DBs, replay /tick-sample returns rows; admin recorder card interactive; depth panel for an option shows LOT column; session chip showed live WR/pts; console clean, tsc 0 new errors (18 pre-existing lines)
+   157→- Infra notes: dev server restarted once to load the new engine closure (HMR keeps old intervals); feed service respawned cleanly with the recorder enabled
+   158→
+   159→---
+   160→Task ID: 8
+   161→Agent: main (Z.ai)
+   162→Task: User round-5 feedback — scalping-tool #chartbar/#tools port (full ghost-candle logic, per-chart type/indicators/ghost/scales/draw-tools), auto bot v3 compound triggers (time + index-range + premium with ATM±5 button style), bottom-dock collapse + session counts, websocket sync hub replacing N polling APIs, broker extras (holdings/GTT/margin) + Dashboard view.
+   163→
+   164→Work Log:
+   165→- Read the straweb scalpingtool source (fetched raw HTML, extracted 134KB inline JS): ghost = 1m inner candles rendered INSIDE higher-tf aggregated shells (alpha `la` from inner bar width, hover slot emphasis + inner-bar full alpha, ghost volume micro-bars, amber slot box, legend shows shell + inner 1m details); #tools = 2-pt click-click drawings anchored to bars; computeVP (26 bins, typical price, POC/VAH/VAL @70%); computeBSV (bf=(c-l)/(h-l) buy/sell split, net histogram)
+   166→- canvas-chart full rewrite (~2090 lines): GHOST v2 (shell translucent + hollow outline, inner 1m per slot via time->x mapping, la alpha ramp, hovered slot amber box, isInner emphasis, ghost volume micro-bars, LEGEND row 2 always shows 1m OHLCV when tf>1m even ghost-off); #tools (trend/ray/hline/rect/fib/pricerange/long/short/vprofile/vbs — time+price anchored, click-click or drag, select/move/endpoint-edit, Del/Esc, localStorage per chart); PER-CHART settings (chartType/indicators/ghost/ghostStyle/scales under zterm-chart:{settingsKey}); per-chart #chartbar overlay (type icon, Σ indicators popover, ghost icon + H/F, scales popover, pen tools popover + active-tool hint)
+   167→- store: AppView 'dashboard', bottomCollapsed persisted, mkWs showGhost:true + persist v2 migration; terminal-view toolbar slimmed (tf/layout/vol/depth remain; per-chart hint label); option-panes settingsKeys per pane
+   168→- auto-rules-service v3: kinds + COMPOUND; conditions AND-combined per 250ms tick — TIME (graceFor: 2s solo / 300s combined / rule.graceSec), INDEX range steady-state (legacy INDEX_RANGE keeps edge trigger), premium per-strike gate INSIDE executeStrikes (entryOp LTE/GTE/RANGE on the option's own LTP — delta/gamma-aware; returns waiting instead of burning the once-per-day guard, expires FAILED after grace); auto-panel v3 UI (condition chips, premium mode seg ≤/lo-hi/≥, ATM[-5..+5] button row, kept strikes-picker + optional entry/SL/TGT legs)
+   169→- bottom-panel: collapse chevron -> slim session bar (ORD 0/180 POS 3/33 net ₹ pts + tab buttons); tab labels carry open/total counts; hub feeds all tables
+   170→- sync hub (mini-services/market-feed): 'sync:sub' per-socket params; 1s loop emits sync:core (accounts+positions+orders+trades+funds+session — DIRECT bun:sqlite readonly reads of db/custom.db BrokerAccount/CapitalConfig + per-broker DBs, ltp-marked from the feed's own quote engine, session stats replicated), sync:chain (master-DB chain + inferred step, CE floor/PE ceil ATM, ±15 steps, atm cells carry strike), sync:index (embedded weight maps, pts contribution); client lib/sync.ts (onSync/useSyncChannel/useSyncData + socket->local bridge + mergeChain for REST far-strike fill); swapped app-shell chips, session chip, bottom tables, strikes panel (chain + positions), option panes, watchlist constituents, terminal-view markers — REST kept as auto-fallback (refetchInterval relaxed to 5-8s)
+   171→- broker extras: registry +getHoldings/+marginCalc; DHAN GET /v2/holdings + POST /v2/margincalculator; SHOONYA Holdings + GetMargin; BREEZE /portfolio/holdings + /customer/margins?action=; GTT service (db/gtt.json, 1s edge-trigger engine -> placeMasterOrder, arm/disarm/repeatDaily, wired in instrumentation); /api/gtt CRUD, /api/portfolio (live holdings + live marks + open positions), /api/margin (per-account broker margin vs usable, sandbox estimate fallback); DashboardView (KPI row net/wr/pts/margin/charges/fill-rate, SVG realized curve, accounts table, portfolio card, margin calculator, GTT manager) + top-nav entry
+   172→- FIXES during E2E: graceSec was always stored as 2 (killed compound windows) -> only stored when provided; feed hub paths resolved from service cwd ('../..') + brokerType lowercased; sync socket->listener bridge was missing (core never reached React); instrumentation universe guard — republishes master contracts when feed /health symbols < 400 (manual feed restarts were leaving 9 symbols and empty option quotes)
+   173→
+   174→Stage Summary:
+   175→- E2E (API): GTT create->trigger ABOVE->FIRED 3/3 fills + auto-disarm; compound rule (time+range+premium LTE) FIRED 3/3 fills at the target second; margin (sim estimate 9800 = notional/5); portfolio rows + messages; probe: sync core/chain/index all flowing incl. through the Caddy gateway
+   176→- E2E (browser): 5m shells + 1m ghost on spot/CE/PE with dual-row legend (shell + 1m OHLCV + seconds time); per-chart bars render on every pane; trend line drawn via canvas clicks + SURVIVED pan (time-anchored); injected vprofile (amber POC/VAH/VAL histogram + labels) and long-position box (ENTRY/STOP/TGT + 1:R) render correctly; indicators/ghost/scales popovers present; bottom counts Orders 0/180 · Trades 168 · Positions 3/33; collapse bar shows session net/pts; auto panel chips + ATM±5 + COMPOUND rules listed; Dashboard KPIs (Net −₹1.72L, WR 11%, −945.4 pts, ₹88.22k margin, ₹15.9k charges, 100% fill), realized curve, accounts table, margin calc ₹4.9k vs ₹3.89L, GTT manager with SUCCESS/FAILED statuses; console clean
+   177→- tsc: 0 new errors (pre-existing untouched files only); feed service + dev server restarted cleanly; test rules/GTTs cleaned up
+   178→

@@ -1,0 +1,27 @@
+# Production entry :81
+#   /pyapi/*?XTransformPort=8000  -> FastAPI REST :8000
+#   /?XTransformPort=8001         -> socket.io WS :8001 (WebSocket upgrade aware)
+#   everything else               -> Next.js :3000
+:81 {
+	@transform_port_query {
+		query XTransformPort=*
+	}
+
+	handle @transform_port_query {
+		reverse_proxy localhost:{query.XTransformPort} {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy localhost:3000 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

@@ -1,0 +1,863 @@
+     1→"""
+     2→FNO Session Simulator — synthetic options trading session built on REAL
+     3→broker spot data.  (Entirely different from paper-trading tick replay:
+     4→the spot path is real broker 1m OHLCV, the option premiums are generated
+     5→from it with Black-Scholes using the user's expiry + volatility settings.)
+     6→
+     7→Round-18 upgrades:
+     8→  • MULTI-UNDERLYING — the user adds a LIST of F&O stocks/indices and every
+     9→    one of them runs its own session in parallel (own dataset, own contracts,
+    10→    own run loop, own persisted row).
+    11→  • CUSTOM EXPIRY DATE+TIME — the geek setting accepts an absolute expiry
+    12→    ("YYYY-MM-DD HH:MM" IST, or date-only → 15:30).  Empty → TODAY (current
+    13→    date, 15:30 IST).  The label (DDMMMYY) builds the option symbols, the
+    14→    absolute datetime drives Black-Scholes T.
+    15→  • GREEKS — Black-Scholes delta/gamma/theta/vega are computed per contract
+    16→    (chain payload carries them; strikes populate from expiry+vol).
+    17→  • MINUTE PATH = REAL OHLCV EXACTLY — the first sub-tick of every minute IS
+    18→    the candle open, the last sub-tick IS the candle close, and the path
+    19→    REACHES the candle high and low in between.  The intra-minute wiggle
+    20→    scales with the user's volatility rate AND the candle's volume vs the
+    21→    day average (high-volume minutes wobble more).
+    22→
+    23→Flow per underlying:
+    24→  1. user adds F&O underlyings + a historical session date (or RANDOM)
+    25→  2. engine pulls REAL 1m OHLCV of the spot through a connected live broker
+    26→     adapter (Breeze / Dhan / Shoonya) — session day + previous days
+    27→     (default 5, up to 6 months) for prev-day/week/month/6M high-low stats
+    28→  3. contracts: CE/PE for ATM±band strikes (strike ladder per underlying)
+    29→     are inserted into every broker master so orders route normally
+    30→  4. engine seeds chart history (spot: previous days + session day so far;
+    31→     options: BS-derived 1m path of the session day)
+    32→  5. the run loop walks the session minute-by-minute (speed = session
+    33→     minutes per real second), emitting ticks through the normal hub tick
+    34→     path — charts, chain, depth, order pad all behave like a live day.
+    35→
+    36→Sessions are sandbox-only: starting one in LIVE ONLY mode is refused, and
+    37→an active session self-stops if the mode is switched to live.
+    38→"""
+    39→import asyncio
+    40→import json
+    41→import math
+    42→import random
+    43→import time
+    44→from datetime import datetime, timedelta
+    45→
+    46→from backend import config, db
+    47→
+    48→# NSE session window (IST).  ts values are naive-UTC epoch; IST = UTC+5:30.
+    49→SESSION_START_HM = (9, 15)
+    50→SESSION_END_HM = (15, 29)
+    51→IST = 19800
+    52→
+    53→RISK_FREE = 0.065
+    54→
+    55→# strike ladder for stock underlyings (indices use options_chain.STEPS)
+    56→_LADDER = (1.0, 2.5, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
+    57→
+    58→
+    59→# ------------------------------------------------------------------ helpers
+    60→def _n(x: float) -> float:
+    61→    """Standard normal CDF."""
+    62→    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    63→
+    64→
+    65→def _bs_premium(right: str, S: float, K: float, T_years: float, iv: float) -> float:
+    66→    """Black-Scholes option premium (r=RISK_FREE), floored at 0.05."""
+    67→    if S <= 0 or K <= 0:
+    68→        return 0.05
+    69→    intrinsic = max(0.0, S - K) if right == "CE" else max(0.0, K - S)
+    70→    if T_years <= 0 or iv <= 0:
+    71→        return max(0.05, intrinsic)
+    72→    try:
+    73→        sqT = math.sqrt(T_years)
+    74→        d1 = (math.log(S / K) + (RISK_FREE + iv * iv / 2.0) * T_years) / (iv * sqT)
+    75→        d2 = d1 - iv * sqT
+    76→        disc = math.exp(-RISK_FREE * T_years)
+    77→        if right == "CE":
+    78→            px = S * _n(d1) - K * disc * _n(d2)
+    79→        else:
+    80→            px = K * disc * _n(-d2) - S * _n(-d1)
+    81→        return max(0.05, px)
+    82→    except (ValueError, ZeroDivisionError, OverflowError):
+    83→        return max(0.05, intrinsic)
+    84→
+    85→
+    86→def _bs_greeks(right: str, S: float, K: float, T_years: float, iv: float) -> dict:
+    87→    """Black-Scholes greeks: delta / gamma / theta(day) / vega(1% IV)."""
+    88→    out = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    89→    if S <= 0 or K <= 0 or iv <= 0 or T_years <= 0:
+    90→        if S > 0 and K > 0:
+    91→            itm = S > K if right == "CE" else K > S
+    92→            out["delta"] = (1.0 if itm else 0.0) if T_years <= 0 else 0.0
+    93→        return out
+    94→    try:
+    95→        sqT = math.sqrt(T_years)
+    96→        d1 = (math.log(S / K) + (RISK_FREE + iv * iv / 2.0) * T_years) / (iv * sqT)
+    97→        d2 = d1 - iv * sqT
+    98→        pdf = math.exp(-d1 * d1 / 2.0) / math.sqrt(2.0 * math.pi)
+    99→        disc = math.exp(-RISK_FREE * T_years)
+   100→        if right == "CE":
+   101→            delta = _n(d1)
+   102→            theta = (-(S * pdf * iv) / (2 * sqT) - RISK_FREE * K * disc * _n(d2)) / 365.0
+   103→        else:
+   104→            delta = _n(d1) - 1.0
+   105→            theta = (-(S * pdf * iv) / (2 * sqT) + RISK_FREE * K * disc * _n(-d2)) / 365.0
+   106→        gamma = pdf / (S * iv * sqT)
+   107→        vega = S * pdf * sqT / 100.0
+   108→        return {"delta": round(delta, 4), "gamma": round(gamma, 6),
+   109→                "theta": round(theta, 3), "vega": round(vega, 3)}
+   110→    except (ValueError, ZeroDivisionError, OverflowError):
+   111→        return out
+   112→
+   113→
+   114→def _ist_hm(ts: int) -> int:
+   115→    g = time.gmtime(ts + IST)
+   116→    return g.tm_hour * 100 + g.tm_min
+   117→
+   118→
+   119→def _ist_date(ts: int) -> str:
+   120→    return time.strftime("%Y-%m-%d", time.gmtime(ts + IST))
+   121→
+   122→
+   123→def _ist_now() -> datetime:
+   124→    return datetime.utcnow() + timedelta(seconds=IST)
+   125→
+   126→
+   127→def _step_for(underlying: str, spot: float) -> float:
+   128→    from backend.options_chain import STEPS
+   129→    if underlying in STEPS:
+   130→        return float(STEPS[underlying])
+   131→    for st in _LADDER:
+   132→        if 20 <= spot / st <= 160:
+   133→            return st
+   134→    return 100.0
+   135→
+   136→
+   137→def _expiry_label(dt: datetime) -> str:
+   138→    """datetime -> '05NOV26' style symbol label."""
+   139→    return f"{dt.day:02d}{dt.strftime('%b').upper()}{dt.strftime('%y')}"
+   140→
+   141→
+   142→def _parse_expiry_input(raw: str | None) -> datetime:
+   143→    """User expiry input -> absolute IST-naive datetime.
+   144→
+   145→    accepted: 'YYYY-MM-DD HH:MM' · 'YYYY-MM-DD' (→15:30) · '05NOV26' (→15:30)
+   146→    empty/None → TODAY (current IST date) at 15:30.
+   147→    """
+   148→    s = (raw or "").strip()
+   149→    if not s:
+   150→        d = _ist_now().replace(hour=15, minute=30, second=0, microsecond=0)
+   151→        return d
+   152→    s = s.upper().replace("T", " ")
+   153→    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+   154→        try:
+   155→            dt = datetime.strptime(s, fmt)
+   156→            if fmt == "%Y-%m-%d":
+   157→                dt = dt.replace(hour=15, minute=30)
+   158→            return dt
+   159→        except ValueError:
+   160→            continue
+   161→    try:
+   162→        return datetime.strptime(s, "%d%b%y") + timedelta(hours=15, minutes=30)
+   163→    except ValueError:
+   164→        pass
+   165→    raise ValueError(f"expiry must be 'YYYY-MM-DD HH:MM' or a date — got {raw!r}")
+   166→
+   167→
+   168→def _parse_label(label: str) -> datetime | None:
+   169→    """'05NOV26' -> datetime (15:30 IST expiry close)."""
+   170→    try:
+   171→        return datetime.strptime(label.strip().upper(), "%d%b%y") + timedelta(hours=15, minutes=30)
+   172→    except Exception:
+   173→        return None
+   174→
+   175→
+   176→class FnoSimSession:
+   177→    """One underlying's session — full state + run loop (was the old SVC)."""
+   178→
+   179→    def __init__(self) -> None:
+   180→        self.active = False
+   181→        self.completed = False
+   182→        self.underlying: str | None = None
+   183→        self.spot_symbol: str | None = None
+   184→        self.session_date: str | None = None
+   185→        self.expiry: str | None = None            # label used in symbols (05NOV26)
+   186→        self.expiry_dt: datetime | None = None    # absolute expiry datetime (user geek setting)
+   187→        self.expiry_custom = False                # user-provided vs defaulted
+   188→        self.iv = 0.25              # annualised, user "volatility rate"
+   189→        self.speed = 5.0            # session minutes per real second
+   190→        self.band = 10
+   191→        self.prev_days = 5
+   192→        self.step = 50.0
+   193→        self.lot_size = 75
+   194→        self.strikes: list[int] = []
+   195→        self.stats: dict = {}
+   196→        self.source_label: str | None = None
+   197→        self.symbols: set[str] = set()
+   198→        self.option_symbols: set[str] = set()
+   199→        self.error: str | None = None
+   200→        self.started_at: float | None = None
+   201→        self.ticks_sent = 0
+   202→        self.cursor_iso: str | None = None
+   203→        self.progress = 0.0
+   204→        self._dataset: dict = {}
+   205→        self._minutes: list[int] = []
+   206→        self._candles: dict[int, dict] = {}
+   207→        self._cursor = 0
+   208→        self._task: asyncio.Task | None = None
+   209→        self._prev_close: float = 0.0
+   210→        self._opt_prev: dict[str, float] = {}
+   211→        self._cumvol: dict[str, int] = {}
+   212→        self._opt_hi: dict[str, float] = {}
+   213→        self._opt_lo: dict[str, float] = {}
+   214→        self._avg_vol: float = 0.0
+   215→        self._last_minute_ts: int | None = None
+   216→        self._running = False
+   217→
+   218→    def now_dt(self) -> datetime:
+   219→        """'Current time' for pricing: the replay clock while the session
+   220→        walks (greeks/premiums evolve with the session), else wall clock."""
+   221→        if self._last_minute_ts is not None:
+   222→            return datetime.utcfromtimestamp(self._last_minute_ts + IST)
+   223→        return _ist_now()
+   224→
+   225→    # ------------------------------------------------------------------ state
+   226→    def serves(self, symbol: str) -> bool:
+   227→        return self.active and symbol in self.symbols
+   228→
+   229→    # ------------------------------------------------------------------ data load
+   230→    def _cache_get(self, underlying: str, date: str) -> dict | None:
+   231→        row = db.core().one("SELECT data FROM fnosim_cache WHERE underlying=? AND date=?",
+   232→                            (underlying, date))
+   233→        if row:
+   234→            try:
+   235→                return json.loads(row["data"])
+   236→            except Exception:
+   237→                return None
+   238→        return None
+   239→
+   240→    def _cache_put(self, underlying: str, date: str, data: dict) -> None:
+   241→        db.core().exec(
+   242→            "INSERT OR REPLACE INTO fnosim_cache(underlying,date,data,fetched_at) VALUES(?,?,?,?)",
+   243→            (underlying, date, json.dumps(data)[:4_000_000], time.time()))
+   244→
+   245→    async def _load_spot(self) -> dict:
+   246→        """REAL 1m OHLCV through a connected live broker adapter.
+   247→
+   248→        Returns {session: [...], prev_days: [...], dailies: [...], source: label}.
+   249→        Cached per (underlying, date) so re-runs never re-hit the broker API.
+   250→        """
+   251→        cached = self._cache_get(self.underlying, self.session_date)
+   252→        if cached:
+   253→            return cached
+   254→        hub = Hub_instance()
+   255→        # prefer the active feed source account, else any connected live broker
+   256→        order: list[int] = []
+   257→        src = hub.feed_source()
+   258→        if src not in ("sim", ""):
+   259→            try:
+   260→                order.append(int(src))
+   261→            except ValueError:
+   262→                pass
+   263→        for aid in hub.adapters:
+   264→            if aid not in order:
+   265→                order.append(aid)
+   266→        errors: list[str] = []
+   267→        for aid in order:
+   268→            adapter = hub.adapters.get(aid)
+   269→            if not adapter:
+   270→                continue
+   271→            acc = db.core().one("SELECT broker,label,mode FROM accounts WHERE id=?", (aid,))
+   272→            if not acc or acc["broker"] == "sim":
+   273→                continue
+   274→            label = f"{acc['label']} ({acc['broker']})"
+   275→            try:
+   276→                hist = await adapter.get_history(self.spot_symbol, 1, days=185)
+   277→                if not hist or len(hist) < 30:
+   278→                    errors.append(f"{label}: no history returned")
+   279→                    continue
+   280→                data = self._build_dataset(hist)
+   281→                if not data["session"]:
+   282→                    errors.append(f"{label}: no 1m data for {self.session_date}")
+   283→                    continue
+   284→                data["source"] = label
+   285→                self._cache_put(self.underlying, self.session_date, data)
+   286→                return data
+   287→            except Exception as e:
+   288→                errors.append(f"{label}: {str(e)[:120]}")
+   289→        raise ValueError(
+   290→            "no live broker 1m data available — connect a live broker account "
+   291→            "(Admin → Accounts) with history access. Attempts: " + " | ".join(errors[:3]))
+   292→
+   293→    def _build_dataset(self, hist: list[dict]) -> dict:
+   294→        """Split raw 1m candles into session day / previous days / daily bars."""
+   295→        sess: list[dict] = []
+   296→        prev: list[dict] = []
+   297→        by_day: dict[str, list[dict]] = {}
+   298→        for c in hist:
+   299→            ts = int(c["t"])
+   300→            if _ist_hm(ts) < 900 or _ist_hm(ts) > 1530:
+   301→                continue
+   302→            d = _ist_date(ts)
+   303→            by_day.setdefault(d, []).append({"t": ts, "o": c["o"], "h": c["h"],
+   304→                                             "l": c["l"], "c": c["c"], "v": c.get("v") or 0})
+   305→        dates = sorted(by_day)
+   306→        for d in dates:
+   307→            if d == self.session_date:
+   308→                sess = sorted(by_day[d], key=lambda x: x["t"])
+   309→            elif d < self.session_date:
+   310→                prev.extend(sorted(by_day[d], key=lambda x: x["t"]))
+   311→        prev = prev[-self.prev_days * 375:]
+   312→        dailies = []
+   313→        for d in dates:
+   314→            rows = by_day[d]
+   315→            dailies.append({"date": d, "o": rows[0]["o"], "h": max(r["h"] for r in rows),
+   316→                            "l": min(r["l"] for r in rows), "c": rows[-1]["c"]})
+   317→        dailies = [d for d in dailies if d["date"] <= (self.session_date or "9999")]
+   318→        return {"session": sess, "prev_days": prev, "dailies": dailies,
+   319→                "fetched_at": time.time()}
+   320→
+   321→    def _compute_stats(self, data: dict) -> dict:
+   322→        dailies = data.get("dailies") or []
+   323→        if not dailies:
+   324→            return {}
+   325→        def rng(n):
+   326→            rows = dailies[-n:] if n else dailies
+   327→            return {"high": max(d["h"] for d in rows), "low": min(d["l"] for d in rows)}
+   328→        # prev trading day strictly BEFORE the session date
+   329→        prev_rows = [d for d in dailies if d["date"] < (self.session_date or "")]
+   330→        prev_day = prev_rows[-1] if prev_rows else dailies[-1]
+   331→        return {
+   332→            "prevDayHigh": prev_day["h"], "prevDayLow": prev_day["l"],
+   333→            "weekHigh": rng(5)["high"], "weekLow": rng(5)["low"],
+   334→            "monthHigh": rng(21)["high"], "monthLow": rng(21)["low"],
+   335→            "sixMonthHigh": rng(0)["high"], "sixMonthLow": rng(0)["low"],
+   336→            "sessionDaysLoaded": len(dailies),
+   337→        }
+   338→
+   339→    # ------------------------------------------------------------------ contracts
+   340→    def _ensure_contracts(self) -> None:
+   341→        """Insert CE/PE master rows for every band strike into every broker
+   342→        master (idempotent) so orders + quotes resolve like real contracts."""
+   343→        hub = Hub_instance()
+   344→        exp = self.expiry
+   345→        atm = round(self._session_open() / self.step) * self.step
+   346→        strikes = [int(atm + k * self.step) for k in range(-self.band, self.band + 1)]
+   347→        self.strikes = strikes
+   348→        rows = []
+   349→        for s in strikes:
+   350→            for right in ("CE", "PE"):
+   351→                sym = f"NFO:{self.underlying}{exp}{s}{right}"
+   352→                self.option_symbols.add(sym)
+   353→                rows.append((sym.split(":")[1], sym,
+   354→                             f"{self.underlying} {exp} {s} {right}",
+   355→                             "NFO", "OPT", exp, s, right, self.lot_size))
+   356→        self.symbols = {self.spot_symbol, *self.option_symbols}
+   357→        touched: set[str] = set()
+   358→        for name in db.broker_dbs_keys():
+   359→            bdb = db.broker_db(name)
+   360→            if bdb.one("SELECT COUNT(*) c FROM master")["c"] == 0:
+   361→                continue
+   362→            bdb.executemany(
+   363→                "INSERT OR REPLACE INTO master(token,symbol,name,exchange,instrument,expiry,strike,right,lotsize) "
+   364→                "VALUES(?,?,?,?,?,?,?,?,?)", rows)
+   365→            touched.add(name)
+   366→        for aid in list(hub.adapters):
+   367→            acc = db.core().one("SELECT broker FROM accounts WHERE id=?", (aid,))
+   368→            if acc and acc["broker"] in touched:
+   369→                hub._load_token_map(aid)
+   370→        config.log("fnosim", f"contracts ensured: {len(rows)} option rows across {len(touched)} broker masters")
+   371→
+   372→    def _session_open(self) -> float:
+   373→        rows = self._candles or {}
+   374→        if self._minutes:
+   375→            return float(rows[self._minutes[0]]["o"])
+   376→        return 100.0
+   377→
+   378→    # ------------------------------------------------------------------ seeding
+   379→    def _seed_history(self) -> None:
+   380→        """Seed the aggregator so every chart opens with full context."""
+   381→        hub = Hub_instance()
+   382→        agg = hub.agg
+   383→        spot_prev = self._dataset.get("prev_days") or []
+   384→        up_to = self._minutes[self._cursor] if self._minutes else 0
+   385→        spot_hist = [c for c in spot_prev if c["t"] < up_to]
+   386→        spot_hist += [c for c in self._minutes if c < up_to and self._candles.get(c)]
+   387→        agg.seed_history(self.spot_symbol, spot_hist)
+   388→        # options: BS path of the session day so far (greeks-consistent)
+   389→        exp_dt = self.expiry_dt
+   390→        for sym in self.option_symbols:
+   391→            right = "CE" if sym.endswith("CE") else "PE"
+   392→            mrow = self._row_of(sym)
+   393→            strike = float((mrow or {}).get("strike") or 0)
+   394→            if not strike:
+   395→                continue
+   396→            path = []
+   397→            t0 = None
+   398→            for ts in self._minutes:
+   399→                if ts >= up_to:
+   400→                    break
+   401→                cnd = self._candles[ts]
+   402→                mid = (cnd["h"] + cnd["l"]) / 2.0
+   403→                T = max(0.0, (exp_dt - datetime.utcfromtimestamp(ts + IST)).total_seconds()) / (365 * 86400) if exp_dt else 5 / 365
+   404→                px = _bs_premium(right, mid, strike, T, self.iv)
+   405→                if t0 is None:
+   406→                    t0 = px
+   407→                path.append({"t": ts, "o": px, "h": px * 1.004, "l": px * 0.996,
+   408→                             "c": px, "v": int(cnd.get("v") or 0) // 40})
+   409→            if path:
+   410→                agg.seed_history(sym, path)
+   411→                self._opt_prev[sym] = round(t0, 2)
+   412→        # spot prev_close = last close BEFORE the session day
+   413→        if spot_prev:
+   414→            self._prev_close = float(spot_prev[-1]["c"])
+   415→        elif self._minutes:
+   416→            self._prev_close = float(self._candles[self._minutes[0]]["o"])
+   417→
+   418→    def _row_of(self, symbol: str) -> dict | None:
+   419→        for name in db.broker_dbs_keys():
+   420→            row = db.broker_db(name).one("SELECT * FROM master WHERE symbol=?", (symbol,))
+   421→            if row:
+   422→                return row
+   423→        return None
+   424→
+   425→    # ------------------------------------------------------------------ lifecycle
+   426→    async def start(self, underlying: str, session_date: str, expiry_input: str | None,
+   427→                    iv_pct: float = 25.0, speed: float = 5.0, band: int = 10,
+   428→                    prev_days: int = 5) -> dict:
+   429→        if self.active:
+   430→            self.stop()
+   431→            await asyncio.sleep(0.1)
+   432→        hub = Hub_instance()
+   433→        if hub.trading_mode() == "live":
+   434→            raise ValueError("FNO session simulator is sandbox-only — switch trading mode to SANDBOX first")
+   435→        underlying = underlying.upper().strip()
+   436→        session_date = session_date.strip()
+   437→        try:
+   438→            datetime.strptime(session_date, "%Y-%m-%d")
+   439→        except ValueError:
+   440→            raise ValueError("session_date must be YYYY-MM-DD")
+   441→        if datetime.strptime(session_date, "%Y-%m-%d").weekday() >= 5:
+   442→            raise ValueError(f"{session_date} is a weekend — pick a trading day")
+   443→        self.underlying = underlying
+   444→        self.session_date = session_date
+   445→        self.spot_symbol = f"NSE:{underlying}"
+   446→        self.iv = max(0.05, min(2.0, float(iv_pct) / 100.0))
+   447→        self.speed = max(0.5, min(60.0, float(speed)))
+   448→        self.band = max(3, min(20, int(band)))
+   449→        self.prev_days = max(1, min(185, int(prev_days)))
+   450→        self.error = None
+   451→        self.completed = False
+   452→        self.ticks_sent = 0
+   453→        self.progress = 0.0
+   454→        self.cursor_iso = None
+   455→
+   456→        # custom expiry: absolute datetime (empty → current date 15:30 IST)
+   457→        self.expiry_dt = _parse_expiry_input(expiry_input)
+   458→        self.expiry_custom = bool((expiry_input or "").strip())
+   459→        self.expiry = _expiry_label(self.expiry_dt)
+   460→
+   461→        # 1. REAL spot data (raises with a clear message when unavailable)
+   462→        data = await self._load_spot()
+   463→        self._dataset = data
+   464→        self._candles = {c["t"]: c for c in data["session"]}
+   465→        self._minutes = sorted(self._candles)
+   466→        if not self._minutes:
+   467→            raise ValueError(f"no 1m candles for {underlying} on {session_date} — pick another date")
+   468→        vols = [c.get("v") or 0 for c in data["session"]]
+   469→        self._avg_vol = (sum(vols) / len(vols)) if vols else 0.0
+   470→        self.stats = self._compute_stats(data)
+   471→        self.source_label = data.get("source") or "live broker"
+   472→        self._cursor = 0
+   473→        self._cumvol = {}
+   474→        self._opt_hi = {}
+   475→        self._opt_lo = {}
+   476→
+   477→        # 2. step + lot
+   478→        spot0 = float(self._candles[self._minutes[0]]["o"])
+   479→        self.step = _step_for(underlying, spot0)
+   480→        urow = self._row_of(f"NSE:{underlying}") or self._row_of(f"NFO:{underlying}")
+   481→        self.lot_size = int((urow or {}).get("lotsize") or (75 if underlying in
+   482→                            ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX") else 250))
+   483→
+   484→        # 3. contracts + history seeding
+   485→        self._ensure_contracts()
+   486→        self._seed_history()
+   487→
+   488→        # 4. persist + run
+   489→        self.active = True
+   490→        self.started_at = time.time()
+   491→        db.core().exec(
+   492→            "INSERT INTO fnosim_sessions(underlying,session_date,expiry,iv,speed,status,source,stats,created_at) "
+   493→            "VALUES(?,?,?,?,?, 'running', ?, ?, ?)",
+   494→            (underlying, session_date, self.expiry, self.iv, self.speed,
+   495→             self.source_label, json.dumps(self.stats), time.time()))
+   496→        self._running = True
+   497→        self._task = asyncio.ensure_future(self._run())
+   498→        self._task.add_done_callback(self._on_done)
+   499→        config.log("fnosim", f"session started: {underlying} {session_date} "
+   500→                             f"expiry={self.expiry} ({self.expiry_dt:%Y-%m-%d %H:%M} IST"
+   501→                             f"{', custom' if self.expiry_custom else ', defaulted to today'}) "
+   502→                             f"iv={self.iv:.2f} speed={self.speed} band=±{self.band} "
+   503→                             f"minutes={len(self._minutes)} source={self.source_label}")
+   504→        return self.status()
+   505→
+   506→    def _on_done(self, task: asyncio.Task) -> None:
+   507→        try:
+   508→            exc = task.exception()
+   509→        except asyncio.CancelledError:
+   510→            exc = None
+   511→        if exc:
+   512→            self.error = str(exc)[:200]
+   513→            config.log("fnosim", f"session crashed: {exc}", "ERROR")
+   514→        self.active = False
+   515→        self._running = False
+   516→        if not self.error and not self.completed:
+   517→            self.completed = True
+   518→
+   519→    def stop(self) -> dict:
+   520→        if self._task and not self._task.done():
+   521→            self._task.cancel()
+   522→        was = self.active
+   523→        self.active = False
+   524→        self._running = False
+   525→        if was:
+   526→            db.core().exec("UPDATE fnosim_sessions SET status='stopped', finished_at=? "
+   527→                           "WHERE status='running' AND underlying=?",
+   528→                           (time.time(), self.underlying))
+   529→            config.log("fnosim", f"session stopped by user: {self.underlying}")
+   530→        return self.status()
+   531→
+   532→    def patch(self, iv_pct: float | None = None, speed: float | None = None) -> dict:
+   533→        if iv_pct is not None:
+   534→            self.iv = max(0.05, min(2.0, float(iv_pct) / 100.0))
+   535→        if speed is not None:
+   536→            self.speed = max(0.5, min(60.0, float(speed)))
+   537→        return self.status()
+   538→
+   539→    # ------------------------------------------------------------------ run loop
+   540→    def _make_tick(self, symbol: str, ltp: float, prev_close: float, vol_delta: int,
+   541→                   ts_ms: int, hi: float, lo: float, open_px: float) -> dict:
+   542→        return {"symbol": symbol, "exchange": symbol.split(":")[0],
+   543→                "ltp": round(max(0.05, ltp), 2), "prev_close": round(prev_close, 2),
+   544→                "bid": round(max(0.05, ltp - 0.05), 2), "ask": round(ltp + 0.05, 2),
+   545→                "bid_qty": random.randint(1, 40) * 10, "ask_qty": random.randint(1, 40) * 10,
+   546→                "vol": vol_delta, "open": round(open_px, 2), "high": round(hi, 2),
+   547→                "low": round(lo, 2), "close": round(ltp, 2),
+   548→                "ts": ts_ms, "source": "fnosim"}
+   549→
+   550→    def _minute_path(self, cnd: dict, subs: int) -> list[float]:
+   551→        """Intra-minute spot path that matches the REAL 1m OHLCV exactly:
+   552→        pts[0] = open, pts[-1] = close, the path REACHES the candle high and
+   553→        low in between.  The wiggle between anchors scales with the user
+   554→        volatility AND the candle's volume vs the session-day average
+   555→        (high-volume minutes wobble more)."""
+   556→        o, h, l, c = cnd["o"], cnd["h"], cnd["l"], cnd["c"]
+   557→        v = cnd.get("v") or 0
+   558→        rng = max(0.05, h - l)
+   559→        vol_f = 1.0
+   560→        if self._avg_vol > 0 and v > 0:
+   561→            vol_f = max(0.6, min(1.7, 0.75 + 0.5 * (v / self._avg_vol)))
+   562→        wig = rng * 0.15 * (self.iv / 0.25) * vol_f
+   563→        mid1, mid2 = (h, l) if c >= o else (l, h)   # 1st extreme, 2nd extreme
+   564→        subs = max(4, subs)
+   565→        fr = [i / (subs - 1) for i in range(subs)]
+   566→        anchors = ((0.0, o), (0.4, mid1), (0.7, mid2), (1.0, c))
+   567→        pts = []
+   568→        for f in fr:
+   569→            for (f0, v0), (f1, v1) in zip(anchors, anchors[1:]):
+   570→                if f0 <= f <= f1:
+   571→                    v_ = v0 if f1 == f0 else v0 + (v1 - v0) * (f - f0) / (f1 - f0)
+   572→                    pts.append(v_)
+   573→                    break
+   574→        i1 = min(range(subs), key=lambda i: abs(fr[i] - 0.4))
+   575→        i2 = min(range(subs), key=lambda i: abs(fr[i] - 0.7))
+   576→        for i, p in enumerate(pts):
+   577→            # keep the OPEN (first), the two extremes and the CLOSE (last) exact
+   578→            if i in (0, i1, i2, subs - 1):
+   579→                continue
+   580→            # clamp INSIDE [l, h] so the aggregator's 1m candle high/low are
+   581→            # EXACTLY the real candle's high/low (nothing pokes beyond)
+   582→            pts[i] = min(h, max(l, p + random.gauss(0, wig * 0.5)))
+   583→        pts[i1], pts[i2], pts[-1], pts[0] = mid1, mid2, c, o
+   584→        return pts[:subs]
+   585→
+   586→    async def _run(self) -> None:
+   587→        hub = Hub_instance()
+   588→        subs = 6                                   # sub-ticks per session minute
+   589→        exp_dt = self.expiry_dt
+   590→        run_hi, run_lo = -1e18, 1e18
+   591→        for i, ts in enumerate(self._minutes):
+   592→            if not self._running:
+   593→                return
+   594→            if hub.trading_mode() == "live":       # sandbox-only guarantee
+   595→                config.log("fnosim", "LIVE ONLY mode — session auto-stopped", "WARN")
+   596→                self.stop()
+   597→                return
+   598→            cnd = self._candles[ts]
+   599→            self._last_minute_ts = ts
+   600→            run_hi = max(run_hi, cnd["h"])
+   601→            run_lo = min(run_lo, cnd["l"])
+   602→            path = self._minute_path(cnd, subs)
+   603→            sleep_s = max(0.02, (60.0 / self.speed) / subs)
+   604→            for j, px in enumerate(path):
+   605→                ts_ms = (ts + int(j * 60 / subs)) * 1000
+   606→                self._emit_minute(ts, ts_ms, px, cnd, run_hi, run_lo,
+   607→                                  exp_dt, full=(j == subs - 1))
+   608→                await asyncio.sleep(sleep_s)
+   609→            self._cursor = i + 1
+   610→            self.progress = round(100.0 * (i + 1) / len(self._minutes), 1)
+   611→            dt = datetime.utcfromtimestamp(ts + IST)
+   612→            self.cursor_iso = dt.strftime("%Y-%m-%d %H:%M")
+   613→        self.completed = True
+   614→        self.active = False
+   615→        self._running = False
+   616→        db.core().exec("UPDATE fnosim_sessions SET status='completed', finished_at=? "
+   617→                       "WHERE status='running' AND underlying=?",
+   618→                       (time.time(), self.underlying))
+   619→        config.log("fnosim", f"session completed: {self.underlying} {self.session_date} "
+   620→                             f"({self.ticks_sent} ticks)")
+   621→        if hub.sio:
+   622→            try:
+   623→                await hub.sio.emit("fnosim", {"event": "completed", **self.status()})
+   624→            except Exception:
+   625→                pass
+   626→
+   627→    def _emit_minute(self, minute_ts: int, ts_ms: int, spot_px: float, cnd: dict,
+   628→                     run_hi: float, run_lo: float,
+   629→                     exp_dt: datetime | None, full: bool) -> None:
+   630→        hub = Hub_instance()
+   631→        self._cumvol[self.spot_symbol] = self._cumvol.get(self.spot_symbol, 0) \
+   632→            + max(1, int((cnd.get("v") or 0) / 6))
+   633→        spot_tick = self._make_tick(self.spot_symbol, spot_px, self._prev_close,
+   634→                                    self._cumvol[self.spot_symbol], ts_ms,
+   635→                                    run_hi, run_lo, self._candles[self._minutes[0]]["o"])
+   636→        self._push(hub, spot_tick)
+   637→        T = max(0.0, (exp_dt - datetime.utcfromtimestamp(minute_ts + IST)).total_seconds()) \
+   638→            / (365 * 86400) if exp_dt else 5 / 365
+   639→        atm = round(cnd["o"] / self.step) * self.step
+   640→        emit = self.strikes if full else [s for s in self.strikes if abs(s - atm) <= 3 * self.step]
+   641→        for s in emit:
+   642→            for right in ("CE", "PE"):
+   643→                sym = f"NFO:{self.underlying}{self.expiry}{s}{right}"
+   644→                px = _bs_premium(right, spot_px, float(s), T, self.iv)
+   645→                px = round(px / 0.05) * 0.05
+   646→                prev = self._opt_prev.get(sym)
+   647→                if prev is None:
+   648→                    T0 = max(T, 1 / 365)
+   649→                    prev = round(_bs_premium(right, self._session_open(), float(s), T0, self.iv) / 0.05) * 0.05
+   650→                    self._opt_prev[sym] = prev
+   651→                self._cumvol[sym] = self._cumvol.get(sym, 0) + random.randint(1, max(2, self.lot_size // 10))
+   652→                hi = max(px, prev, self._opt_hi.get(sym, 0))
+   653→                lo = min(px, prev, self._opt_lo.get(sym, 1e18)) or px
+   654→                self._opt_hi[sym] = hi
+   655→                self._opt_lo[sym] = lo
+   656→                self._push(hub, self._make_tick(sym, px, prev, self._cumvol[sym], ts_ms,
+   657→                                                hi, lo, prev))
+   658→
+   659→    def _push(self, hub, tick: dict) -> None:
+   660→        try:
+   661→            hub._on_broker_tick(tick)
+   662→            self.ticks_sent += 1
+   663→        except Exception as e:
+   664→            config.log("fnosim", f"tick push failed {tick.get('symbol')}: {e}", "WARN")
+   665→
+   666→    # ------------------------------------------------------------------ status
+   667→    def status(self) -> dict:
+   668→        return {
+   669→            "active": self.active,
+   670→            "completed": self.completed,
+   671→            "error": self.error,
+   672→            "underlying": self.underlying,
+   673→            "spotSymbol": self.spot_symbol,
+   674→            "sessionDate": self.session_date,
+   675→            "expiry": self.expiry,
+   676→            "expiryDt": self.expiry_dt.strftime("%Y-%m-%d %H:%M") if self.expiry_dt else None,
+   677→            "expiryCustom": self.expiry_custom,
+   678→            "ivPct": round(self.iv * 100, 1),
+   679→            "speed": self.speed,
+   680→            "band": self.band,
+   681→            "step": self.step,
+   682→            "lotSize": self.lot_size,
+   683→            "strikeCount": len(self.strikes),
+   684→            "source": self.source_label,
+   685→            "progressPct": self.progress,
+   686→            "cursor": self.cursor_iso,
+   687→            "ticksSent": self.ticks_sent,
+   688→            "startedAt": self.started_at,
+   689→            "stats": self.stats,
+   690→            "symbols": len(self.symbols),
+   691→        }
+   692→
+   693→
+   694→class FnoSimManager:
+   695→    """Runs SEVERAL FnoSimSessions in parallel — the user adds a list of
+   696→    F&O stocks/indices and every underlying gets its own live session."""
+   697→
+   698→    def __init__(self) -> None:
+   699→        self.engines: dict[str, FnoSimSession] = {}
+   700→        self._ensure_tables()
+   701→
+   702→    def _ensure_tables(self) -> None:
+   703→        c = db.core()
+   704→        c.exec("""CREATE TABLE IF NOT EXISTS fnosim_cache(
+   705→                   underlying TEXT, date TEXT, data TEXT, fetched_at REAL,
+   706→                   PRIMARY KEY(underlying, date))""")
+   707→        c.exec("""CREATE TABLE IF NOT EXISTS fnosim_sessions(
+   708→                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+   709→                   underlying TEXT, session_date TEXT, expiry TEXT,
+   710→                   iv REAL, speed REAL, status TEXT, source TEXT,
+   711→                   stats TEXT, created_at REAL, finished_at REAL)""")
+   712→
+   713→    # ------------------------------------------------------------------ state
+   714→    def serves(self, symbol: str) -> bool:
+   715→        return any(e.serves(symbol) for e in self.engines.values())
+   716→
+   717→    def session_of(self, underlying: str) -> FnoSimSession | None:
+   718→        e = self.engines.get((underlying or "").upper().strip())
+   719→        return e if (e and e.active) else None
+   720→
+   721→    def expiry_of(self, underlying: str) -> str | None:
+   722→        e = self.session_of(underlying)
+   723→        return e.expiry if e else None
+   724→
+   725→    def iv_of(self, underlying: str) -> float | None:
+   726→        e = self.session_of(underlying)
+   727→        return e.iv if e else None
+   728→
+   729→    def expiry_dt_of(self, underlying: str) -> datetime | None:
+   730→        e = self.session_of(underlying)
+   731→        return e.expiry_dt if e else None
+   732→
+   733→    def active_underlyings(self) -> list[str]:
+   734→        return [u for u, e in self.engines.items() if e.active]
+   735→
+   736→    @property
+   737→    def active(self) -> bool:
+   738→        return any(e.active for e in self.engines.values())
+   739→
+   740→    # legacy single-session attribute shims (options_chain / hub compat)
+   741→    @property
+   742→    def underlying(self) -> str | None:
+   743→        act = self.active_underlyings()
+   744→        return act[0] if act else None
+   745→
+   746→    @property
+   747→    def expiry(self) -> str | None:
+   748→        e = self.session_of(self.underlying or "")
+   749→        return e.expiry if e else None
+   750→
+   751→    # ------------------------------------------------------------------ control
+   752→    async def start(self, underlyings: list[str], session_date: str,
+   753→                    expiry_input: str | None, iv_pct: float = 25.0,
+   754→                    speed: float = 5.0, band: int = 10, prev_days: int = 5) -> dict:
+   755→        """Start (or restart) a session for EVERY underlying in the list.
+   756→        Data loads run in parallel; a failure on one underlying does not
+   757→        cancel the others — the error lands on that session's status."""
+   758→        clean = []
+   759→        for u in underlyings:
+   760→            u = (u or "").upper().strip()
+   761→            if u and u not in clean:
+   762→                clean.append(u)
+   763→        if not clean:
+   764→            raise ValueError("add at least one F&O stock or index")
+   765→        # pre-flight: sandbox-only
+   766→        if Hub_instance().trading_mode() == "live":
+   767→            raise ValueError("FNO session simulator is sandbox-only — switch trading mode to SANDBOX first")
+   768→
+   769→        async def one(u: str) -> None:
+   770→            eng = self.engines.get(u) or FnoSimSession()
+   771→            self.engines[u] = eng
+   772→            try:
+   773→                await eng.start(u, session_date, expiry_input,
+   774→                                iv_pct=iv_pct, speed=speed, band=band, prev_days=prev_days)
+   775→            except Exception as e:
+   776→                eng.error = str(e)[:220]
+   777→                eng.active = False
+   778→                config.log("fnosim", f"session start failed for {u}: {e}", "ERROR")
+   779→
+   780→        await asyncio.gather(*(one(u) for u in clean))
+   781→        started = [u for u in clean if self.engines[u].active]
+   782→        if not started:
+   783→            errs = "; ".join(f"{u}: {self.engines[u].error}" for u in clean if self.engines[u].error)
+   784→            raise ValueError(errs[:400] or "no session could start")
+   785→        return self.status()
+   786→
+   787→    def stop(self, underlying: str | None = None) -> dict:
+   788→        if underlying:
+   789→            e = self.engines.get(underlying.upper().strip())
+   790→            if e:
+   791→                e.stop()
+   792→        else:
+   793→            for e in self.engines.values():
+   794→                e.stop()
+   795→        return self.status()
+   796→
+   797→    def patch(self, iv_pct: float | None = None, speed: float | None = None,
+   798→              underlying: str | None = None) -> dict:
+   799→        if underlying:
+   800→            e = self.engines.get(underlying.upper().strip())
+   801→            if e:
+   802→                e.patch(iv_pct, speed)
+   803→        else:
+   804→            for e in self.engines.values():
+   805→                if e.active:
+   806→                    e.patch(iv_pct, speed)
+   807→        return self.status()
+   808→
+   809→    # ------------------------------------------------------------------ random
+   810→    def random_pick(self) -> dict:
+   811→        """Random F&O underlying + a random recent trading day."""
+   812→        unds = []
+   813→        try:
+   814→            from backend.options_chain import fno_universe
+   815→            for g in fno_universe().get("groups", []):
+   816→                for u in g.get("underlyings", []):
+   817→                    if u.get("latestExpiry") and (u.get("contracts") or 0) > 0:
+   818→                        unds.append(u)
+   819→        except Exception:
+   820→            pass
+   821→        if not unds:
+   822→            raise ValueError("F&O universe is empty — sync master contracts first")
+   823→        u = random.choice(unds)
+   824→        # random weekday within the last ~30 days
+   825→        today = _ist_now()
+   826→        d = today
+   827→        for _ in range(30):
+   828→            d = today - timedelta(days=random.randint(1, 30))
+   829→            if d.weekday() < 5:
+   830→                break
+   831→        return {"underlying": u["underlying"],
+   832→                "session_date": d.strftime("%Y-%m-%d"),
+   833→                "expiry": u.get("latestExpiry"),
+   834→                "name": u.get("name")}
+   835→
+   836→    # ------------------------------------------------------------------ status
+   837→    def status(self) -> dict:
+   838→        live = [e.status() for e in self.engines.values()]
+   839→        act = [s for s in live if s["active"]]
+   840→        prim = act[0] if act else (live[0] if live else {
+   841→            "active": False, "completed": False, "error": None, "underlying": None,
+   842→            "spotSymbol": None, "sessionDate": None, "expiry": None, "expiryDt": None,
+   843→            "expiryCustom": False, "ivPct": 25.0, "speed": 5.0, "band": 10,
+   844→            "step": 50.0, "lotSize": 75, "strikeCount": 0, "source": None,
+   845→            "progressPct": 0.0, "cursor": None, "ticksSent": 0, "startedAt": None,
+   846→            "stats": {}, "symbols": 0})
+   847→        errors = [f"{s['underlying']}: {s['error']}" for s in live if s.get("error")]
+   848→        return {
+   849→            **prim,
+   850→            "count": len(live),
+   851→            "underlyings": [s["underlying"] for s in live],
+   852→            "live": live,
+   853→            "errors": errors,
+   854→        }
+   855→
+   856→
+   857→def Hub_instance():
+   858→    from backend.market.hub import Hub
+   859→    return Hub.instance()
+   860→
+   861→
+   862→SVC = FnoSimManager()
+   863→
