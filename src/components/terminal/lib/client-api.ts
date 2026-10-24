@@ -268,6 +268,8 @@ export const api = {
   deleteAccount: (id: string) => fetchJson<{ ok: boolean }>(`/accounts/${id}`, { method: 'DELETE' }),
   accountsBulk: (accounts: unknown[], deleteMissing: boolean) =>
     fetchJson<BulkApplyResp>('/accounts/bulk', { method: 'POST', body: JSON.stringify({ accounts, deleteMissing }) }, 0),
+  accountsExport: () =>
+    fetchJson<{ accounts: ExportedAccountRow[]; exportedAt: number; note: string }>('/accounts/export', { method: 'GET' }, 0),
 
   copyTrade: () => fetchJson<{ config: CopyTradeCfg }>('/copytrade'),
   patchCopyTrade: (body: Record<string, unknown>) =>
@@ -430,6 +432,24 @@ export interface BulkApplyResp {
   detail: { row: number | null; id?: string; ok: boolean; action?: string; label?: string; error?: string }[]
 }
 
+/** Full account row from GET /accounts/export — raw credentials + live session
+ * token, so the Bulk-JSON editor can copy/paste an account verbatim. */
+export interface ExportedAccountRow {
+  id?: string
+  label: string
+  broker: string
+  mode: 'live' | 'sandbox'
+  clientId?: string | null
+  credentials: Record<string, string>
+  session?: { token: string; broker: string; updatedAt: number } | null
+  initialCapital: number | null
+  capitalPct: number
+  capitalMode: string
+  isActive: boolean
+  isOrderEnabled: boolean
+  _delete?: boolean
+}
+
 /** Broker session-auth flow descriptor (GET /broker-auth). */
 export interface BrokerAuthStatus {
   accountId: string
@@ -545,6 +565,7 @@ export interface ChargesResp {
   schedule: ChargeSchedule
   defaults: ChargeSchedule
   customized: boolean
+  source?: { name: string; note: string; links: string[]; asOf: string }
   example: {
     buy: ChargeLine
     sell: ChargeLine

@@ -149,7 +149,7 @@ class Hub:
         self.symbol_source.clear()
         self.epoch += 1
         self._last_tick_ts = None
-        self._feed_note(f"feed source -> {source}")
+        self.feed_note(f"feed source -> {source}")
         # re-subscribe every watched symbol under the new source
         for sid, info in list(self.sockets.items()):
             for sym in list(info.get("symbols", set())):
@@ -238,7 +238,13 @@ class Hub:
     def _load_token_map(self, aid: int) -> None:
         broker = db.core().one("SELECT broker FROM accounts WHERE id=?", (aid,))
         name = broker["broker"] if broker else "sim"
-        rows = db.broker_db(name).query("SELECT token,symbol FROM master")
+        try:
+            rows = db.broker_db(name).query("SELECT token,symbol FROM master")
+        except Exception as e:
+            # a broker db without the master table (never synced) must never
+            # blow up the connect path with a 500 — an empty map is fine
+            config.log("hub", f"token map for account#{aid} ({name}): master table unavailable ({e}) — empty map", "WARN")
+            rows = []
         self.token_map[aid] = {r["token"]: r["symbol"] for r in rows}
         config.log("hub", f"token map for account#{aid} ({name}): {len(self.token_map[aid])} mappings")
 

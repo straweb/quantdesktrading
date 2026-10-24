@@ -54,7 +54,7 @@ class FeedReq(BaseModel):
 
 
 @router.post("/feed")
-async def feed_post(body: FeedReq, authorization: str = ""):
+async def feed_post(body: FeedReq, authorization: str = Header(default="")):
     uid(authorization)
     hub = Hub.instance()
     if body.simDisabled is not None:
@@ -237,6 +237,7 @@ async def charges_get(accountId: str, authorization: str = Header(default="")):
             "schedule": sched,
             "defaults": charges_config.default_schedule(acc["broker"]),
             "customized": charges_config.get_override(int(accountId)) is not None,
+            "source": charges_config.charges_source(acc["broker"]),
             "example": example}
 
 
@@ -1226,8 +1227,8 @@ async def broker_auth_status(accountId: str, authorization: str = Header(default
                  "Dhan API calls only work from whitelisted static IPs — check the server IP below and sync it if it differs"],
         "shoonya": ["Open the OAuth URL — your client_id is pre-filled",
                     "Log in; copy the ?code= from the redirect (single-use + short-lived: always use a FRESH one)",
-                    "Paste it below — GenAcsTok checksum variants are tried automatically and logged",
-                    "No browser? Paste pwd:factor2(:totp) — e.g. mypass:ABCD1234E"],
+                    "Paste it below — the docs checksum sha256(client_id+secret+code) is tried first and every attempt is logged",
+                    "QuickAuth (pwd:factor2) is VENDOR-GATED at Shoonya now — OAuth is the only consumer flow"],
     }
     # dhan: server IP + registered IPs (SEBI static-IP rule) + AUTO-CONSENT —
     # when App ID + App Secret are saved, generate the consentApp-login URL so
@@ -1425,8 +1426,18 @@ async def _dhan_complete(aid: int, acc: dict, creds: dict, code: str) -> dict:
 
 
 async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict:
-    """Port of the legacy Node flow (brokers/shoonya/auth.ts) — documented
-    checksum variant FIRST, fallbacks after, every attempt logged."""
+    """Round-25 — Shoonya DECOMMISSIONED the NorenWClientTP gateway (nginx 502
+    verified live) and the bare /QuickAuth /GenAcsTok paths (404).  The ONLY
+    live consumer auth is the documented OAuth flow:
+
+        POST https://api.shoonya.com/NorenWClientAPI/GenAcsTok
+        jData={"code": <auth_code>, "checksum": sha256(client_id+secret+code)}
+        -> {"stat":"Ok","susertoken":…,"uid":…,"actid":…}
+
+    (shoonya.com/api-documentation — Manual Authentication (OAuth)).  The
+    documented checksum goes FIRST, the other orderings stay as fallbacks,
+    every attempt logged.  QuickAuth is vendor-gated now ("Invalid Access
+    Type") — kept as a single best-effort attempt with honest messaging."""
     import hashlib
     import httpx
     import re as _re
@@ -1442,12 +1453,12 @@ async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict
         extra: dict = {"uid": uid_}
         if vc_used:
             extra["vendor_code"] = vc_used
-        if qa:  # pwd, factor2, totp — enables programmatic auto-renew
+        if qa:  # pwd, factor2, totp — vendor-class auto-renew
             extra["password"], extra["totp"] = qa[0], qa[2] or ""
         _merge_creds(acc, extra)
 
     async with httpx.AsyncClient(timeout=15) as cx:
-        # ---- QuickAuth shorthand: "pwd:factor2(:totp)" --------------------
+        # ---- QuickAuth shorthand: "pwd:factor2(:totp)" — VENDOR-GATED -------
         if ":" in code and not code.lower().startswith("jdata"):
             parts = [s.strip() for s in code.split(":")]
             if len(parts) >= 2 and parts[0] and parts[1]:
@@ -1455,6 +1466,9 @@ async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict
                 totp = parts[2] if len(parts) > 2 else ""
                 if not uid_:
                     return {"ok": False, "message": "QuickAuth needs the account User ID — edit the account and save it"}
+                if not client_id or not secret:
+                    return {"ok": False, "message": "Save api_key (client_id) + api_secret on the account first — "
+                                                   "use the form above (or pencil → credentials)"}
                 appkey = hashlib.sha256(f"{uid_}|{secret}".encode()).hexdigest()
                 for vc, vlabel in ((f"{uid_}_U", "vc=uid_U"), (client_id, "vc=client_id")):
                     if not vc:
@@ -1463,7 +1477,7 @@ async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict
                                "vc": vc, "appkey": appkey, "imei": "abc1234", "source": "WEB"}
                     if totp:
                         payload["totp"] = totp
-                    r = await cx.post("https://api.shoonya.com/NorenWClientTP/QuickAuth",
+                    r = await cx.post("https://api.shoonya.com/NorenWClientAPI/QuickAuth",
                                       content=f"jData={json.dumps(payload)}",
                                       headers={"Content-Type": "text/plain"})
                     try:
@@ -1474,15 +1488,21 @@ async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict
                     if d.get("stat") == "Ok" and d.get("susertoken"):
                         _persist(d["susertoken"], vc, (pwd, factor2, totp))
                         return {"ok": True, "message": f"Shoonya session active (QuickAuth {vlabel}) — persisted"}
-                return {"ok": False, "message": "QuickAuth failed — " + " | ".join(tried[-2:]) +
-                        ". Format: pwd:factor2(:totp), e.g. mypass:ABCD1234E"}
-        # ---- OAuth GenAcsTok (single-use redirect code) --------------------
+                    if r.status_code == 502 or "invalid access type" in str(d.get("emsg", "")).lower():
+                        break   # vendor-gated / gateway down — other vc values cannot help
+                return {"ok": False, "message":
+                        "QuickAuth is VENDOR-GATED at Shoonya now (their docs list OAuth as the only "
+                        "consumer flow — NorenWClientTP was decommissioned, HTTP 502). "
+                        "Use the OAuth code flow: open the login URL above, paste the redirect ?code= here. "
+                        "Attempts: " + " | ".join(tried)}
+        # ---- OAuth GenAcsTok (single-use redirect code) ---------------------
         if not client_id or not secret:
             return {"ok": False, "message": "Save api_key (client_id) + api_secret on the account first — "
                                            "use the form above (or pencil → credentials), then paste a FRESH code"}
-        # family A — NorenWClientAPI/GenAcsTok {code, checksum}
+        # docs-exact checksum FIRST, orderings after; code-rejections break early
+        code_rejected = False
         for label, checksum in (
-            ("sha256(client_id+secret+code)", hashlib.sha256(f"{client_id}{secret}{code}".encode()).hexdigest()),
+            ("sha256(client_id+secret+code) [docs]", hashlib.sha256(f"{client_id}{secret}{code}".encode()).hexdigest()),
             ("sha256(code+secret)", hashlib.sha256(f"{code}{secret}".encode()).hexdigest()),
             ("sha256(secret+code)", hashlib.sha256(f"{secret}{code}".encode()).hexdigest()),
         ):
@@ -1493,41 +1513,24 @@ async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict
                 d = r.json()
             except Exception:
                 d = {}
-            tried.append(f"API {label} → {d.get('emsg') or d.get('stat') or 'HTTP ' + str(r.status_code)}")
+            tried.append(f"{label} → {d.get('emsg') or d.get('stat') or 'HTTP ' + str(r.status_code)}")
             tok = d.get("access_token") or d.get("susertoken")
             if d.get("stat") == "Ok" and tok:
                 _persist(tok, client_id)
-                return {"ok": True, "message": f"Shoonya session active (GenAcsTok — {label}) — persisted"}
-            if _re.search(r"invalid\s*code|expired|no data", str(d.get("emsg") or ""), _re.I):
-                break  # the code itself is bad — checksums won't help
-        # family B — NorenWClientTP/GenAcsTok full jData (legacy docs shape)
-        if uid_:
-            appkey = hashlib.sha256(f"{uid_}|{secret}".encode()).hexdigest()
-            for label, verifier in (
-                ("sha256(code+secret)", hashlib.sha256(f"{code}{secret}".encode()).hexdigest()),
-                ("sha256(secret+code)", hashlib.sha256(f"{secret}{code}".encode()).hexdigest()),
-                ("sha256(secret+uid+code)", hashlib.sha256(f"{secret}{uid_}{code}".encode()).hexdigest()),
-                ("sha256(code)", hashlib.sha256(code.encode()).hexdigest()),
-            ):
-                payload = {"apkversion": "1.0.0", "uid": uid_, "pwd": verifier, "factor2": "",
-                           "vc": client_id, "appkey": appkey, "imei": "abc1234"}
-                r = await cx.post("https://api.shoonya.com/NorenWClientTP/GenAcsTok",
-                                  content=f"jData={json.dumps(payload)}",
-                                  headers={"Content-Type": "text/plain"})
-                try:
-                    d = r.json()
-                except Exception:
-                    d = {}
-                tried.append(f"TP {label} → {d.get('emsg') or d.get('stat') or 'HTTP ' + str(r.status_code)}")
-                tok = d.get("access_token") or d.get("susertoken")
-                if d.get("stat") == "Ok" and tok:
-                    _persist(tok, client_id)
-                    return {"ok": True, "message": f"Shoonya session active (GenAcsTok — {label}) — persisted"}
-                if _re.search(r"invalid\s*code|expired|no data", str(d.get("emsg") or ""), _re.I):
-                    break
+                return {"ok": True, "message": f"Shoonya session active (GenAcsTok — {label}) — persisted; "
+                                               f"master contracts syncing"}
+            if _re.search(r"invalid\s*code|expired|no data|code\s*not", str(d.get("emsg") or ""), _re.I):
+                code_rejected = True
+                break  # the CODE itself is bad — checksum orderings cannot help
+        if code_rejected:
+            last = str(tried[-1]).split("→ ")[-1]
+            return {"ok": False, "message":
+                    "Shoonya rejected the code itself (" + last + ") — the redirect code is SINGLE-USE "
+                    "and short-lived. Open the OAuth URL again and paste a FRESH ?code= "
+                    "(complete the exchange within minutes; never reuse an old tab's code)."}
     config.log("shoonya", f"GenAcsTok failed for account#{aid} — {' | '.join(tried)}", "ERROR")
     return {"ok": False, "message": "GenAcsTok failed — " + " | ".join(tried[-3:]) +
-            ". The redirect code is single-use: open the OAuth URL again for a FRESH code, or use QuickAuth (paste pwd:factor2)"}
+            ". The redirect code is single-use: open the OAuth URL again for a FRESH code"}
 
 
 async def _dhan_sync_ip(aid: int, acc: dict, creds: dict, broker: str) -> dict:

@@ -1,13 +1,22 @@
 """
-Breeze (ICICI Direct) REST adapter.
+Breeze (ICICI Direct) REST adapter — wire shapes per the OFFICIAL breeze-connect
+SDK (Idirect-Tech/Breeze-Python-SDK, api_util + generate_headers + make_request).
 
-Auth flow (per breeze-connect SDK, authentic):
-  1. TOTP login on ICICI portal yields an api `session_token` (user pastes it).
-  2. GET  {API_URL}customerdetails  with headers {"SessionToken": <token>, "X-AppKey": api_key}
-     -> Success.session_token = base64("user_id:session_token")  -> extract user_id.
-  3. Every API call headers:
-       X-AppKey, X-SessionToken (base64 above), X-Timestamp (utc .000Z),
-       X-Checksum = sha256(timestamp + body + api_secret)
+Auth flow (Round-25 — matches the SDK exactly):
+  1. TOTP login on ICICI portal (apiuser/login?api_key=...) yields an api
+     `session_token` ("apisession") the user pastes.
+  2. GET {API_URL}customerdetails with a JSON REQUEST BODY
+         {"SessionToken": <apisession>, "AppKey": <api_key>}
+     and ONLY Content-Type in the headers (no checksum headers on this call).
+     Sending them as HEADERS is what produced Breeze's
+     `customerdetails failed: {'Status': 500, 'Error': 'Request Object is Null'}`
+     — the server reads the request OBJECT (body), not headers.
+     -> Success.session_token = base64("user_id:session_key") -> split.
+  3. Every subsequent call:
+       GETs CARRY A JSON BODY TOO ("{}" or the params object, compact
+       separators, sent like the SDK's requests.get(url, data=body)) and
+       headers X-AppKey, X-SessionToken (base64 above), X-Timestamp (utc .000Z),
+       X-Checksum = "token " + sha256(timestamp + body + api_secret).
 Sessions are persisted in DB and REUSED (Round-14): generate once, reuse until
 it stops validating — regenerating on every connect caused the 401 storms.
 """
@@ -66,14 +75,26 @@ class BreezeAdapter(BaseBroker):
         tok = self.credentials.get("session_token", "").strip()
         if not tok:
             raise BrokerError("Breeze session_token missing — complete TOTP login on ICICI portal first")
+        # SDK api_util: SessionToken + AppKey travel in the JSON BODY of the GET
+        # (requests.get(url, data=body)) — NOT in headers.  Headers carry only
+        # Content-Type.  Anything else -> "Request Object is Null".
+        body = json.dumps({"SessionToken": tok, "AppKey": self.credentials.get("api_key", "")},
+                          separators=(",", ":"))
         r = await self._request(
             "GET", f"{API_URL}customerdetails",
-            headers={"SessionToken": tok, "X-AppKey": self.credentials.get("api_key", ""),
-                     "Content-Type": "application/json", "User-Agent": UA},
-            tag="customerdetails")
+            headers={"Content-Type": "application/json", "User-Agent": UA},
+            data=body, tag="customerdetails")
         b64 = (r.get("Success") or {}).get("session_token", "")
         if not b64:
-            raise BrokerError(f"Breeze customerdetails failed: {str(r)[:160]}")
+            err = str(r.get("Error") or r)[:160]
+            hint = ""
+            if "Public Key" in err:
+                hint = " — the App Key is wrong (save the exact key from the Breeze API portal)"
+            elif "Invalid session" in err:
+                hint = " — the apisession is wrong or expired; log in again for a fresh one"
+            elif "Resource not available" in err:
+                hint = " — the apisession expired; log in again for a fresh one"
+            raise BrokerError(f"Breeze rejected the apisession: {err}{hint}")
         user_id = base64.b64decode(b64.encode()).decode().split(":")[0]
         self.session = {"session_token": tok, "user_id": user_id, "b64_session": b64}
         session_store.save(self.account_id, self.name, tok, None,
@@ -92,7 +113,8 @@ class BreezeAdapter(BaseBroker):
 
     # ------------------------------------------------------------------ funds / portfolio
     async def get_funds(self) -> dict:
-        r = await self._request("GET", f"{API_URL}funds", headers=self._mk_headers("{}"), tag="funds")
+        r = await self._request("GET", f"{API_URL}funds", headers=self._mk_headers("{}"),
+                                data="{}", tag="funds")
         s = r.get("Success") or {}
         avail = float(s.get("net") or 0)
         used = abs(float(s.get("utilised_debits") or 0))
@@ -101,7 +123,7 @@ class BreezeAdapter(BaseBroker):
 
     async def get_positions(self) -> list[dict]:
         r = await self._request("GET", f"{API_URL}portfoliopositions",
-                                headers=self._mk_headers("{}"), tag="positions")
+                                headers=self._mk_headers("{}"), data="{}", tag="positions")
         out = []
         for p in (r.get("Success") or []):
             try:
@@ -114,7 +136,8 @@ class BreezeAdapter(BaseBroker):
         return out
 
     async def get_orderbook(self) -> list[dict]:
-        r = await self._request("GET", f"{API_URL}order", headers=self._mk_headers("{}"), tag="orderbook")
+        r = await self._request("GET", f"{API_URL}order", headers=self._mk_headers("{}"),
+                                data="{}", tag="orderbook")
         return (r.get("Success") or [])
 
     # ------------------------------------------------------------------ orders
@@ -145,8 +168,11 @@ class BreezeAdapter(BaseBroker):
         return {"order_id": oid, "status": "open", "raw": r}
 
     async def cancel_order(self, broker_order_id, symbol="") -> dict:
-        r = await self._request("DELETE", f"{API_URL}order", headers=self._mk_headers(""),
-                                params={"order_id": broker_order_id}, tag="cancel-order")
+        exch, _ = self._split(symbol)
+        body = json.dumps({"exchange_code": exch, "order_id": broker_order_id},
+                          separators=(",", ":"))
+        r = await self._request("DELETE", f"{API_URL}order", headers=self._mk_headers(body),
+                                data=body, tag="cancel-order")
         return {"order_id": broker_order_id, "status": "cancelled", "raw": r}
 
     def _split(self, symbol: str) -> tuple[str, str]:
@@ -155,7 +181,8 @@ class BreezeAdapter(BaseBroker):
 
     # ------------------------------------------------------------------ history
     async def get_history(self, symbol: str, tf_minutes: int, days: int) -> list[dict]:
-        iv = {1: "1minute", 5: "5minute", 15: "30minute", 30: "30minute"}.get(tf_minutes, "1minute")
+        # wire interval values per the SDK (it maps "1minute"->"minute" before sending)
+        iv = {1: "minute", 5: "5minute", 15: "30minute", 30: "30minute"}.get(tf_minutes, "minute")
         exch, sym = self._split(symbol)
         params: dict = {"interval": iv,
                         "from_date": datetime.fromtimestamp(__import__("time").time() - days * 86400)
@@ -171,8 +198,10 @@ class BreezeAdapter(BaseBroker):
                            "right": "call" if c["right"] == "CE" else "put",
                            "strike_price": str(int(c["strike"]))})
         body = json.dumps(params, separators=(",", ":"))
+        # SDK sends the params as the GET request BODY (requests.get(url, data=body)),
+        # checksum computed over that body — NOT as query params.
         r = await self._request("GET", f"{API_URL}historicalcharts",
-                                headers=self._mk_headers(body), params=params, tag="history")
+                                headers=self._mk_headers(body), data=body, tag="history")
         candles = (r.get("Success") or {}).get("candles") or []
         out = []
         for row in candles:

@@ -897,9 +897,9 @@ function AccountsManager() {
           <BulkAccountsDialog accounts={accounts} />
           <Dialog open={dlgOpen} onOpenChange={setDlgOpen}>
             <DialogTrigger asChild><Button size="sm" className="text-xs">+ Add Account</Button></DialogTrigger>
-          <DialogContent className="bg-popover">
+          <DialogContent className="bg-popover max-w-[calc(100vw-2rem)] sm:max-w-lg">
             <DialogHeader><DialogTitle>Add Broker Account</DialogTitle></DialogHeader>
-            <div className="space-y-3 text-xs">
+            <div className="space-y-3 text-xs min-w-0 max-w-full">
               <Field label="Label">
                 <Input value={form.label} onChange={e => setForm({ ...form, label: e.target.value })} placeholder="e.g. Dhan Prop Desk 2" className="h-8" />
               </Field>
@@ -1147,6 +1147,23 @@ function ChargesDialog({ accountId, label, brokerType }: { accountId: string; la
           Edit any number — every fill, the margin calculator and the P&amp;L math instantly use YOUR rates, so net profit after
           brokerage + STT + all taxes is always the REAL amount.
         </p>
+        {data?.source && (
+          <div className="text-[10px] text-muted-foreground rounded border border-border/60 bg-secondary/30 px-2 py-1.5 leading-relaxed">
+            <b className="text-foreground">{data.source.name}</b> — rates referenced from this broker&apos;s own pricing,
+            <b className="text-foreground"> as of {data.source.asOf}</b>. {data.source.note}
+            {data.source.links.length > 0 && (
+              <span className="block mt-0.5">
+                Verify / update:{' '}
+                {data.source.links.map((l, i) => (
+                  <span key={l}>
+                    {i > 0 && ' · '}
+                    <a href={l} target="_blank" rel="noreferrer" className="text-[#4dd0e1] underline break-all">{l}</a>
+                  </span>
+                ))}
+              </span>
+            )}
+          </div>
+        )}
         {!sched && <div className="text-[10px] text-muted-foreground py-3">loading schedule…</div>}
         {sched && (
           <div className="space-y-2">
@@ -1203,14 +1220,17 @@ function ChargesDialog({ accountId, label, brokerType }: { accountId: string; la
   )
 }
 
-// ---------------- Bulk accounts via JSON (Round-24) ----------------
-// A textarea prefilled with the CURRENT accounts — edit in place and Apply:
-//  · row WITH id        → modify (label / mode / credentials-merge / capital)
-//  · row WITHOUT id     → add
+// ---------------- Bulk accounts via JSON (Round-24, expanded Round-25) -----
+// An ALTERNATIVE to the add/edit UI: the textarea is prefilled with the FULL
+// current accounts (GET /accounts/export — raw credentials + live session
+// tokens + capital config + flags).  Edit in place and Apply:
+//  · row WITH id        → modify (any field incl. credentials/session merge)
+//  · row WITHOUT id     → add (the pasted copy fully recreates the account,
+//                         session included — no Session dialog needed)
 //  · "_delete": true    → delete that row
 //  · "delete missing"   → also delete every account absent from the JSON
-// Masked secrets (••••xxxx) round-trip safely — the backend keeps the stored
-// value for any masked/empty field.
+// The textarea SCROLLS INTERNALLY (max-height) so any number of accounts fits
+// the screen, and Copy puts the whole JSON on the clipboard for backup/sharing.
 function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
@@ -1219,7 +1239,7 @@ function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
   const [deleteMissing, setDeleteMissing] = useState(false)
   const [result, setResult] = useState<BulkApplyResp | null>(null)
 
-  const prefill = () => {
+  const fallbackPrefill = () => {
     const rows = accounts.map(a => {
       const extra = a as AccountRow & { modeLabel2?: string | null; credentials?: Record<string, string> }
       return {
@@ -1237,7 +1257,16 @@ function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
     setResult(null)
   }
 
-
+  // FULL export — raw credentials + session tokens (GET /accounts/export)
+  const prefill = async () => {
+    try {
+      const r = await api.accountsExport()
+      setText(JSON.stringify(r.accounts, null, 2))
+      setResult(null)
+    } catch {
+      fallbackPrefill()
+    }
+  }
 
   const apply = async () => {
     let parsed: unknown
@@ -1255,30 +1284,36 @@ function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={o => { setOpen(o); if (o) prefill() }}>
+    <Dialog open={open} onOpenChange={o => { setOpen(o); if (o) void prefill() }}>
       <DialogTrigger asChild>
-        <Button size="sm" variant="secondary" className="text-xs" title="Add / modify / delete many accounts at once from JSON">
+        <Button size="sm" variant="secondary" className="text-xs" title="Add / modify / delete many accounts at once from JSON — full data incl. credentials & sessions">
           Bulk JSON
         </Button>
       </DialogTrigger>
-      <DialogContent className="bg-popover max-w-3xl">
+      <DialogContent className="bg-popover max-w-3xl max-h-[92vh] overflow-y-auto">
         <DialogHeader><DialogTitle>Bulk accounts — JSON</DialogTitle></DialogHeader>
-        <div className="space-y-2.5 text-xs">
+        <div className="space-y-2.5 text-xs min-w-0">
           <div className="text-[10px] text-muted-foreground leading-snug">
-            Prefilled with the CURRENT accounts — edit and Apply. Row with <code>id</code> → <b>modify</b> ·
-            without <code>id</code> → <b>add</b> · <code>&quot;_delete&quot;: true</code> → <b>delete</b> ·
-            masked secrets (<code>••••xxxx</code>) keep the stored value · <code>initialCapital: null</code> →
-            % of broker available cash · <code>capitalMode</code>: PROFIT_ONLY | INITIAL_PLUS_PNL |
-            INITIAL_WITH_LOSS_REDUCTION | LIVE_BALANCE · <code>broker</code>: sim | breeze | dhan | shoonya.
+            Prefilled with <b>ALL current account data</b> — credentials, session tokens, capital config, flags — straight
+            from the export. Edit and Apply: row with <code>id</code> → <b>modify</b> · without <code>id</code> → <b>add</b>
+            {' '}({'—'} a pasted copy fully recreates the account, session included) · <code>&quot;_delete&quot;: true</code> →
+            <b> delete</b> · <code>initialCapital: null</code> → % of broker available cash · <code>capitalMode</code>:
+            PROFIT_ONLY | INITIAL_PLUS_PNL | INITIAL_WITH_LOSS_REDUCTION | LIVE_BALANCE · <code>broker</code>:
+            sim | breeze | dhan | shoonya. Copy the JSON to back up or clone an account.
           </div>
           <Textarea value={text} onChange={e => setText(e.target.value)}
-            className="font-mono text-[10.5px] leading-snug min-h-[300px] bg-[#0b0e14]" spellCheck={false} />
+            className="font-mono text-[10.5px] leading-snug h-[42vh] min-h-[200px] max-h-[55vh] resize-y overflow-y-auto bg-[#0b0e14] w-full min-w-0 block"
+            spellCheck={false} />
           <div className="flex flex-wrap items-center gap-3">
             <Button size="sm" className="h-8 text-xs" onClick={apply} disabled={busy || !text.trim()}>
               {busy ? 'Applying…' : 'Apply changes'}
             </Button>
-            <Button size="sm" variant="secondary" className="h-8 text-xs" onClick={prefill} disabled={busy}>
+            <Button size="sm" variant="secondary" className="h-8 text-xs" onClick={() => void prefill()} disabled={busy}>
               Reset to current
+            </Button>
+            <Button size="sm" variant="secondary" className="h-8 text-xs" disabled={!text.trim()}
+              onClick={() => { void navigator.clipboard?.writeText(text); toast.info('Account JSON copied to clipboard') }}>
+              Copy JSON
             </Button>
             <label className="flex items-center gap-1.5 text-[10px] text-[#ff7a7a] cursor-pointer select-none">
               <Switch checked={deleteMissing} onCheckedChange={setDeleteMissing} className="scale-[0.8]" />
@@ -1294,7 +1329,7 @@ function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
                 <div key={i} className="text-[10px] flex items-center gap-1.5">
                   <span className={d.ok ? 'term-up' : 'term-down'}>{d.ok ? '✓' : '✗'}</span>
                   <span className="text-muted-foreground">row {d.row ?? '—'}</span>
-                  <span>{d.action ?? ''}{d.label ? ` — ${d.label}` : ''}{d.error ? ` — ${d.error}` : ''}</span>
+                  <span className="break-words">{d.action ?? ''}{d.label ? ` — ${d.label}` : ''}{d.error ? ` — ${d.error}` : ''}</span>
                 </div>
               ))}
             </div>
@@ -1350,9 +1385,9 @@ function EditAccountDialog({ accountId, brokerType }: { accountId: string; broke
           <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
         </Button>
       </DialogTrigger>
-      <DialogContent className="bg-popover max-w-lg">
+      <DialogContent className="bg-popover max-w-[calc(100vw-2rem)] sm:max-w-lg">
         <DialogHeader><DialogTitle>Edit account — {st?.label ?? ''}</DialogTitle></DialogHeader>
-        <div className="space-y-3 text-xs">
+        <div className="space-y-3 text-xs min-w-0 max-w-full">
           <div className="text-[10px] text-muted-foreground">
             Stored values show masked. Leave a field EMPTY to keep the current value — secrets never need retyping.
           </div>
@@ -1439,9 +1474,9 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
           <KeyRound className={`h-3.5 w-3.5 ${st?.hasSession ? 'text-[#00c896]' : 'text-muted-foreground'}`} />
         </Button>
       </DialogTrigger>
-      <DialogContent className="bg-popover max-w-lg">
+      <DialogContent className="bg-popover max-w-[calc(100vw-2rem)] sm:max-w-lg">
         <DialogHeader><DialogTitle>Broker session — {label}</DialogTitle></DialogHeader>
-        <div className="space-y-3 text-xs">
+        <div className="space-y-3 text-xs min-w-0 max-w-full">
           {st && (
             <div className="flex flex-wrap items-center gap-2 text-[10px]">
               <span className={`px-1.5 py-0.5 rounded ${st.hasSession ? 'bg-up text-[#00c896]' : 'bg-secondary text-muted-foreground'}`}>
@@ -1477,19 +1512,19 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
             </div>
           )}
           {st?.loginUrl && (
-            <div className="flex items-center gap-1.5">
-              <a href={st.loginUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#4dd0e1] truncate flex-1" title={st.loginUrl}>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <a href={st.loginUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#4dd0e1] truncate flex-1 min-w-0 break-all" title={st.loginUrl}>
                 {st.loginUrl}
               </a>
-              <Button size="sm" variant="secondary" className="h-6 text-[10px]" onClick={() => { void navigator.clipboard?.writeText(st.loginUrl!); toast.info('Login URL copied') }}>copy</Button>
+              <Button size="sm" variant="secondary" className="h-6 text-[10px] shrink-0" onClick={() => { void navigator.clipboard?.writeText(st.loginUrl!); toast.info('Login URL copied') }}>copy</Button>
             </div>
           )}
           {consentUrl && (
-            <div className="flex items-center gap-1.5">
-              <a href={consentUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#ffb86b] truncate flex-1" title={consentUrl}>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <a href={consentUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#ffb86b] truncate flex-1 min-w-0 break-all" title={consentUrl}>
                 {consentUrl}
               </a>
-              <Button size="sm" variant="secondary" className="h-6 text-[10px]" onClick={() => { void navigator.clipboard?.writeText(consentUrl); toast.info('Consent login URL copied') }}>copy</Button>
+              <Button size="sm" variant="secondary" className="h-6 text-[10px] shrink-0" onClick={() => { void navigator.clipboard?.writeText(consentUrl); toast.info('Consent login URL copied') }}>copy</Button>
             </div>
           )}
           {isDhan && (
@@ -1538,9 +1573,10 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
           </div>
           {isShoonya && (
             <div className="border-t border-border pt-2 text-[10px] text-muted-foreground">
-              Direct QuickAuth (no browser): save the account with User ID + API secret, then paste
-              <b> pwd:factor2 </b>(password:PAN/DOB, optionally <b>:totp</b>) as the code above — e.g. <code>mypass:ABCD1</code> or <code>mypass:ABCD1:987654</code>.
-              The OAuth code flow tries sha256 verifier variants automatically and logs every attempt.
+              Shoonya&apos;s <b>QuickAuth (pwd:factor2) is vendor-gated now</b> and the old NorenWClientTP gateway is
+              decommissioned (HTTP 502) — the OAuth code flow above is the only consumer login. Save the account with
+              API Key (client_id) + API secret, open the login URL, and paste the FRESH <code>?code=</code> from the
+              redirect (single-use, expires in minutes). The docs checksum sha256(client_id+secret+code) is tried first.
             </div>
           )}
         </div>
@@ -1551,10 +1587,10 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="space-y-1">
+    <div className="space-y-1 min-w-0">
       <div className="text-[10px] text-muted-foreground">{label}</div>
       {children}
-      {hint && <div className="text-[9px] text-muted-foreground/70">{hint}</div>}
+      {hint && <div className="text-[9px] text-muted-foreground/70 break-words">{hint}</div>}
     </div>
   )
 }

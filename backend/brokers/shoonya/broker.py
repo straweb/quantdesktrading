@@ -1,15 +1,26 @@
 """
-Shoonya (Finvasia) adapter — Noren REST + QuickAuth.
+Shoonya (Finvasia) adapter — Noren REST via the LIVE gateway prefix.
 
-Auth (simplified OpenAlgo-style, Round-10/12):
-  A. Direct susertoken paste (from Shoonya API dashboard TOTP flow).
-  B. QuickAuth: uid + password + factor2(TOTP) + vendor_code + api_secret(app_idkey)
-     POST {BASE}/QuickAuth  data={apk:api_key, imei, source:'API', uid, pwd,
-     factor2, vc, app_idkey, addldivinf} -> susertoken (persisted).
+Round-25: Shoonya DECOMMISSIONED the bare /QuickAuth, /Limits … paths AND the
+whole NorenWClientTP gateway (both now nginx 502/404 — verified live).
+Every REST endpoint now lives under:
 
-REST base: https://api.shoonya.com/  endpoints: QuickAuth, PlaceOrder,
-CancelOrderTask, Limits (funds), PositionBook, OrderBook, TPSeries.
-All calls: POST with form jData=<json>&jKey=<susertoken>.
+    https://api.shoonya.com/NorenWClientAPI/<Endpoint>
+
+(per shoonya.com/api-documentation — Quick Start: host="https://api.shoonya.com/NorenWClientAPI/",
+ websocket="wss://api.shoonya.com/NorenWSAPI/").
+
+Auth:
+  A. OAuth (the ONLY documented consumer flow): user opens
+     https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=<api_key>,
+     the redirect carries ?code=…, the server exchanges it via
+     POST /NorenWClientAPI/GenAcsTok  jData={"code":…,"checksum":sha256(client_id+secret+code)}
+     -> {stat:"Ok", susertoken, uid, actid}.
+  B. QuickAuth (vendor-gated): POST /NorenWClientAPI/QuickAuth — works only
+     for vendor-class API apps; regular consumer apps get
+     "Invalid Input : Invalid Access Type" (kept as a best-effort fallback).
+
+All calls: POST form  jData=<json>&jKey=<susertoken>.
 """
 from __future__ import annotations
 
@@ -22,6 +33,7 @@ from backend.brokers.base import BaseBroker, BrokerError
 from backend.brokers.shoonya import mapping as sm
 
 BASE = "https://api.shoonya.com"
+GW = f"{BASE}/NorenWClientAPI"          # live REST gateway (Round-25)
 
 
 class ShoonyaAdapter(BaseBroker):
@@ -32,7 +44,7 @@ class ShoonyaAdapter(BaseBroker):
         jkey = self.session.get("susertoken", "")
         if "jData" not in jdata:
             jdata = {"jData": jdata, "jKey": jkey}
-        r = await self._request("POST", f"{BASE}/{endpoint}", data=jdata, tag=tag)
+        r = await self._request("POST", f"{GW}/{endpoint}", data=jdata, tag=tag)
         out = r.get("data", r)
         if isinstance(out, dict) and out.get("stat") == "Not_Ok":
             raise BrokerError(f"{tag}: {out.get('emsg', 'Not_Ok')}")
@@ -71,7 +83,7 @@ class ShoonyaAdapter(BaseBroker):
                    "source": "API", "uid": c.get("uid", ""), "pwd": c.get("password", ""),
                    "factor2": c.get("totp", ""), "vc": c.get("vendor_code", ""),
                    "app_idkey": c.get("api_secret", c.get("api_key", "")), "addldivinf": ""}
-        r = await self._request("POST", f"{BASE}/QuickAuth", data={"jData": payload}, tag="QuickAuth")
+        r = await self._request("POST", f"{GW}/QuickAuth", data={"jData": payload}, tag="QuickAuth")
         body = r.get("data", r)
         if not isinstance(body, dict) or not body.get("susertoken"):
             raise BrokerError(f"QuickAuth failed: {str(body)[:200]}")

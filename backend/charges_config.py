@@ -37,6 +37,35 @@ STATUTORY = {   # segment -> (sttBuy, sttSell, txn, sebi, stampBuy)
 GST_PCT = 0.18
 SEGMENTS = ("EQ_INTRADAY", "EQ_DELIVERY", "FUT", "OPT")
 
+# Round-25 — per-broker rate PROVENANCE.  Every default above is referenced
+# from the broker's own pricing page; the date is when the schedule was last
+# verified against those pages.  Statutory taxes (STT/txn/SEBI/stamp/GST) are
+# set by law and identical for every broker — only brokerage differs.
+CHARGES_AS_OF = "2026-10-24"
+CHARGES_SOURCES = {
+    "sim":          {"name": "Simulated Feed",
+                     "note": "mirrors the Dhan/₹20 flat-fee schedule so paper P&L ≈ real P&L",
+                     "links": []},
+    "ICICI_BREEZE": {"name": "ICICI Direct (Breeze)",
+                     "note": "₹20 flat brokerage; statutory taxes identical for all brokers",
+                     "links": ["https://www.icicidirect.com/calculators/brokerage-calculator",
+                               "https://www.icicidirect.com/brokerage"]},
+    "DHAN":         {"name": "Dhan",
+                     "note": "₹20 flat brokerage (₹0 delivery); statutory taxes identical for all brokers",
+                     "links": ["https://dhan.co/pricing/",
+                               "https://dhan.co/calculators/brokerage-calculator/"]},
+    "SHOONYA":      {"name": "Shoonya (Finvasia)",
+                     "note": "₹0 brokerage across segments; statutory taxes identical for all brokers",
+                     "links": ["https://shoonya.com/pricing",
+                               "https://shoonya.com/calculators/brokerage-calculator"]},
+}
+
+
+def charges_source(broker: str) -> dict:
+    """Provenance block for the charges dialog (name + verified-on date + links)."""
+    src = CHARGES_SOURCES.get((broker or "").upper()) or CHARGES_SOURCES["sim"]
+    return {"name": src["name"], "note": src["note"], "links": src["links"], "asOf": CHARGES_AS_OF}
+
 # Broker-flavoured brokerage defaults (flat ₹ per order / pct of turnover).
 BROKER_BROKERAGE = {
     "sim":         {"EQ_INTRADAY": (20, 0.0003), "EQ_DELIVERY": (0, 0.0),

@@ -342,6 +342,18 @@ async def patch_account(account_id: int, body: dict, authorization: str = Header
     acc = db.core().one("SELECT * FROM accounts WHERE id=?", (account_id,))
     if not acc:
         raise HTTPException(404, "account not found")
+    # Round-25 hardening: ANY unexpected error in the flag/credential handling
+    # below surfaces as a clear 400 with the real message — never a bare 500.
+    try:
+        return await _patch_account_inner(account_id, acc, body, authorization)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"account update failed: {str(e)[:220]}")
+
+
+async def _patch_account_inner(account_id: int, acc: dict, body: dict, authorization: str = Header(default="")):
+    _uid(authorization)
     sets, vals = [], []
     simple = {"label": "label", "mode": "mode",
               "isOrderEnabled": "is_order_enabled", "isActive": "is_active",
@@ -483,6 +495,46 @@ async def delete_account(account_id: int, authorization: str = Header(default=""
 #          "capitalPct": 100, "capitalMode": "…",
 #          "isActive": true, "isOrderEnabled": true,
 #          "_delete": false}                             ← true → delete row
+def _apply_session_row(aid: int, broker: str, r: dict) -> None:
+    """Bulk-JSON round-trip: a row's `session: {token}` (copied from the export)
+    is persisted verbatim, so a pasted account is FULLY recreated — including
+    its live broker session — without opening the Session dialog."""
+    if not isinstance(r.get("session"), dict):
+        return
+    tok = str(r["session"].get("token") or "").strip()
+    if not tok or tok.startswith("••••"):
+        return
+    session_store.save(aid, broker or "", tok, None, {"bulkImport": True})
+
+
+@app.get("/pyapi/accounts/export")
+async def accounts_export(authorization: str = Header(default="")):
+    """FULL account dump for the Bulk-JSON editor (Round-25): raw credentials,
+    live session tokens, capital config + row flags — copy/paste round-trips
+    an account (or a whole book) without touching the UI forms."""
+    _uid(authorization)
+    out: list[dict] = []
+    for row in db.core().query("SELECT * FROM accounts ORDER BY id"):
+        try:
+            creds = json.loads(row["credentials"] or "{}")
+        except Exception:
+            creds = {}
+        sess = session_store.get(row["id"])
+        out.append({
+            "id": str(row["id"]), "label": row["label"], "broker": row["broker"],
+            "mode": row["mode"], "clientId": creds.get("client_id") or creds.get("user_id") or None,
+            "credentials": creds,
+            "session": ({"token": sess["session_token"], "broker": sess.get("broker", row["broker"]),
+                         "updatedAt": sess.get("updated_at")} if sess and sess.get("session_token") else None),
+            "initialCapital": row["initial_capital"], "capitalPct": row["capital_pct"] or 100,
+            "capitalMode": row["capital_mode"] or "INITIAL_PLUS_PNL",
+            "isActive": bool(row["is_active"]), "isOrderEnabled": bool(row["is_order_enabled"]),
+        })
+    return {"accounts": out, "exportedAt": time.time(),
+            "note": "rows with id=modify, without id=add, \"_delete\":true=delete; "
+                    "credentials+session are RAW so a pasted copy fully recreates the account"}
+
+
 @app.post("/pyapi/accounts/bulk")
 async def accounts_bulk(body: dict, authorization: str = Header(default="")):
     _uid(authorization)
@@ -552,6 +604,8 @@ async def accounts_bulk(body: dict, authorization: str = Header(default="")):
             patch["mode"] = r["mode"]
         if isinstance(r.get("credentials"), dict):
             patch["credentials"] = r["credentials"]
+        if r.get("clientId"):  # Round-25: clientId round-trips too
+            patch.setdefault("credentials", {})["client_id"] = str(r["clientId"]).strip()
         if "initialCapital" in r:
             ic = r.get("initialCapital")
             if ic in (None, "", 0):
@@ -571,11 +625,12 @@ async def accounts_bulk(body: dict, authorization: str = Header(default="")):
             patch["isActive"] = bool(r["isActive"])
         if "isOrderEnabled" in r:
             patch["isOrderEnabled"] = bool(r["isOrderEnabled"])
-        if not patch:
+        if not patch and not (isinstance(r.get("session"), dict) and r["session"].get("token")):
             _after(i, True, id=rid, action="unchanged")
             continue
         try:
             await patch_account(aid, patch, authorization=authorization)
+            _apply_session_row(aid, acc["broker"], r)
             _after(i, True, id=rid, action="modified", label=patch.get("label") or acc["label"])
         except HTTPException as e:
             _after(i, False, id=rid, error=str(e.detail))
@@ -598,6 +653,7 @@ async def accounts_bulk(body: dict, authorization: str = Header(default="")):
             )
             res = await create_account(req, authorization=authorization)
             new_id = res.get("id")
+            _apply_session_row(int(new_id), str(r.get("broker") or ""), r)
             seen_ids.add(str(new_id))
             _after(i, True, id=str(new_id), action="created", label=res.get("account", {}).get("label"))
         except HTTPException as e:

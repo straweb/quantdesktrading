@@ -172,6 +172,17 @@ class DhanAdapter(BaseBroker):
     # ------------------------------------------------------------------ data
     async def get_funds(self) -> dict:
         r = await self._request("GET", f"{REST}/fundlimit", headers=self._headers(), tag="funds")
+        # Dhan also reports failures inside HTTP-200 bodies — surface the REAL
+        # reason (bad token / IP not whitelisted) instead of pretending 0 cash.
+        if isinstance(r, dict):
+            if r.get("errorType") or r.get("errorCode"):
+                raise BrokerError(f"Dhan API: {r.get('errorMessage') or r.get('errorType')} "
+                                  f"({r.get('errorCode')}) — check the access token and the "
+                                  f"static-IP whitelist (Session → Sync server IP)")
+            if r.get("status") == "failure":
+                rem = r.get("remarks") or {}
+                raise BrokerError(f"Dhan API: {rem.get('error_message') or rem.get('error_code') or 'failure'} "
+                                  "— check the access token and the static-IP whitelist")
         avail = float(r.get("availableBalance") or 0)
         used = float(r.get("utilizedAmount") or 0)
         return {"available": round(avail, 2), "used": round(used, 2),
