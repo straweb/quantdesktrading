@@ -1237,7 +1237,7 @@ function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
     setResult(null)
   }
 
-  useEffect(() => { if (open) prefill() /* eslint-disable-line react-hooks/exhaustive-deps */ }, [open])
+
 
   const apply = async () => {
     let parsed: unknown
@@ -1255,7 +1255,7 @@ function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={o => { setOpen(o); if (o) prefill() }}>
       <DialogTrigger asChild>
         <Button size="sm" variant="secondary" className="text-xs" title="Add / modify / delete many accounts at once from JSON">
           Bulk JSON

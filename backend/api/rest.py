@@ -37,129 +37,6 @@ def _uid(authorization: str = "") -> dict:
 
 
 # ================================================================== health
-@app.post("/pyapi/_diag_patch/{account_id}")
-async def _diag_patch(account_id: int, body: dict, authorization: str = Header(default="")):
-    """TEMP: invoke patch_account logic directly (POST route) — isolates the
-    handler logic from the PATCH dispatch."""
-    return await patch_account(account_id, body, authorization=authorization)
-
-
-@app.get("/pyapi/_diag")
-async def _diag_sqlite(authorization: str = Header(default="")):
-    """TEMP Round-24: sqlite write-behaviour matrix inside the live process."""
-    import sqlite3 as _sq
-    import time as _t
-    out: dict = {}
-    base = db.core()
-    # ensure a target row
-    now = _t.time()
-    r = base._conn.execute(
-        "INSERT INTO accounts(broker,label,mode,credentials,created_at,updated_at) "
-        "VALUES('breeze','DIAGM','live','{}',?,?)", (now, now))
-    rid = r.lastrowid
-    base._conn.commit()
-    out["created_id"] = rid
-
-    def upd(tag, conn, sql, params=(), commit=True):
-        try:
-            cur = conn.execute(sql, params)
-            rc = cur.rowcount
-            if commit:
-                conn.commit()
-            back = conn.execute("SELECT credentials FROM accounts WHERE id=?", (rid,)).fetchone()[0]
-            out[tag] = {"rowcount": rc, "readback": back}
-        except Exception as e:
-            out[tag] = {"error": str(e)[:120]}
-
-    # 1 standard singleton
-    upd("1_singleton", base._conn,
-        "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":1}', rid))
-    # 2 fresh plain
-    c2 = _sq.connect(base.path)
-    upd("2_fresh_plain", c2, "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":2}', rid))
-    c2.close()
-    # 3 fresh + DELETE pragma
-    c3 = _sq.connect(base.path)
-    c3.execute("PRAGMA journal_mode=DELETE")
-    upd("3_fresh_delete", c3, "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":3}', rid))
-    c3.close()
-    # 4 literal sql
-    upd("4_literal", base._conn,
-        f"UPDATE accounts SET credentials='{{\"v\":4}}' WHERE id={rid}")
-    # 5 autocommit connection
-    c5 = _sq.connect(base.path, isolation_level=None)
-    upd("5_autocommit", c5, "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":5}', rid), commit=False)
-    c5.close()
-    # 6 INSERT OR REPLACE whole row
-    row = base.one("SELECT * FROM accounts WHERE id=?", (rid,))
-    base._conn.execute(
-        "INSERT OR REPLACE INTO accounts(id,broker,label,mode,credentials,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,?)", (rid, row["broker"], row["label"], row["mode"],
-                                  '{"v":6}', row["created_at"], _t.time()))
-    base._conn.commit()
-    out["6_insert_replace"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
-    # 7 delete+reinsert
-    base._conn.execute("DELETE FROM accounts WHERE id=?", (rid,))
-    base._conn.commit()
-    base._conn.execute(
-        "INSERT INTO accounts(id,broker,label,mode,credentials,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,?)", (rid, row["broker"], row["label"], row["mode"],
-                                  '{"v":7}', row["created_at"], _t.time()))
-    base._conn.commit()
-    out["7_del_reinsert"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
-    # 8-11: EXACT patch_account shapes
-    now = _t.time()
-    upd("8_conn_creds_updatedat", base._conn,
-        "UPDATE accounts SET credentials=?, updated_at=? WHERE id=?",
-        ('{"v":8}', now, rid))
-    upd("9_exec_wrapper", base._conn,
-        "UPDATE accounts SET credentials=?, updated_at=? WHERE id=?",
-        ('{"v":9}', now, rid))
-    base.exec("UPDATE accounts SET credentials=?, updated_at=? WHERE id=?",
-              ('{"v":10}', _t.time(), rid))
-    out["10_base_exec"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
-    base.exec("UPDATE accounts SET credentials='{\"v\":11}' WHERE id=" + str(rid))
-    out["11_base_exec_literal"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
-    upd("12_two_stmts", base._conn,
-        "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":12}', rid))
-    # 13: update a row created by an EARLIER HTTP request (e.g. TWIN2/TWIN3)
-    old_row = base.one("SELECT id, credentials FROM accounts WHERE label LIKE 'TWIN%' ORDER BY id DESC LIMIT 1")
-    if old_row:
-        upd("13_cross_request_row", base._conn,
-            "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":13}', old_row["id"]))
-    # 14: create + update in THIS request (same-request control)
-    now = _t.time()
-    r2 = base._conn.execute(
-        "INSERT INTO accounts(broker,label,mode,credentials,created_at,updated_at) "
-        "VALUES('breeze','DIAGM2','live','{}',?,?)", (now, now))
-    rid2 = r2.lastrowid
-    base._conn.commit()
-    upd("14_same_request_row", base._conn,
-        "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":14}', rid2))
-    base._conn.execute("DELETE FROM accounts WHERE id=?", (rid2,))
-    base._conn.commit()
-    # 16 FIRST (pure function, cannot 401): normalize check
-    out["16_normalize"] = _normalize_creds_row(json.dumps({"api_key": "N16", "apiKey": "N16b"}))
-    # 15: call patch_account DIRECTLY with the caller's REAL token
-    try:
-        pa = await patch_account(rid, {"credentialsMerge": {"api_key": "X15"}}, authorization=authorization)
-        out["15_patch_account"] = pa.get("account", {}).get("credentials")
-        out["15_after_db"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
-    except Exception as e:
-        out["15_patch_account"] = f"EXC {e}"
-    # cleanup
-    base._conn.execute("DELETE FROM accounts WHERE id=?", (rid,))
-    base._conn.commit()
-    import inspect as _insp
-    import sys as _sys
-    out["_module_file"] = _insp.getfile(_sys.modules[__name__])
-    out["_norm_row_file"] = _insp.getfile(_normalize_creds_row)
-    out["_norm_row_source"] = _insp.getsource(_normalize_creds_row)[:600]
-    out["_patch_account_file"] = _insp.getfile(patch_account)
-    out["journal_main"] = base._conn.execute("PRAGMA journal_mode").fetchone()[0]
-    return out
-
-
 @app.get("/pyapi/health")
 async def health():
     hub = Hub.instance()
@@ -462,8 +339,6 @@ async def create_account(req: AccountReq, authorization: str = Header(default=""
 @app.patch("/pyapi/accounts/{account_id}")
 async def patch_account(account_id: int, body: dict, authorization: str = Header(default="")):
     _uid(authorization)
-    import asyncio as _aio
-    await _aio.sleep(2.0)   # SPY2
     acc = db.core().one("SELECT * FROM accounts WHERE id=?", (account_id,))
     if not acc:
         raise HTTPException(404, "account not found")
@@ -534,9 +409,14 @@ async def patch_account(account_id: int, body: dict, authorization: str = Header
             db.core().exec("UPDATE copytrade SET master_account_id=NULL "
                            "WHERE id=1 AND master_account_id=?", (str(account_id),))
     if sets:
-        vals.append(account_id)
+        # Round-24 CRITICAL FIX: the params must end with (…, updated_at, id) —
+        # the previous code appended account_id BEFORE time.time(), binding
+        # updated_at=<id> and WHERE id=<timestamp> — which never matches, so
+        # every PATCH write silently no-opped (credentialsMerge, capitalMode,
+        # label…).  This is the real root cause of the "credentials not saved"
+        # reports; the credentialsMerge key-drop was a second bug on top.
         db.core().exec(f"UPDATE accounts SET {', '.join(sets)}, updated_at=? WHERE id=?",
-                       (*vals, time.time()))
+                       (*vals, time.time(), account_id))
     if hub.adapters.get(account_id) and (body.get("credentials") or body.get("isActive") is False):
         await hub.disconnect_account(account_id)
     if body.get("isActive") is True and not hub.adapters.get(account_id):

@@ -23,7 +23,8 @@ Two surfaces:
 |---|---|
 | `GET /api/accounts` | all accounts + capital state (mode, base/pct, available cash, usable) |
 | `POST /api/accounts` | create account (per-broker credential fields, encrypted at rest; live brokers: blank initial capital = 100 % of broker available cash) |
-| `GET/PATCH/DELETE /api/accounts/[id]` | read / update (label, `isActive` routing, `credentials` (replace) or `credentialsMerge` (partial — blank keys kept), `capitalBase`, `capitalPct`, capital+mode) / delete |
+| `GET/PATCH/DELETE /api/accounts/[id]` | read / update (label, `isActive` routing, `credentials` (replace) or `credentialsMerge` (partial — blank/masked keys kept), `capitalBase`, `capitalPct`, capital+mode) / delete. Round-24: credential keys are normalized to snake_case on every write (apiKey→api_key etc.) and the PATCH param-order bug that silently dropped ALL edits is fixed |
+| `POST /api/accounts/bulk` | `{accounts: [row…], deleteMissing?}` — bulk add/modify/delete: row WITH `id` → modify (label/mode/credentials-merge/capital fields/`isActive`/`isOrderEnabled`), WITHOUT `id` → add, `"_delete": true` → delete; `deleteMissing: true` also deletes every account absent from the array. Response: `{ok, counts:{created,modified,deleted,errors}, detail[]}`. Powers the Admin → "Bulk JSON" dialog (textarea prefilled with the current accounts; masked secrets round-trip safely) |
 | `GET /api/funds` | aggregated per-account funds ledgers |
 | `POST /api/funds` | `{accountId?}` — pull REAL broker funds now (one account or every active live account; also runs automatically every 45 s). Repeated pulls share one broker call per 15 s (micro-cache); explicit pulls bypass it |
 | `GET /api/portfolio` | live holdings + live marks + open positions |
@@ -38,7 +39,8 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 
 | Method & path | Description |
 |---|---|
-| `GET /api/broker-auth` | auth status + flow descriptor + login URL (real keys substituted: Breeze `apiuser/login?api_key=<key>`, Shoonya `OAuthlogin?client_id=<id>`) + masked `credFields`; Dhan adds `serverIp` + `ipInfo` (registered IPs, match check) |
+| `GET /api/broker-auth` | auth status + flow descriptor + login URL (real keys substituted: Breeze `apiuser/login?api_key=<key>`, Shoonya `OAuthlogin?client_id=<id>`; Dhan AUTO-GENERATES the consent login URL when App ID + App Secret are saved — 120 s TTL cache, falls back to the web console URL) + masked `credFields` + `fieldsNeeded`; Dhan adds `serverIp` + `ipInfo` (registered IPs, match check) |
+| `POST /api/accounts/[id] (session created)` | after ANY successful `broker-auth complete` the backend auto-syncs master contracts (`trigger=session`), reloads token maps and best-effort connects the account — first login of the day needs no manual Sync; the day-start loop (08:00 IST, 5-min tick) also covers session-holding accounts that are not yet connected |
 | `POST /api/broker-auth` | `{accountId, action:'consent'\|'complete'\|'syncIp', code?}` — consent (Dhan generate-consent → consentApp login URL, echoed to the dialog) / session creation (flows above; exchange attempts logged) / Dhan IP sync (`getIP` → `setIP` when none, `modifyIP` when the server IP differs). Completed sessions are persisted in `broker_sessions` — refresh/restart re-uses them |
 | `GET /api/broker-sessions` | persisted session status per live account: `{hasSession, connected, validatedAt, expiresAt, autoRenew, renewing, lastAction, error}` — validated against the broker (funds probe, 5-min throttle) and auto-renewed where the stored credentials allow (Shoonya QuickAuth) |
 | `POST /api/broker-sessions` | `{accountId?}` — force-validate one account (or all) now |

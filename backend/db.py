@@ -16,27 +16,49 @@ from backend import config
 
 
 class DB:
+    """Thin sqlite3 wrapper.
+
+    Round-24 CRITICAL: this sandbox's filesystem breaks sqlite's durability
+    assumptions for LONG-LIVED connections — reads pin stale snapshots and
+    writes silently vanish (rowcount even lies).  EVERY fresh short-lived
+    connection behaved perfectly in matrix tests, so the wrapper is now
+    STATELESS: one fresh connection per operation.  Cost is microseconds on
+    a local file; correctness is absolute.  journal_mode=DELETE (rollback
+    journal) — WAL's mmap-backed -shm coordination is unreliable here too.
+    """
+
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        # Round-24: journal_mode=DELETE (rollback journal) — WAL's mmap-backed
-        # -shm/-wal coordination is unreliable on this sandbox FS (observed:
-        # UPDATE matching COUNT(*)=1 rows but applying 0 changes across
-        # connections).  DELETE mode commits straight into the main file.
-        self._conn.execute("PRAGMA journal_mode=DELETE")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+
+    def _conn(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA journal_mode=DELETE")
+            con.execute("PRAGMA synchronous=NORMAL")
+            con.execute("PRAGMA busy_timeout=8000")
+        except Exception:
+            pass
+        return con
 
     def exec(self, sql: str, params: Iterable[Any] = ()) -> None:
         with self._lock:
-            self._conn.execute(sql, tuple(params))
-            self._conn.commit()
+            con = self._conn()
+            try:
+                con.execute(sql, tuple(params))
+                con.commit()
+            finally:
+                con.close()
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
         with self._lock:
-            cur = self._conn.execute(sql, tuple(params))
-            return [dict(r) for r in cur.fetchall()]
+            con = self._conn()
+            try:
+                cur = con.execute(sql, tuple(params))
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                con.close()
 
     def one(self, sql: str, params: Iterable[Any] = ()) -> Optional[dict]:
         rows = self.query(sql, params)
@@ -44,12 +66,15 @@ class DB:
 
     def executemany(self, sql: str, rows: list[tuple]) -> None:
         with self._lock:
-            self._conn.executemany(sql, rows)
-            self._conn.commit()
+            con = self._conn()
+            try:
+                con.executemany(sql, rows)
+                con.commit()
+            finally:
+                con.close()
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        pass   # stateless — nothing to close
 
 
 # ---------------------------------------------------------------- singletons

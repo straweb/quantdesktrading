@@ -295,6 +295,7 @@ Fixed ₹ source:   usable = f(mode) − deployed
 |---|---|
 | **PROFIT_ONLY** | first trade uses the full initial capital; afterwards only accumulated **net profit** |
 | **INITIAL_PLUS_PNL** | initial capital **+ realized P&L** (compounding) |
+| **LIVE_BALANCE** | deploys the **full live broker balance** as reported by the funds API — net of margin used by open positions, including realized + unrealized P&L. Falls back to Initial + PnL until the first funds snapshot |
 | **INITIAL_WITH_LOSS_REDUCTION** | initial capital **− every loss incl. charges**; profits never add back |
 
 - `deployed` = margin locked in open positions — always subtracted.
@@ -319,4 +320,5 @@ Fixed ₹ source:   usable = f(mode) − deployed
 | Option quotes empty after feed restart | The universe guard republishes 850+ symbols automatically; if you restarted the feed manually, wait one watchdog cycle or restart the Next process. |
 | Live broker returns 401 | Session expired — re-run **Admin → Accounts → Session** for that account. |
 | Orders rejected "insufficient capital" | House rules — that account's usable capital is ₹0 (e.g. PROFIT_ONLY after losses). Adjust in the capital chip popover. |
+| "Save the App Key…" / login URL shows `{api_key}` | The broker session needs the app credentials first — the Session dialog shows an inline save form (or use pencil → credentials); the login URL substitutes the key the moment it is saved. Pasting the session code then auto-syncs master contracts and connects the account |
 | Can't see ITM/OTM on quick-add buttons | Open an F&O workspace first — labels come from the live option-chain sync. |

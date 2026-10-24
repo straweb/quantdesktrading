@@ -38,8 +38,11 @@ st, r = call("POST", "/accounts", {
     "credentials": {"apiKey": "R24TESTKEY123456", "apiSecret": "R24secretABCD"},
     "initialCapital": 250000, "capitalMode": "INITIAL_PLUS_PNL"})
 aid = r.get("id"); created.append(aid)
-con = sqlite3.connect(DB)
-creds = json.loads(con.execute("SELECT credentials FROM accounts WHERE id=?", (int(aid),)).fetchone()[0])
+def dbq(sql, params=()):
+    return sqlite3.connect(DB).execute(sql, params).fetchone()
+
+con = None  # stateless reads via dbq()
+creds = json.loads(dbq("SELECT credentials FROM accounts WHERE id=?", (int(aid),))[0])
 results.append(check("camelCase creds normalized on CREATE",
                      creds.get("api_key") == "R24TESTKEY123456" and "apiKey" not in creds, json.dumps(creds)))
 
@@ -52,11 +55,11 @@ results.append(check("ICICI login URL api_key substituted",
 st, r = call("POST", "/accounts", {"broker": "breeze", "label": "R24 merge", "mode": "live", "initialCapital": 100000})
 aid2 = r.get("id"); created.append(aid2)
 st, r = call("PATCH", f"/accounts/{aid2}", {"credentialsMerge": {"api_key": "MERGEKEY999", "api_secret": "mergesecret"}})
-creds = json.loads(con.execute("SELECT credentials FROM accounts WHERE id=?", (int(aid2),)).fetchone()[0])
+creds = json.loads(dbq("SELECT credentials FROM accounts WHERE id=?", (int(aid2),))[0])
 results.append(check("PATCH credentialsMerge persists (was silently dropped)",
                      creds.get("api_key") == "MERGEKEY999" and creds.get("api_secret") == "mergesecret", json.dumps(creds)))
 st, r = call("PATCH", f"/accounts/{aid2}", {"credentialsMerge": {"api_secret": "••••cret"}})
-creds = json.loads(con.execute("SELECT credentials FROM accounts WHERE id=?", (int(aid2),)).fetchone()[0])
+creds = json.loads(dbq("SELECT credentials FROM accounts WHERE id=?", (int(aid2),))[0])
 results.append(check("masked echo keeps stored secret", creds.get("api_secret") == "mergesecret", json.dumps(creds)))
 st, r = call("GET", f"/broker-auth?accountId={aid2}")
 results.append(check("merged key visible in login URL", "api_key=MERGEKEY999" in (r.get("loginUrl") or ""), r.get("loginUrl")))
@@ -124,7 +127,7 @@ results.append(check("bulk apply ok (>=1 modified, 1 created)", st == 200 and r.
                      and cnt.get("modified", 0) >= 1 and cnt.get("created") == 1, json.dumps(cnt)))
 new_id = next((d.get("id") for d in r.get("detail", []) if d.get("action") == "created"), None)
 created.append(new_id)
-creds = json.loads(con.execute("SELECT credentials FROM accounts WHERE id=?", (int(new_id),)).fetchone()[0])
+creds = json.loads(dbq("SELECT credentials FROM accounts WHERE id=?", (int(new_id),))[0])
 results.append(check("bulk create normalizes creds", creds.get("api_key") == "BULK123_U", json.dumps(creds)))
 cur = call("GET", "/accounts")[1]["accounts"]
 renamed = next((a for a in cur if a["id"] == aid), {})
@@ -143,6 +146,6 @@ ids_now = [a["id"] for a in call("GET", "/accounts")[1]["accounts"]]
 results.append(check("deleteMissing wipes everything except listed sim",
                      cnt.get("deleted", 0) >= 4 and ids_now == [sim_id], f"cnt={cnt} ids={ids_now}"))
 
-con.close()
+
 failed = results.count(False)
 print(f"\n=== {len(results) - failed}/{len(results)} passed ===")
