@@ -49,6 +49,8 @@ dev.out.log
 test
 prompt
 
+__pycache__/
+
 server.log
 # Skills directory
 /skills/
