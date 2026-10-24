@@ -266,6 +266,8 @@ export const api = {
   patchAccount: (id: string, body: Record<string, unknown>) =>
     fetchJson<{ ok: boolean }>(`/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteAccount: (id: string) => fetchJson<{ ok: boolean }>(`/accounts/${id}`, { method: 'DELETE' }),
+  accountsBulk: (accounts: unknown[], deleteMissing: boolean) =>
+    fetchJson<BulkApplyResp>('/accounts/bulk', { method: 'POST', body: JSON.stringify({ accounts, deleteMissing }) }, 0),
 
   copyTrade: () => fetchJson<{ config: CopyTradeCfg }>('/copytrade'),
   patchCopyTrade: (body: Record<string, unknown>) =>
@@ -389,6 +391,8 @@ export const api = {
     fetchJson<{ ok: boolean; loginUrl?: string; message: string }>('/broker-auth', { method: 'POST', body: JSON.stringify({ accountId, action: 'consent' }) }),
   brokerAuthComplete: (accountId: string, code: string) =>
     fetchJson<{ ok: boolean; message: string }>('/broker-auth', { method: 'POST', body: JSON.stringify({ accountId, action: 'complete', code }) }),
+  brokerIpSync: (accountId: string) =>
+    fetchJson<{ ok: boolean; message: string }>('/broker-auth', { method: 'POST', body: JSON.stringify({ accountId, action: 'syncIp' }) }),
   marginCalc: (body: { accountId: string; symbol: string; side: string; qty: number; price: number; productType?: string }) =>
     fetchJson<MarginResp>('/margin', { method: 'POST', body: JSON.stringify(body) }),
 }
@@ -419,6 +423,13 @@ export interface PortfolioResp {
   ts: string
 }
 
+/** Bulk apply result (POST /accounts/bulk). */
+export interface BulkApplyResp {
+  ok: boolean
+  counts: { created: number; modified: number; deleted: number; errors: number }
+  detail: { row: number | null; id?: string; ok: boolean; action?: string; label?: string; error?: string }[]
+}
+
 /** Broker session-auth flow descriptor (GET /broker-auth). */
 export interface BrokerAuthStatus {
   accountId: string
@@ -432,6 +443,8 @@ export interface BrokerAuthStatus {
   mode: string
   loginUrl: string | null
   instructions: string[]
+  serverIp?: string | null
+  ipInfo?: { registered: string[]; flags?: string[]; matches?: boolean | null; error?: string } | null
   fieldsNeeded: string[]
   credFields: { key: string; label: string; masked: string | null; sample: string }[]
 }

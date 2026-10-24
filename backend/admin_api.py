@@ -1107,6 +1107,75 @@ async def broker_orderbook(accountId: str, authorization: str = Header(default="
 
 
 # ================================================================== broker session auth descriptor
+_PUB_IP = {"ip": "", "ts": 0.0}
+
+
+# ---------------------------------------------------------- credential read view
+# Rows saved before the Round-24 write-path normalization may hold camelCase
+# keys — fold aliases into snake_case for every auth-flow read.
+_CRED_READ_ALIASES = {
+    "apiKey": "api_key", "AppKey": "api_key", "appId": "api_key",
+    "apiSecret": "api_secret", "appSecret": "api_secret", "secretKey": "api_secret",
+    "userId": "user_id", "clientId": "client_id", "pinTotp": "pin_totp",
+}
+
+
+def _creds_view(creds: dict) -> dict:
+    out = dict(creds or {})
+    for a, k in _CRED_READ_ALIASES.items():
+        if a in out and k not in out:
+            out[k] = out[a]
+    return out
+
+
+# Dhan auto-consent cache (the Session dialog polls GET /broker-auth every 15s —
+# never hammer generate-consent per poll; consents expire in minutes anyway)
+_DHAN_CONSENT_CACHE: dict = {}   # aid -> (ts, consent_login_url)
+
+
+async def _public_ip() -> str:
+    """Server's outbound public IP (10-min cache) — Dhan binds API access to
+    whitelisted static IPs, so the dialog shows this for one-click syncing."""
+    if _PUB_IP["ip"] and time.time() - _PUB_IP["ts"] < 600:
+        return _PUB_IP["ip"]
+    import httpx
+    for url in ("https://api.ipify.org?format=json", "https://checkip.amazonaws.com"):
+        try:
+            async with httpx.AsyncClient(timeout=8) as cx:
+                r = await cx.get(url)
+                if r.status_code != 200:
+                    continue
+                ip = (r.json().get("ip", "") if "ipify" in url else r.text.strip())
+                if ip and len(ip) <= 45:
+                    _PUB_IP.update(ip=ip, ts=time.time())
+                    return ip
+        except Exception:
+            continue
+    return _PUB_IP["ip"]
+
+
+def _ipify_ips(obj) -> list:
+    """Defensively extract {ip, flag} pairs from the Dhan getIP response."""
+    out, seen = [], set()
+
+    def walk(o, flag_hint=""):
+        if isinstance(o, dict):
+            ip_val = None
+            for k, v in o.items():
+                if isinstance(v, str) and v.count(".") == 3 and all(p.isdigit() for p in v.split(".")):
+                    ip_val, fl = v, (k if k.lower() in ("primary", "secondary", "ipflag") else flag_hint)
+                elif isinstance(v, (dict, list)):
+                    walk(v, fl if k == "ipFlag" and isinstance(k, str) else flag_hint)
+            if ip_val and ip_val not in seen:
+                seen.add(ip_val)
+                out.append({"ip": ip_val, "flag": (flag_hint or "PRIMARY").upper()})
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, flag_hint)
+    walk(obj)
+    return out
+
+
 @router.get("/broker-auth")
 async def broker_auth_status(accountId: str, authorization: str = Header(default="")):
     uid(authorization)
@@ -1114,9 +1183,8 @@ async def broker_auth_status(accountId: str, authorization: str = Header(default
     acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
     if not acc:
         raise HTTPException(404, "account not found")
-    import json as _json
     try:
-        creds = _json.loads(acc["credentials"] or "{}")
+        creds = _creds_view(json.loads(acc["credentials"] or "{}"))
     except Exception:
         creds = {}
     sess = db.core().one("SELECT session_token FROM broker_sessions WHERE account_id=?", (aid,))
@@ -1125,27 +1193,72 @@ async def broker_auth_status(accountId: str, authorization: str = Header(default
         "breeze": [("api_key", "App Key", "••••", "your-breeze-app-key"),
                    ("api_secret", "App Secret", "••••", "your-breeze-app-secret")],
         "dhan": [("client_id", "Dhan Client ID", "", "e.g. 1101234567"),
-                 ("pin_totp", "PIN:TOTP", "", "123456:987654")],
-        "shoonya": [("api_key", "API Key (user)", "", "e.g. 123456_U"),
-                    ("api_secret", "API Secret", "••••", "your-shoonya-secret")],
+                 ("pin_totp", "PIN:TOTP (optional)", "", "123456:987654"),
+                 ("api_key", "DhanHQ App ID (for consent flow)", "••••", "your-dhan-app-id"),
+                 ("api_secret", "DhanHQ App Secret (for consent flow)", "••••", "your-dhan-app-secret")],
+        "shoonya": [("api_key", "API Key (client_id)", "", "e.g. FA12345_U"),
+                    ("api_secret", "API Secret", "••••", "your-shoonya-secret"),
+                    ("user_id", "User ID (login id, optional)", "", "e.g. FA12345")],
     }
     spec = field_specs.get(broker, [("api_key", "API Key", "", "")])
     cred_fields = []
     for key, label, _m, sample in spec:
         masked = ("••••" + creds[key][-4:]) if creds.get(key) else None
         cred_fields.append({"key": key, "label": label, "masked": masked, "sample": sample})
+    # login URLs — REAL urls with the saved keys substituted (was: docs
+    # index.json for breeze, literal {client_id} for shoonya)
+    breeze_key = (creds.get("api_key") or "").strip()
+    shoonya_client = (creds.get("api_key") or "").strip()
     login_urls = {
-        "breeze": "https://api.icicidirect.com/breezeapi/index.json",
-        "shoonya": f"https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id={{client_id}}",
+        "breeze": ("https://api.icicidirect.com/apiuser/login?api_key=" + breeze_key)
+                  if breeze_key else "https://api.icicidirect.com/apiuser/login?api_key={api_key}",
+        "shoonya": ("https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=" + shoonya_client)
+                   if shoonya_client else "https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id={client_id}",
         "dhan": "https://auth.dhan.co/login?consoleType=web",
     }
     instructions = {
-        "breeze": ["Open the Breeze apiuser login URL", "After redirect copy ?apisession= value",
-                   "Paste it as the session code below"],
-        "dhan": ["Save credentials first", "Press Generate consent", "Complete the Dhan login, paste the redirect tokenId"],
-        "shoonya": ["Open the OAuth URL with your client_id", "Login and copy the ?code= from the redirect",
-                    "Paste the FRESH code below (single-use)"],
+        "breeze": ["Open the ICICI apiuser login URL — your App Key is pre-filled",
+                   "Log in; the redirect URL contains ?apisession=…",
+                   "Paste that value below — it is exchanged and validated immediately",
+                   "On success the master contracts auto-sync (first login of the day) and the account connects"],
+        "dhan": ["Fastest: paste PIN:TOTP below (e.g. 123456:987654) — the access token is generated server-side",
+                 "Consent flow: save App ID + App Secret — the consent login URL is generated automatically above; log in and paste the redirect tokenId",
+                 "Dhan API calls only work from whitelisted static IPs — check the server IP below and sync it if it differs"],
+        "shoonya": ["Open the OAuth URL — your client_id is pre-filled",
+                    "Log in; copy the ?code= from the redirect (single-use + short-lived: always use a FRESH one)",
+                    "Paste it below — GenAcsTok checksum variants are tried automatically and logged",
+                    "No browser? Paste pwd:factor2(:totp) — e.g. mypass:ABCD1234E"],
     }
+    # dhan: server IP + registered IPs (SEBI static-IP rule) + AUTO-CONSENT —
+    # when App ID + App Secret are saved, generate the consentApp-login URL so
+    # the dialog shows the REAL API login link (was: static web login URL).
+    server_ip = ""
+    ip_info = None
+    if broker == "dhan":
+        server_ip = await _public_ip()
+        if sess and sess["session_token"]:
+            try:
+                from backend.brokers import registry as _reg
+                adapter = _reg.get_adapter(acc, creds)
+                adapter.session = {"access_token": sess["session_token"],
+                                   "client_id": creds.get("client_id", "")}
+                ips = _ipify_ips(await adapter.ip_get())
+                ip_info = {"registered": [e["ip"] for e in ips],
+                           "flags": [e["flag"] for e in ips],
+                           "matches": (server_ip in [e["ip"] for e in ips]) if ips and server_ip else None}
+            except Exception as e:
+                ip_info = {"registered": [], "matches": None, "error": str(e)[:120]}
+        if creds.get("api_key") and creds.get("api_secret"):
+            cached = _DHAN_CONSENT_CACHE.get(aid)
+            if cached and time.time() - cached[0] < 120:
+                login_urls["dhan"] = cached[1]
+            else:
+                try:
+                    res = await _mk_adapter(acc, creds).generate_consent()
+                    login_urls["dhan"] = res["login_url"]
+                    _DHAN_CONSENT_CACHE[aid] = (time.time(), res["login_url"])
+                except Exception as e:
+                    config.log("dhan", f"auto-consent on GET failed: {e}", "WARN")
     return {
         "accountId": str(aid), "label": acc["label"], "brokerType": acc["broker"].upper(),
         "sessionKind": "daily", "hasSession": bool(sess and sess["session_token"]),
@@ -1153,9 +1266,293 @@ async def broker_auth_status(accountId: str, authorization: str = Header(default
         "userId": creds.get("user_id") or creds.get("client_id"),
         "liveCapable": acc["broker"] != "sim", "mode": acc["mode"],
         "loginUrl": login_urls.get(broker), "instructions": instructions.get(broker, []),
+        "serverIp": server_ip or None, "ipInfo": ip_info,
         "fieldsNeeded": [c["key"] for c in cred_fields if not creds.get(c["key"])],
         "credFields": cred_fields,
     }
+
+
+# ------------------------------------------------------------------ POST /broker-auth
+# {accountId, action: 'consent'|'complete'|'syncIp', code?}
+#   consent  — dhan: generate-consent (app_id+app_secret) -> consentApp login URL;
+#              other brokers: echo the (pre-filled) login URL.
+#   complete — exchange the pasted code for a session, validate it, persist it:
+#              breeze  : apisession -> customerdetails -> b64 session
+#              dhan    : PIN:TOTP -> generateAccessToken | tokenId -> consumeApp-consent | raw JWT
+#              shoonya : OAuth code -> GenAcsTok (checksum families) | "pwd:factor2(:totp)" -> QuickAuth
+#   syncIp   — dhan only: read registered IPs; register (setIP) or update
+#              (modifyIP) THIS server's public IP when it differs.
+@router.post("/broker-auth")
+async def broker_auth_post(body: dict, authorization: str = Header(default="")):
+    uid(authorization)
+    action = (body.get("action") or "").strip().lower()
+    if not action:
+        raise HTTPException(400, "action required (consent | complete | syncIp)")
+    aid = int(body.get("accountId"))
+    acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+    if not acc:
+        raise HTTPException(404, "account not found")
+    try:
+        creds = _creds_view(json.loads(acc["credentials"] or "{}"))
+    except Exception:
+        creds = {}
+    broker = acc["broker"].lower()
+
+    if action == "syncip":
+        return await _dhan_sync_ip(aid, acc, creds, broker)
+    if action == "consent":
+        return await _auth_consent(aid, acc, creds, broker)
+    if action == "complete":
+        code = (body.get("code") or "").strip()
+        if not code:
+            raise HTTPException(400, "code required — paste the redirect value (or PIN:TOTP / pwd:factor2)")
+        if broker == "shoonya":
+            res = await _shoonya_complete(aid, acc, creds, code)
+        elif broker == "dhan":
+            res = await _dhan_complete(aid, acc, creds, code)
+        elif broker == "breeze":
+            res = await _breeze_complete(aid, acc, creds, code)
+        else:
+            raise HTTPException(400, f"broker '{broker}' has no interactive auth flow")
+        if res.get("ok"):
+            # first-login-of-the-day housekeeping: master contract refresh +
+            # token-map reload + best-effort hub connect (feed + funds live)
+            await _post_session_success(aid, acc, broker)
+        return res
+    raise HTTPException(400, f"unknown action '{action}'")
+
+
+async def _post_session_success(aid: int, acc: dict, broker: str) -> None:
+    """Runs after a broker session is created: auto-sync the master contracts
+    (fresh symbol list every trading day — the user should never have to press
+    Sync after the first login), reload the token maps, and connect the account
+    so the feed + funds go live without a manual step."""
+    try:
+        from backend import masters
+        await masters.sync_account(dict(acc), trigger="session")
+        masters._reload_token_maps(broker)
+    except Exception as e:
+        config.log("broker-auth", f"post-session master sync failed: {e}", "WARN")
+    try:
+        hub = Hub.instance()
+        if not hub.adapters.get(aid):
+            row = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+            if row:
+                try:
+                    creds = json.loads(row["credentials"] or "{}")
+                except Exception:
+                    creds = {}
+                await hub.connect_account(dict(row), creds)
+                config.log("broker-auth", f"account#{aid} ({broker}) auto-connected after session create")
+    except Exception as e:
+        config.log("broker-auth", f"post-session auto-connect failed: {e}", "WARN")
+
+
+def _merge_creds(acc: dict, extra: dict) -> None:
+    try:
+        cur = json.loads(acc["credentials"] or "{}")
+    except Exception:
+        cur = {}
+    cur.update(extra)
+    db.core().exec("UPDATE accounts SET credentials=? WHERE id=?", (json.dumps(cur), acc["id"]))
+
+
+def _mk_adapter(acc: dict, creds: dict):
+    from backend.brokers import registry as _reg
+    return _reg.get_adapter(acc, creds)
+
+
+async def _auth_consent(aid: int, acc: dict, creds: dict, broker: str) -> dict:
+    if broker == "dhan":
+        adapter = _mk_adapter(acc, creds)
+        res = await adapter.generate_consent()
+        return {"ok": True, "loginUrl": res["login_url"],
+                "message": f"Consent created ({str(res['consentAppId'])[:12]}…) — log in and paste the redirect tokenId"}
+    # other brokers have a static login URL — surface it
+    if broker == "breeze":
+        key = (creds.get("api_key") or "").strip()
+        return {"ok": bool(key), "loginUrl": "https://api.icicidirect.com/apiuser/login?api_key=" + key if key else None,
+                "message": "Save the App Key first" if not key else "Open the login URL and paste the redirect apisession"}
+    if broker == "shoonya":
+        cid = (creds.get("api_key") or "").strip()
+        return {"ok": bool(cid), "loginUrl": "https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=" + cid if cid else None,
+                "message": "Save the API Key (client_id) first" if not cid else "Open the OAuth URL and paste the redirect code"}
+    return {"ok": False, "message": "consent flow not applicable"}
+
+
+async def _breeze_complete(aid: int, acc: dict, creds: dict, code: str) -> dict:
+    if not creds.get("api_key"):
+        return {"ok": False, "message": "Save the App Key on the account first — use the form above "
+                                       "(or pencil → credentials); the apisession is validated against it"}
+    adapter = _mk_adapter(acc, {**creds, "session_token": code})
+    try:
+        sess = await adapter.authenticate()
+    except Exception as e:
+        return {"ok": False, "message": f"Breeze rejected the apisession: {str(e)[:180]}"}
+    msg = f"Breeze session active (user={sess.get('user_id', '?')}) — persisted; master contracts syncing"
+    if not creds.get("api_secret"):
+        msg += " — ⚠ App Secret still missing: save it (pencil → credentials) or quotes/orders/funds will fail"
+    return {"ok": True, "message": msg}
+
+
+async def _dhan_complete(aid: int, acc: dict, creds: dict, code: str) -> dict:
+    import re as _re
+    adapter = _mk_adapter(acc, creds)
+    m = _re.match(r"^(\d{4,8})\s*:\s*(\d{6})$", code)
+    errs: list[str] = []
+    if m:  # PIN:TOTP — direct server-side generation, no browser
+        try:
+            res = await adapter.generate_token_from_pin_totp(m.group(1), m.group(2))
+            return {"ok": True, "message": f"Dhan access token generated (expiry {res.get('expiry') or 'daily'})"}
+        except Exception as e:
+            errs.append(f"PIN:TOTP flow: {str(e)[:140]}")
+    if creds.get("api_key") and creds.get("api_secret"):
+        try:  # app-consent tokenId
+            await adapter.consume_consent(code)
+            return {"ok": True, "message": "Dhan access token created via consent flow — persisted"}
+        except Exception as e:
+            errs.append(f"consent flow: {str(e)[:140]}")
+    # raw JWT paste from web.dhan.co — validate against the funds API
+    probe = _mk_adapter(acc, creds)
+    probe.session = {"access_token": code, "client_id": creds.get("client_id", "")}
+    if await probe.validate_session():
+        from backend import session_store
+        session_store.save(aid, "dhan", code, None, {"client_id": creds.get("client_id", "")})
+        return {"ok": True, "message": "Dhan session active (pasted access token) — persisted"}
+    errs.append("raw token: funds check failed")
+    hint = " Format hint: PIN:TOTP looks like 123456:987654." if not m else ""
+    return {"ok": False, "message": "Dhan rejected the token — " + " | ".join(errs) + "." + hint}
+
+
+async def _shoonya_complete(aid: int, acc: dict, creds: dict, code: str) -> dict:
+    """Port of the legacy Node flow (brokers/shoonya/auth.ts) — documented
+    checksum variant FIRST, fallbacks after, every attempt logged."""
+    import hashlib
+    import httpx
+    import re as _re
+    client_id = (creds.get("api_key") or "").strip()
+    secret = (creds.get("api_secret") or "").strip()
+    uid_ = (creds.get("user_id") or creds.get("uid") or
+            (client_id.split("_")[0] if client_id else "")).strip()
+    tried: list[str] = []
+
+    def _persist(token: str, vc_used: str = "", qa: tuple | None = None) -> None:
+        from backend import session_store
+        session_store.save(aid, "shoonya", token, None, {"uid": uid_, "actid": uid_})
+        extra: dict = {"uid": uid_}
+        if vc_used:
+            extra["vendor_code"] = vc_used
+        if qa:  # pwd, factor2, totp — enables programmatic auto-renew
+            extra["password"], extra["totp"] = qa[0], qa[2] or ""
+        _merge_creds(acc, extra)
+
+    async with httpx.AsyncClient(timeout=15) as cx:
+        # ---- QuickAuth shorthand: "pwd:factor2(:totp)" --------------------
+        if ":" in code and not code.lower().startswith("jdata"):
+            parts = [s.strip() for s in code.split(":")]
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                pwd, factor2 = parts[0], parts[1]
+                totp = parts[2] if len(parts) > 2 else ""
+                if not uid_:
+                    return {"ok": False, "message": "QuickAuth needs the account User ID — edit the account and save it"}
+                appkey = hashlib.sha256(f"{uid_}|{secret}".encode()).hexdigest()
+                for vc, vlabel in ((f"{uid_}_U", "vc=uid_U"), (client_id, "vc=client_id")):
+                    if not vc:
+                        continue
+                    payload = {"apkversion": "1.0.0", "uid": uid_, "pwd": pwd, "factor2": factor2,
+                               "vc": vc, "appkey": appkey, "imei": "abc1234", "source": "WEB"}
+                    if totp:
+                        payload["totp"] = totp
+                    r = await cx.post("https://api.shoonya.com/NorenWClientTP/QuickAuth",
+                                      content=f"jData={json.dumps(payload)}",
+                                      headers={"Content-Type": "text/plain"})
+                    try:
+                        d = r.json()
+                    except Exception:
+                        d = {}
+                    tried.append(f"QuickAuth {vlabel} → {d.get('emsg') or d.get('stat') or 'HTTP ' + str(r.status_code)}")
+                    if d.get("stat") == "Ok" and d.get("susertoken"):
+                        _persist(d["susertoken"], vc, (pwd, factor2, totp))
+                        return {"ok": True, "message": f"Shoonya session active (QuickAuth {vlabel}) — persisted"}
+                return {"ok": False, "message": "QuickAuth failed — " + " | ".join(tried[-2:]) +
+                        ". Format: pwd:factor2(:totp), e.g. mypass:ABCD1234E"}
+        # ---- OAuth GenAcsTok (single-use redirect code) --------------------
+        if not client_id or not secret:
+            return {"ok": False, "message": "Save api_key (client_id) + api_secret on the account first — "
+                                           "use the form above (or pencil → credentials), then paste a FRESH code"}
+        # family A — NorenWClientAPI/GenAcsTok {code, checksum}
+        for label, checksum in (
+            ("sha256(client_id+secret+code)", hashlib.sha256(f"{client_id}{secret}{code}".encode()).hexdigest()),
+            ("sha256(code+secret)", hashlib.sha256(f"{code}{secret}".encode()).hexdigest()),
+            ("sha256(secret+code)", hashlib.sha256(f"{secret}{code}".encode()).hexdigest()),
+        ):
+            r = await cx.post("https://api.shoonya.com/NorenWClientAPI/GenAcsTok",
+                              content=f"jData={json.dumps({'code': code, 'checksum': checksum})}",
+                              headers={"Content-Type": "text/plain"})
+            try:
+                d = r.json()
+            except Exception:
+                d = {}
+            tried.append(f"API {label} → {d.get('emsg') or d.get('stat') or 'HTTP ' + str(r.status_code)}")
+            tok = d.get("access_token") or d.get("susertoken")
+            if d.get("stat") == "Ok" and tok:
+                _persist(tok, client_id)
+                return {"ok": True, "message": f"Shoonya session active (GenAcsTok — {label}) — persisted"}
+            if _re.search(r"invalid\s*code|expired|no data", str(d.get("emsg") or ""), _re.I):
+                break  # the code itself is bad — checksums won't help
+        # family B — NorenWClientTP/GenAcsTok full jData (legacy docs shape)
+        if uid_:
+            appkey = hashlib.sha256(f"{uid_}|{secret}".encode()).hexdigest()
+            for label, verifier in (
+                ("sha256(code+secret)", hashlib.sha256(f"{code}{secret}".encode()).hexdigest()),
+                ("sha256(secret+code)", hashlib.sha256(f"{secret}{code}".encode()).hexdigest()),
+                ("sha256(secret+uid+code)", hashlib.sha256(f"{secret}{uid_}{code}".encode()).hexdigest()),
+                ("sha256(code)", hashlib.sha256(code.encode()).hexdigest()),
+            ):
+                payload = {"apkversion": "1.0.0", "uid": uid_, "pwd": verifier, "factor2": "",
+                           "vc": client_id, "appkey": appkey, "imei": "abc1234"}
+                r = await cx.post("https://api.shoonya.com/NorenWClientTP/GenAcsTok",
+                                  content=f"jData={json.dumps(payload)}",
+                                  headers={"Content-Type": "text/plain"})
+                try:
+                    d = r.json()
+                except Exception:
+                    d = {}
+                tried.append(f"TP {label} → {d.get('emsg') or d.get('stat') or 'HTTP ' + str(r.status_code)}")
+                tok = d.get("access_token") or d.get("susertoken")
+                if d.get("stat") == "Ok" and tok:
+                    _persist(tok, client_id)
+                    return {"ok": True, "message": f"Shoonya session active (GenAcsTok — {label}) — persisted"}
+                if _re.search(r"invalid\s*code|expired|no data", str(d.get("emsg") or ""), _re.I):
+                    break
+    config.log("shoonya", f"GenAcsTok failed for account#{aid} — {' | '.join(tried)}", "ERROR")
+    return {"ok": False, "message": "GenAcsTok failed — " + " | ".join(tried[-3:]) +
+            ". The redirect code is single-use: open the OAuth URL again for a FRESH code, or use QuickAuth (paste pwd:factor2)"}
+
+
+async def _dhan_sync_ip(aid: int, acc: dict, creds: dict, broker: str) -> dict:
+    if broker != "dhan":
+        raise HTTPException(400, "IP sync applies to Dhan accounts only")
+    sess = db.core().one("SELECT session_token FROM broker_sessions WHERE account_id=?", (aid,))
+    if not sess or not sess["session_token"]:
+        return {"ok": False, "message": "Create the Dhan session first — IP APIs need the access token"}
+    server_ip = await _public_ip()
+    if not server_ip:
+        return {"ok": False, "message": "Could not detect the server public IP — set it manually at web.dhan.co → DhanHQ Trading APIs"}
+    adapter = _mk_adapter(acc, creds)
+    adapter.session = {"access_token": sess["session_token"], "client_id": creds.get("client_id", "")}
+    try:
+        registered = _ipify_ips(await adapter.ip_get())
+        if not registered:
+            await adapter.ip_set(server_ip, "PRIMARY")
+            return {"ok": True, "message": f"No IP registered yet — server IP {server_ip} set as PRIMARY"}
+        if any(e["ip"] == server_ip for e in registered):
+            return {"ok": True, "message": f"Server IP {server_ip} is already whitelisted in Dhan"}
+        primary = next((e for e in registered if "primary" in e["flag"].lower()), registered[0])
+        await adapter.ip_modify(server_ip, primary["flag"])
+        return {"ok": True, "message": f"Dhan IP updated: {primary['ip']} → {server_ip} ({primary['flag']}). Note: Dhan locks IP edits for 7 days."}
+    except Exception as e:
+        return {"ok": False, "message": f"IP sync failed: {str(e)[:180]} — set it manually at web.dhan.co (static-IP rule, 7-day edit lock)"}
 
 
 # ================================================================== FNO session simulator

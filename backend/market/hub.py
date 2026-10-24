@@ -195,6 +195,17 @@ class Hub:
     async def connect_account(self, account: dict, credentials: Optional[dict] = None) -> dict:
         from backend.brokers.registry import get_adapter, get_stream_cls
         aid = account["id"]
+        # Round-24: normalize credential keys (camelCase stored rows → snake_case)
+        # so every adapter sees api_key/api_secret/client_id/... regardless of the
+        # spelling the UI saved.
+        try:
+            from backend.api.rest import _normalize_creds, _normalize_creds_row
+            credentials = _normalize_creds(dict(credentials or {}))
+            _stored = account.get("credentials")
+            if isinstance(_stored, str) and _stored:
+                account = {**account, "credentials": _normalize_creds_row(_stored)}
+        except Exception:
+            pass
         if aid in self.adapters:
             await self.disconnect_account(aid, keep_session=True)
         adapter = get_adapter(account, credentials)
@@ -798,6 +809,14 @@ class Hub:
             return max(0.0, initial + max(0.0, realized))
         if mode == "INITIAL_WITH_LOSS_REDUCTION":
             return max(0.0, initial + min(0.0, realized))
+        if mode == "LIVE_BALANCE":
+            # FULL broker balance — whatever the broker reports as available
+            # right now (already net of margin used by open positions and
+            # including realized + unrealized PnL).  Falls back to the
+            # INITIAL_PLUS_PNL math until the first funds snapshot lands.
+            live = self._account_cash(acc["id"])
+            if live is not None:
+                return max(0.0, live)
         return max(0.0, initial + realized)
 
     def _account_cash(self, account_id: int) -> Optional[float]:
@@ -888,7 +907,8 @@ class Hub:
                 "deployed": round(deployed, 2), "mode": acc["capital_mode"] or "INITIAL_PLUS_PNL",
                 "modeLabel": {"PROFIT_ONLY": "Profit only",
                               "INITIAL_PLUS_PNL": "Initial + PnL",
-                              "INITIAL_WITH_LOSS_REDUCTION": "Initial − losses"}.get(acc["capital_mode"] or "", "Initial + PnL"),
+                              "INITIAL_WITH_LOSS_REDUCTION": "Initial − losses",
+                              "LIVE_BALANCE": "Broker balance"}.get(acc["capital_mode"] or "", "Initial + PnL"),
                 "firstTradeDone": bool(acc["first_trade_done"]),
                 "openPositions": open_pos, "openOrders": open_ord,
                 "clientId": None, "modeLabel2": None,

@@ -21,7 +21,11 @@ class DB:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # Round-24: journal_mode=DELETE (rollback journal) — WAL's mmap-backed
+        # -shm/-wal coordination is unreliable on this sandbox FS (observed:
+        # UPDATE matching COUNT(*)=1 rows but applying 0 changes across
+        # connections).  DELETE mode commits straight into the main file.
+        self._conn.execute("PRAGMA journal_mode=DELETE")
         self._conn.execute("PRAGMA synchronous=NORMAL")
 
     def exec(self, sql: str, params: Iterable[Any] = ()) -> None:

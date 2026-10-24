@@ -23,6 +23,7 @@ export type CapitalMode =
   | 'PROFIT_ONLY' // house: 1st trade full initial, then only profits
   | 'INITIAL_PLUS_PNL' // initial + realized pnl (compounding)
   | 'INITIAL_WITH_LOSS_REDUCTION' // only initial; losses incl. charges reduce it
+  | 'LIVE_BALANCE' // FULL broker available balance (incl. pnl margin)
 
 export const CAPITAL_MODES: Record<CapitalMode, { label: string; detail: string }> = {
   PROFIT_ONLY: {
@@ -36,6 +37,10 @@ export const CAPITAL_MODES: Record<CapitalMode, { label: string; detail: string 
   INITIAL_WITH_LOSS_REDUCTION: {
     label: 'Initial (loss reducing)',
     detail: 'Only initial capital is deployable. Every loss incl. brokerage/charges/tax permanently reduces it. Profits do not increase it.',
+  },
+  LIVE_BALANCE: {
+    label: 'Broker balance — full',
+    detail: 'Deploys the FULL available broker balance as reported live (net of margin used by open positions, includes realized + unrealized PnL). Falls back to Initial + PnL until the first funds snapshot.',
   },
 }
 

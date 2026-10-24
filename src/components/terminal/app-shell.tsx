@@ -27,6 +27,7 @@ const MODE_SHORT: Record<CapitalMode, string> = {
   PROFIT_ONLY: 'Profit only',
   INITIAL_PLUS_PNL: 'Initial + PnL',
   INITIAL_WITH_LOSS_REDUCTION: 'Initial − losses',
+  LIVE_BALANCE: 'Broker balance',
 }
 
 function fmtCompact(n: number | null | undefined): string {

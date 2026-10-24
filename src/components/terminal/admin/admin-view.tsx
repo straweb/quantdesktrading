@@ -6,11 +6,12 @@ import { toast } from 'sonner'
 import { KeyRound, RefreshCw, Trash2, Download, Radio, ShieldAlert, ShieldCheck, X, Pencil, Stethoscope, FlaskConical, Dices, Play, Pause, Square, Calculator, RotateCcw, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { api, fmtInr, fmtDateTime } from '../lib/client-api'
-import type { BrokerTestResp, AccountRow, CopyTradeCfg, FnoSimResp, SyncInfoResp, ChargesResp, ChargeSchedule, ChargeSegment } from '../lib/client-api'
+import type { BrokerTestResp, BulkApplyResp, AccountRow, CopyTradeCfg, FnoSimResp, SyncInfoResp, ChargesResp, ChargeSchedule, ChargeSegment } from '../lib/client-api'
 import { useSyncChannel, type SyncCore, type SyncAdmin } from '../lib/sync'
 import { useTerminal } from '../lib/store'
 import { BROKER_API_NAME, BROKER_META, CAPITAL_MODES } from '@/lib/types'
@@ -892,8 +893,10 @@ function AccountsManager() {
           <h3 className="text-sm font-semibold">Broker Accounts</h3>
           <p className="text-[11px] text-muted-foreground">Add N accounts of any broker · mark ONE as live data source · enable the set that receives orders</p>
         </div>
-        <Dialog open={dlgOpen} onOpenChange={setDlgOpen}>
-          <DialogTrigger asChild><Button size="sm" className="text-xs">+ Add Account</Button></DialogTrigger>
+        <div className="flex items-center gap-2">
+          <BulkAccountsDialog accounts={accounts} />
+          <Dialog open={dlgOpen} onOpenChange={setDlgOpen}>
+            <DialogTrigger asChild><Button size="sm" className="text-xs">+ Add Account</Button></DialogTrigger>
           <DialogContent className="bg-popover">
             <DialogHeader><DialogTitle>Add Broker Account</DialogTitle></DialogHeader>
             <div className="space-y-3 text-xs">
@@ -943,6 +946,7 @@ function AccountsManager() {
             </div>
           </DialogContent>
         </Dialog>
+        </div>
       </div>
       <div className="divide-y divide-border">
         {accounts.map(a => (
@@ -980,7 +984,7 @@ function AccountsManager() {
               />
             </div>
             <div className="flex items-center gap-1 ml-auto">
-              <ModeSelect id={a.id} current={a.modeLabel} />
+              <ModeSelect id={a.id} current={a.mode} />
               <ChargesDialog accountId={a.id} label={a.label} brokerType={a.brokerType} />
               {a.brokerType !== 'SIMFEED' && <EditAccountDialog accountId={a.id} brokerType={a.brokerType} />}
               {a.brokerType !== 'SIMFEED' && <SessionDialog accountId={a.id} label={a.label} brokerType={a.brokerType} />}
@@ -1199,6 +1203,108 @@ function ChargesDialog({ accountId, label, brokerType }: { accountId: string; la
   )
 }
 
+// ---------------- Bulk accounts via JSON (Round-24) ----------------
+// A textarea prefilled with the CURRENT accounts — edit in place and Apply:
+//  · row WITH id        → modify (label / mode / credentials-merge / capital)
+//  · row WITHOUT id     → add
+//  · "_delete": true    → delete that row
+//  · "delete missing"   → also delete every account absent from the JSON
+// Masked secrets (••••xxxx) round-trip safely — the backend keeps the stored
+// value for any masked/empty field.
+function BulkAccountsDialog({ accounts }: { accounts: AccountRow[] }) {
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [deleteMissing, setDeleteMissing] = useState(false)
+  const [result, setResult] = useState<BulkApplyResp | null>(null)
+
+  const prefill = () => {
+    const rows = accounts.map(a => {
+      const extra = a as AccountRow & { modeLabel2?: string | null; credentials?: Record<string, string> }
+      return {
+        id: a.id,
+        label: a.label,
+        broker: BROKER_API_NAME[a.brokerType as BrokerType] ?? String(a.brokerType ?? '').toLowerCase(),
+        mode: extra.modeLabel2 ?? 'live',
+        credentials: extra.credentials ?? {},
+        initialCapital: a.initialCapitalFixed ?? null,
+        capitalPct: a.capitalPct ?? 100,
+        capitalMode: a.mode,
+      }
+    })
+    setText(JSON.stringify(rows, null, 2))
+    setResult(null)
+  }
+
+  useEffect(() => { if (open) prefill() /* eslint-disable-line react-hooks/exhaustive-deps */ }, [open])
+
+  const apply = async () => {
+    let parsed: unknown
+    try { parsed = JSON.parse(text) } catch (e) { toast.error(`Invalid JSON — ${(e as Error).message}`); return }
+    if (!Array.isArray(parsed)) { toast.error('Top level must be a JSON array [ … ]'); return }
+    setBusy(true)
+    try {
+      const r = await api.accountsBulk(parsed, deleteMissing)
+      setResult(r)
+      if (r.ok) toast.success(`Applied — ${r.counts.created} added · ${r.counts.modified} modified · ${r.counts.deleted} deleted`)
+      else toast.error(`${r.counts.errors} row(s) failed — check the details below`)
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Bulk apply failed') }
+    setBusy(false)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm" variant="secondary" className="text-xs" title="Add / modify / delete many accounts at once from JSON">
+          Bulk JSON
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="bg-popover max-w-3xl">
+        <DialogHeader><DialogTitle>Bulk accounts — JSON</DialogTitle></DialogHeader>
+        <div className="space-y-2.5 text-xs">
+          <div className="text-[10px] text-muted-foreground leading-snug">
+            Prefilled with the CURRENT accounts — edit and Apply. Row with <code>id</code> → <b>modify</b> ·
+            without <code>id</code> → <b>add</b> · <code>&quot;_delete&quot;: true</code> → <b>delete</b> ·
+            masked secrets (<code>••••xxxx</code>) keep the stored value · <code>initialCapital: null</code> →
+            % of broker available cash · <code>capitalMode</code>: PROFIT_ONLY | INITIAL_PLUS_PNL |
+            INITIAL_WITH_LOSS_REDUCTION | LIVE_BALANCE · <code>broker</code>: sim | breeze | dhan | shoonya.
+          </div>
+          <Textarea value={text} onChange={e => setText(e.target.value)}
+            className="font-mono text-[10.5px] leading-snug min-h-[300px] bg-[#0b0e14]" spellCheck={false} />
+          <div className="flex flex-wrap items-center gap-3">
+            <Button size="sm" className="h-8 text-xs" onClick={apply} disabled={busy || !text.trim()}>
+              {busy ? 'Applying…' : 'Apply changes'}
+            </Button>
+            <Button size="sm" variant="secondary" className="h-8 text-xs" onClick={prefill} disabled={busy}>
+              Reset to current
+            </Button>
+            <label className="flex items-center gap-1.5 text-[10px] text-[#ff7a7a] cursor-pointer select-none">
+              <Switch checked={deleteMissing} onCheckedChange={setDeleteMissing} className="scale-[0.8]" />
+              Delete accounts MISSING from this JSON
+            </label>
+          </div>
+          {result && (
+            <div className="rounded border border-border p-2 space-y-1 max-h-40 overflow-y-auto">
+              <div className="text-[10px] text-muted-foreground">
+                +{result.counts.created} added · {result.counts.modified} modified · {result.counts.deleted} deleted · {result.counts.errors} failed
+              </div>
+              {result.detail.map((d, i) => (
+                <div key={i} className="text-[10px] flex items-center gap-1.5">
+                  <span className={d.ok ? 'term-up' : 'term-down'}>{d.ok ? '✓' : '✗'}</span>
+                  <span className="text-muted-foreground">row {d.row ?? '—'}</span>
+                  <span>{d.action ?? ''}{d.label ? ` — ${d.label}` : ''}{d.error ? ` — ${d.error}` : ''}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ---------------- Edit account (credentials + ids) ----------------
 // Round-10: modify user id / client id / api key / secret at any time —
 // masked placeholders show what is stored; only filled fields change
@@ -1284,6 +1390,9 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
   const [open, setOpen] = useState(false)
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
+  const [consentUrl, setConsentUrl] = useState<string | null>(null)
+  const [credVals, setCredVals] = useState<Record<string, string>>({})
+  const [savingCreds, setSavingCreds] = useState(false)
   const qc = useQueryClient()
   const { data: st } = useQuery({
     queryKey: ['broker-auth', accountId],
@@ -1294,11 +1403,29 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
   const isDhan = brokerType === 'DHAN'
   const isShoonya = brokerType === 'SHOONYA'
   const isIcici = brokerType === 'ICICI_BREEZE'
+  // credentials not saved yet on this account — show the inline save form so
+  // the paste-never-works dead end ("Save the App Key first") cannot happen
+  const missingFields = (st?.credFields ?? []).filter(f => st?.fieldsNeeded.includes(f.key))
 
-  const run = async (fn: () => Promise<{ ok: boolean; message: string }>) => {
+  const saveCreds = async () => {
+    const merge: Record<string, string> = {}
+    for (const [k, v] of Object.entries(credVals)) if (v.trim()) merge[k] = v.trim()
+    if (!Object.keys(merge).length) { toast.info('Type the missing values first'); return }
+    setSavingCreds(true)
+    try {
+      await api.patchAccount(accountId, { credentialsMerge: merge })
+      toast.success('Credentials saved — the login URL + paste flow below now work')
+      setCredVals({})
+      qc.invalidateQueries({ queryKey: ['broker-auth', accountId] })
+    } catch (e) { toast.error(e instanceof Error ? e.message : 'Save failed') }
+    setSavingCreds(false)
+  }
+
+  const run = async (fn: () => Promise<{ ok: boolean; loginUrl?: string; message: string }>) => {
     setBusy(true)
     try {
       const r = await fn()
+      if (r.loginUrl) setConsentUrl(r.loginUrl)
       r.ok ? toast.success(r.message) : toast.error(r.message)
       if (r.ok) { setCode(''); qc.invalidateQueries({ queryKey: ['broker-auth', accountId] }) }
     } catch (e) { toast.error(e instanceof Error ? e.message : 'failed') }
@@ -1327,6 +1454,28 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
           <ol className="list-decimal list-inside space-y-0.5 text-[10px] text-muted-foreground">
             {(st?.instructions ?? []).map((s, i) => <li key={i}>{s}</li>)}
           </ol>
+          {missingFields.length > 0 && (
+            <div className="rounded border border-[#f5a623]/40 bg-[#f5a623]/5 p-2 space-y-1.5">
+              <div className="text-[10px] text-[#f5a623] font-medium">
+                Missing credentials — save them here first (or use the pencil edit):
+              </div>
+              {missingFields.map(f => (
+                <div key={f.key} className="flex items-center gap-1.5">
+                  <span className="text-[10px] text-muted-foreground w-[150px] shrink-0" title={f.sample}>{f.label}</span>
+                  <Input
+                    value={credVals[f.key] ?? ''}
+                    onChange={e => setCredVals(v => ({ ...v, [f.key]: e.target.value }))}
+                    className="h-7 text-[11px]"
+                    type={/secret/i.test(f.key) ? 'password' : 'text'}
+                    placeholder={f.sample}
+                  />
+                </div>
+              ))}
+              <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={savingCreds} onClick={saveCreds}>
+                {savingCreds ? 'Saving…' : 'Save credentials'}
+              </Button>
+            </div>
+          )}
           {st?.loginUrl && (
             <div className="flex items-center gap-1.5">
               <a href={st.loginUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#4dd0e1] truncate flex-1" title={st.loginUrl}>
@@ -1335,16 +1484,43 @@ function SessionDialog({ accountId, label, brokerType }: { accountId: string; la
               <Button size="sm" variant="secondary" className="h-6 text-[10px]" onClick={() => { void navigator.clipboard?.writeText(st.loginUrl!); toast.info('Login URL copied') }}>copy</Button>
             </div>
           )}
+          {consentUrl && (
+            <div className="flex items-center gap-1.5">
+              <a href={consentUrl} target="_blank" rel="noreferrer" className="text-[10px] underline text-[#ffb86b] truncate flex-1" title={consentUrl}>
+                {consentUrl}
+              </a>
+              <Button size="sm" variant="secondary" className="h-6 text-[10px]" onClick={() => { void navigator.clipboard?.writeText(consentUrl); toast.info('Consent login URL copied') }}>copy</Button>
+            </div>
+          )}
           {isDhan && (
             <Button size="sm" variant="secondary" className="h-7 text-[10px]" disabled={busy}
               onClick={() => run(() => api.brokerAuthConsent(accountId))}>
               1 · Generate consent (Dhan client id)
             </Button>
           )}
+          {isDhan && st?.serverIp && (
+            <div className="border-t border-border pt-2 space-y-1 text-[10px] text-muted-foreground">
+              <div>
+                Server IP: <b className="text-foreground">{st.serverIp}</b>
+                {st.ipInfo?.registered?.length
+                  ? <> · registered in Dhan: <span className="text-foreground">{st.ipInfo.registered.join(', ')}</span></>
+                  : ' · nothing registered yet'}
+              </div>
+              {st.ipInfo && st.ipInfo.matches === false && (
+                <div className="text-[#ff7a7a]">Mismatch — Dhan API calls fail from non-whitelisted IPs (SEBI static-IP rule).</div>
+              )}
+              {st.ipInfo?.error && <div className="text-[#ffb86b]">IP check: {st.ipInfo.error}</div>}
+              <Button size="sm" variant="secondary" className="h-6 text-[10px]" disabled={busy || !st.hasSession}
+                title={st.hasSession ? 'Set/modify the Dhan-registered IP to this server\u2019s public IP' : 'Create the Dhan session first — IP APIs need the access token'}
+                onClick={() => run(() => api.brokerIpSync(accountId))}>
+                Sync server IP to Dhan
+              </Button>
+            </div>
+          )}
           <div className="space-y-1">
             <div className="text-[10px] text-muted-foreground">
               {isIcici ? '2 · Paste the apisession from the redirect URL'
-                : isDhan ? '3 · Paste the tokenId (or a direct access token)'
+                : isDhan ? '2 · Paste PIN:TOTP, the redirect tokenId, or a direct access token'
                 : isShoonya ? '2 · Paste the code from the redirect URL (or use QuickAuth below)'
                 : 'Paste the session token'}
             </div>

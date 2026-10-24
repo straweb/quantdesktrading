@@ -33,13 +33,13 @@ Two surfaces:
 
 Session flows (per broker, every attempt logged to console + `broker_logs`):
 - **ICICI Breeze** — open the apiuser login URL → redirect `?apisession=` → paste it; the terminal exchanges it at `customerdetails` exactly like the Breeze SDK (GET with a JSON body `{SessionToken, AppKey}` — raw `node:https`, since Node fetch cannot send a GET body).
-- **Dhan** — three flows: ① paste `PIN:TOTP` → `auth.dhan.co/app/generateAccessToken?dhanClientId=&pin=&totp=` returns the accessToken directly; ② partner consent (`partner/generate-consent` → `consent-login?consentId=` → paste the redirect `tokenId` → `partner/consume-consent`); ③ paste a direct JWT from web.dhan.co.
+- **Dhan** — three flows: ① paste `PIN:TOTP` → `auth.dhan.co/app/generateAccessToken?dhanClientId=&pin=&totp=` returns the accessToken directly (server-side, no browser); ② app consent (`app/generate-consent` → `login/consentApp-login?consentAppId=` → paste the redirect `tokenId` → `app/consumeApp-consent`); ③ paste a direct JWT from web.dhan.co. **Static IP (SEBI rule):** Dhan API calls only work from whitelisted IPs — the Session dialog shows this server's public IP and offers one-click `v2/ip/setIP` / `v2/ip/modifyIP` sync (7-day edit lock applies).
 - **Shoonya** — official OAuth `https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id={client_id}` → redirect `?code=` → paste; GenAcsTok checksum families are tried in order (`{code, checksum}` on NorenWClientAPI, full jData verifiers on NorenWClientTP) and every attempt is logged. QuickAuth alternative: paste `pwd:factor2(:totp)`.
 
 | Method & path | Description |
 |---|---|
-| `GET /api/broker-auth` | auth status + flow descriptor + login URL + masked `credFields` (samples + stored values) for the Edit dialog; includes persisted `sessionCreatedAt/sessionExpiresAt` + `autoRenew` |
-| `POST /api/broker-auth` | `{accountId, action:'consent'\|'complete', code?}` — consent / session creation (flows above). Completed sessions are stored ENCRYPTED in the master DB with expiry metadata — refresh/restart re-uses them |
+| `GET /api/broker-auth` | auth status + flow descriptor + login URL (real keys substituted: Breeze `apiuser/login?api_key=<key>`, Shoonya `OAuthlogin?client_id=<id>`) + masked `credFields`; Dhan adds `serverIp` + `ipInfo` (registered IPs, match check) |
+| `POST /api/broker-auth` | `{accountId, action:'consent'\|'complete'\|'syncIp', code?}` — consent (Dhan generate-consent → consentApp login URL, echoed to the dialog) / session creation (flows above; exchange attempts logged) / Dhan IP sync (`getIP` → `setIP` when none, `modifyIP` when the server IP differs). Completed sessions are persisted in `broker_sessions` — refresh/restart re-uses them |
 | `GET /api/broker-sessions` | persisted session status per live account: `{hasSession, connected, validatedAt, expiresAt, autoRenew, renewing, lastAction, error}` — validated against the broker (funds probe, 5-min throttle) and auto-renewed where the stored credentials allow (Shoonya QuickAuth) |
 | `POST /api/broker-sessions` | `{accountId?}` — force-validate one account (or all) now |
 | `POST /api/broker-test` | `{accountId}` — 4-step connectivity test: credentials → adapter mode → funds ₹ → quote LTP (timed, each underlying call logged) |

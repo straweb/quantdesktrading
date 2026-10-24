@@ -116,6 +116,17 @@ fi
 
 # --- 1. Python backend (REST + WS) ------------------------------------------
 echo "[start] starting Python backend (REST :8000, WS :8001)…"
+# restart-safety: kill ANY leftover process still on the backend ports — a
+# previous `timeout`-killed start.sh can orphan uvicorn, and two backends
+# racing on :8000 makes every other request hit a stale-code/stale-DB zombie
+for port in 8000 8001; do
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${port}/tcp" >/dev/null 2>&1 || true
+  else
+    pkill -f "backend.main" >/dev/null 2>&1 || true
+  fi
+done
+sleep 1
 nohup "$PYBIN" -m backend.main > logs/backend.log 2>&1 &
 echo $! > run/backend.pid
 

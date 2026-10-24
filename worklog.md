@@ -187,3 +187,22 @@ Stage Summary:
 - Verified standalone: findMany/create-without-id/delete all pass; relations capital/account/logs/mappings/master pass with real data (SHOONYA + ICICI_BREEZE @ $500000).
 - E2E on restarted stack: login admin OK → /api/accounts, /api/strategies, /api/funds all return real data; background services ticking clean; tsc 0 errors; 0 runtime errors in dev.log.
 - DB backup at db/custom.db.backup-20261024-0519 (can be deleted once confident).
+
+---
+Task ID: 23
+Agent: main
+Task: Broker login fixes — ICICI/Dhan/Shoonya login URLs + 405 on POST /broker-auth + Dhan static-IP sync
+
+Work Log:
+- User-reported: ① ICICI login URL showed breezeapi/index.json (docs URL) instead of apiuser/login; ② Dhan showed bare auth.dhan.co/login?consoleType=web, wanted the documented flow + IP handling; ③ Shoonya showed literal {client_id} placeholder; ④ pasting any session code → 405 Method Not Allowed on POST /pyapi/broker-auth.
+- ROOT CAUSE of 405: POST /broker-auth route was MISSING from the Python backend (only GET existed — lost in the workspace restore). Frontend client-api.ts POSTs {accountId, action:'consent'|'complete'} → FastAPI 405.
+- Fixed GET /broker-auth login URLs (admin_api.py): Breeze → https://api.icicidirect.com/apiuser/login?api_key=<SAVED KEY>; Shoonya → OAuthlogin/authorize/oauth?client_id=<SAVED KEY> (substituted from stored credentials, placeholder only when unset); Dhan keeps console URL but instructions now lead with the PIN:TOTP direct flow.
+- Implemented POST /broker-auth in Python (ported from legacy Node brokers/*/auth.ts): action=consent (Dhan generate-consent → consentApp-login URL, echoed to dialog), action=complete per broker — Breeze: apisession → customerdetails → b64 session persisted; Dhan: PIN:TOTP → generateAccessToken (new DhanAdapter.generate_token_from_pin_totp) | tokenId → consumeApp-consent | raw JWT probe; Shoonya: OAuth code → GenAcsTok family A ({code,checksum} on NorenWClientAPI, 3 checksum variants) then family B (full jData on NorenWClientTP, 4 verifier variants), or QuickAuth shorthand "pwd:factor2(:totp)" (vc variants) — qa credentials persisted for auto-renew. Every attempt logged.
+- Dhan static-IP feature (per dhanhq.co/docs/v2/authentication): server public IP detection (ipify + amazonaws fallback, 10-min cache) shown in the Session dialog for Dhan accounts; getIP read → match check → one-click sync action (setIP when nothing registered, modifyIP when different, 7-day edit-lock surfaced). New DhanAdapter methods ip_get/ip_set/ip_modify.
+- Frontend: client-api.ts brokerIpSync + BrokerAuthStatus.serverIp/ipInfo types; SessionDialog renders consent login URL (amber link + copy), Dhan server-IP section (registered IPs, mismatch warning, Sync button), updated paste hints.
+- Dhan Edit-dialog field spec extended with App ID + App Secret (consent flow was unusable without them).
+- docs/API.md broker-session section + endpoint table updated.
+
+Stage Summary:
+- E2E verified with throwaway accounts (created + deleted, only sim remains): Shoonya GET loginUrl = ...oauth?client_id=FA12345_U (real substitution); Breeze GET loginUrl = .../apiuser/login?api_key=testbreezekey123; POST complete fake codes hit the REAL broker APIs and return friendly per-flow JSON errors (Shoonya GenAcsTok variants logged, Breeze customerdetails "Request Object is Null", Dhan generateAccessToken "Unauthorized Request" — all ok:false, never 405); syncIp without session → clear guard message.
+- py_compile OK; tsc 0 errors; eslint 0 errors (3 pre-existing warnings).

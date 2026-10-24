@@ -178,8 +178,10 @@ def _ist_now_parts() -> tuple[str, int]:
 
 
 async def daystart_loop() -> None:
-    """Every 5 min: after 08:00 IST, sync every connected broker account that
-    has not been synced yet today (new symbols list every day)."""
+    """Every 5 min: after 08:00 IST, sync every broker account that has not
+    been synced yet today (new symbols list every day).  Covers CONNECTED
+    accounts AND accounts that merely hold a session (first login of the day
+    must pull the fresh master contract even before the account is connected)."""
     from backend.market.hub import Hub
     _ensure_table()
     done_date: dict[int, str] = {}
@@ -188,7 +190,12 @@ async def daystart_loop() -> None:
             today, hhmm = _ist_now_parts()
             if hhmm >= 800:
                 hub = Hub.instance()
-                for aid in list(hub.adapters):
+                aids = {int(a) for a in hub.adapters}
+                for r in db.core().query(
+                        "SELECT DISTINCT account_id FROM broker_sessions "
+                        "WHERE session_token IS NOT NULL AND session_token <> ''"):
+                    aids.add(int(r["account_id"]))
+                for aid in sorted(aids):
                     acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
                     if not acc or acc["broker"] == "sim":
                         continue

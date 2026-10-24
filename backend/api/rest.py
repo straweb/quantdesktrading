@@ -37,10 +37,133 @@ def _uid(authorization: str = "") -> dict:
 
 
 # ================================================================== health
+@app.post("/pyapi/_diag_patch/{account_id}")
+async def _diag_patch(account_id: int, body: dict, authorization: str = Header(default="")):
+    """TEMP: invoke patch_account logic directly (POST route) — isolates the
+    handler logic from the PATCH dispatch."""
+    return await patch_account(account_id, body, authorization=authorization)
+
+
+@app.get("/pyapi/_diag")
+async def _diag_sqlite(authorization: str = Header(default="")):
+    """TEMP Round-24: sqlite write-behaviour matrix inside the live process."""
+    import sqlite3 as _sq
+    import time as _t
+    out: dict = {}
+    base = db.core()
+    # ensure a target row
+    now = _t.time()
+    r = base._conn.execute(
+        "INSERT INTO accounts(broker,label,mode,credentials,created_at,updated_at) "
+        "VALUES('breeze','DIAGM','live','{}',?,?)", (now, now))
+    rid = r.lastrowid
+    base._conn.commit()
+    out["created_id"] = rid
+
+    def upd(tag, conn, sql, params=(), commit=True):
+        try:
+            cur = conn.execute(sql, params)
+            rc = cur.rowcount
+            if commit:
+                conn.commit()
+            back = conn.execute("SELECT credentials FROM accounts WHERE id=?", (rid,)).fetchone()[0]
+            out[tag] = {"rowcount": rc, "readback": back}
+        except Exception as e:
+            out[tag] = {"error": str(e)[:120]}
+
+    # 1 standard singleton
+    upd("1_singleton", base._conn,
+        "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":1}', rid))
+    # 2 fresh plain
+    c2 = _sq.connect(base.path)
+    upd("2_fresh_plain", c2, "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":2}', rid))
+    c2.close()
+    # 3 fresh + DELETE pragma
+    c3 = _sq.connect(base.path)
+    c3.execute("PRAGMA journal_mode=DELETE")
+    upd("3_fresh_delete", c3, "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":3}', rid))
+    c3.close()
+    # 4 literal sql
+    upd("4_literal", base._conn,
+        f"UPDATE accounts SET credentials='{{\"v\":4}}' WHERE id={rid}")
+    # 5 autocommit connection
+    c5 = _sq.connect(base.path, isolation_level=None)
+    upd("5_autocommit", c5, "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":5}', rid), commit=False)
+    c5.close()
+    # 6 INSERT OR REPLACE whole row
+    row = base.one("SELECT * FROM accounts WHERE id=?", (rid,))
+    base._conn.execute(
+        "INSERT OR REPLACE INTO accounts(id,broker,label,mode,credentials,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?)", (rid, row["broker"], row["label"], row["mode"],
+                                  '{"v":6}', row["created_at"], _t.time()))
+    base._conn.commit()
+    out["6_insert_replace"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
+    # 7 delete+reinsert
+    base._conn.execute("DELETE FROM accounts WHERE id=?", (rid,))
+    base._conn.commit()
+    base._conn.execute(
+        "INSERT INTO accounts(id,broker,label,mode,credentials,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?)", (rid, row["broker"], row["label"], row["mode"],
+                                  '{"v":7}', row["created_at"], _t.time()))
+    base._conn.commit()
+    out["7_del_reinsert"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
+    # 8-11: EXACT patch_account shapes
+    now = _t.time()
+    upd("8_conn_creds_updatedat", base._conn,
+        "UPDATE accounts SET credentials=?, updated_at=? WHERE id=?",
+        ('{"v":8}', now, rid))
+    upd("9_exec_wrapper", base._conn,
+        "UPDATE accounts SET credentials=?, updated_at=? WHERE id=?",
+        ('{"v":9}', now, rid))
+    base.exec("UPDATE accounts SET credentials=?, updated_at=? WHERE id=?",
+              ('{"v":10}', _t.time(), rid))
+    out["10_base_exec"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
+    base.exec("UPDATE accounts SET credentials='{\"v\":11}' WHERE id=" + str(rid))
+    out["11_base_exec_literal"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
+    upd("12_two_stmts", base._conn,
+        "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":12}', rid))
+    # 13: update a row created by an EARLIER HTTP request (e.g. TWIN2/TWIN3)
+    old_row = base.one("SELECT id, credentials FROM accounts WHERE label LIKE 'TWIN%' ORDER BY id DESC LIMIT 1")
+    if old_row:
+        upd("13_cross_request_row", base._conn,
+            "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":13}', old_row["id"]))
+    # 14: create + update in THIS request (same-request control)
+    now = _t.time()
+    r2 = base._conn.execute(
+        "INSERT INTO accounts(broker,label,mode,credentials,created_at,updated_at) "
+        "VALUES('breeze','DIAGM2','live','{}',?,?)", (now, now))
+    rid2 = r2.lastrowid
+    base._conn.commit()
+    upd("14_same_request_row", base._conn,
+        "UPDATE accounts SET credentials=? WHERE id=?", ('{"v":14}', rid2))
+    base._conn.execute("DELETE FROM accounts WHERE id=?", (rid2,))
+    base._conn.commit()
+    # 16 FIRST (pure function, cannot 401): normalize check
+    out["16_normalize"] = _normalize_creds_row(json.dumps({"api_key": "N16", "apiKey": "N16b"}))
+    # 15: call patch_account DIRECTLY with the caller's REAL token
+    try:
+        pa = await patch_account(rid, {"credentialsMerge": {"api_key": "X15"}}, authorization=authorization)
+        out["15_patch_account"] = pa.get("account", {}).get("credentials")
+        out["15_after_db"] = base.one("SELECT credentials FROM accounts WHERE id=?", (rid,))["credentials"]
+    except Exception as e:
+        out["15_patch_account"] = f"EXC {e}"
+    # cleanup
+    base._conn.execute("DELETE FROM accounts WHERE id=?", (rid,))
+    base._conn.commit()
+    import inspect as _insp
+    import sys as _sys
+    out["_module_file"] = _insp.getfile(_sys.modules[__name__])
+    out["_norm_row_file"] = _insp.getfile(_normalize_creds_row)
+    out["_norm_row_source"] = _insp.getsource(_normalize_creds_row)[:600]
+    out["_patch_account_file"] = _insp.getfile(patch_account)
+    out["journal_main"] = base._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    return out
+
+
 @app.get("/pyapi/health")
 async def health():
     hub = Hub.instance()
-    return {"ok": True, "rest_port": config.REST_PORT, "ws_port": config.WS_PORT,
+    return {"ok": True, "v": 24, "rest_port": config.REST_PORT, "ws_port": config.WS_PORT,
             "mode": hub.trading_mode(), "accounts_connected": len(hub.adapters),
             "brokers": broker_names()}
 
@@ -126,7 +249,72 @@ _BROKER_ALIASES = {
     "dhan": "dhan",
     "shoonya": "shoonya", "finvasia": "shoonya", "noren": "shoonya",
 }
-_CAPITAL_MODES = {"PROFIT_ONLY", "INITIAL_PLUS_PNL", "INITIAL_WITH_LOSS_REDUCTION"}
+_CAPITAL_MODES = {"PROFIT_ONLY", "INITIAL_PLUS_PNL", "INITIAL_WITH_LOSS_REDUCTION", "LIVE_BALANCE"}
+
+# ---------------------------------------------------------------- credential key aliases
+# The Add-Broker UI historically stored camelCase keys (apiKey/apiSecret/appId/
+# userId/clientId…) while every broker auth flow reads snake_case (api_key/
+# api_secret/…) — credentials were saved but INVISIBLE to the auth code (the
+# "Save the App Key + App Secret" guard and the {api_key} login-URL placeholder).
+# Normalize at EVERY write boundary; read paths additionally tolerate both
+# spellings for rows created before this fix.
+_CRED_KEY_ALIASES = {
+    "apiKey": "api_key", "AppKey": "api_key", "appId": "api_key", "appID": "api_key",
+    "apiSecret": "api_secret", "appSecret": "api_secret", "AppSecret": "api_secret",
+    "secretKey": "api_secret", "secret": "api_secret",
+    "userId": "user_id", "UserID": "user_id",
+    "clientId": "client_id", "ClientID": "client_id",
+    "pinTotp": "pin_totp", "pinTOTP": "pin_totp",
+    "vendorCode": "vendor_code", "sessionToken": "session_token",
+    "accessToken": "access_token", "susertoken": "susertoken",
+}
+
+
+def _normalize_creds(creds: dict) -> dict:
+    """Map camelCase credential keys to snake_case; drop empty + masked echoes."""
+    out: dict = {}
+    for k, v in (creds or {}).items():
+        if v is None or v == "" or str(v).startswith("••••"):
+            continue                      # never persist '' or the •••• mask
+        kk = _CRED_KEY_ALIASES.get(k, k)
+        out[kk] = v
+    return out
+
+
+def _normalize_creds_row(row_credentials: str) -> str:
+    """Normalize a stored credentials JSON string (keeps stored real values)."""
+    try:
+        cur = json.loads(row_credentials or "{}")
+    except Exception:
+        cur = {}
+    if not isinstance(cur, dict):
+        return "{}"
+    out: dict = {}
+    for k, v in cur.items():
+        kk = _CRED_KEY_ALIASES.get(k, k)
+        if kk not in out:
+            out[kk] = v
+    return json.dumps(out)
+
+
+def migrate_credential_keys() -> int:
+    """One-time (idempotent) startup migration: rewrite every stored
+    credentials JSON to canonical snake_case keys.  Returns rows changed."""
+    n = 0
+    for r in db.core().query("SELECT id, credentials FROM accounts"):
+        try:
+            cur = json.loads(r["credentials"] or "{}")
+        except Exception:
+            continue
+        if not isinstance(cur, dict) or not cur:
+            continue
+        new = _normalize_creds_row(r["credentials"])
+        if json.loads(new) != cur:
+            db.core().exec("UPDATE accounts SET credentials=? WHERE id=?", (new, r["id"]))
+            n += 1
+    if n:
+        config.log("rest", f"credential-key migration: normalized {n} account(s)")
+    return n
 
 
 class AccountReq(BaseModel):
@@ -152,6 +340,7 @@ class AccountReq(BaseModel):
 
 def _account_req_fields(req: AccountReq) -> dict:
     """Fold canonical + alias fields into one normalized dict."""
+    req.credentials = _normalize_creds(req.credentials)
     broker_raw = (req.broker or req.brokerType or "").strip()
     broker = _BROKER_ALIASES.get(
         broker_raw.lower().replace("-", "_").replace(" ", "_"))
@@ -227,7 +416,8 @@ def _account_row(aid: int) -> dict:
         "realizedPnl": acc["realized_pnl"] or 0, "chargesPaid": acc["charges_paid"] or 0,
         "deployed": 0, "mode": acc["capital_mode"] or "INITIAL_PLUS_PNL",
         "modeLabel": {"PROFIT_ONLY": "Profit only", "INITIAL_PLUS_PNL": "Initial + PnL",
-                      "INITIAL_WITH_LOSS_REDUCTION": "Initial − losses"}.get(acc["capital_mode"] or "", "Initial + PnL"),
+                      "INITIAL_WITH_LOSS_REDUCTION": "Initial − losses",
+                      "LIVE_BALANCE": "Broker balance"}.get(acc["capital_mode"] or "", "Initial + PnL"),
         "firstTradeDone": bool(acc["first_trade_done"]),
         "openPositions": open_pos, "openOrders": open_ord,
         "clientId": creds.get("client_id") or creds.get("user_id"),
@@ -272,6 +462,8 @@ async def create_account(req: AccountReq, authorization: str = Header(default=""
 @app.patch("/pyapi/accounts/{account_id}")
 async def patch_account(account_id: int, body: dict, authorization: str = Header(default="")):
     _uid(authorization)
+    import asyncio as _aio
+    await _aio.sleep(2.0)   # SPY2
     acc = db.core().one("SELECT * FROM accounts WHERE id=?", (account_id,))
     if not acc:
         raise HTTPException(404, "account not found")
@@ -297,20 +489,29 @@ async def patch_account(account_id: int, body: dict, authorization: str = Header
         else:
             if "initialCapital" not in body:
                 raise HTTPException(400, "initialCapital required for FIXED capital base")
-    if "credentials" in body and isinstance(body["credentials"], dict):
-        merged = {}
+    # credentials + credentialsMerge — MERGE into the stored JSON.  Masked
+    # echoes (••••xxxx) and empty strings keep the stored value.  (Round-24:
+    # credentialsMerge was silently dropped here before — the pencil-edit
+    # dialog has been sending it since Round-10, so saved credentials never
+    # reached the broker auth flows.)
+    _new_creds: dict = {}
+    if isinstance(body.get("credentials"), dict):
+        _new_creds.update(body["credentials"])
+    if isinstance(body.get("credentialsMerge"), dict):
+        _new_creds.update(body["credentialsMerge"])
+    if _new_creds:
         try:
-            merged = json.loads(acc["credentials"] or "{}")
+            cur = json.loads(acc["credentials"] or "{}")
+            if not isinstance(cur, dict):
+                cur = {}
         except Exception:
-            pass
-        for k, v in body["credentials"].items():
-            if v not in (None, "") and not str(v).startswith("••••"):
-                merged[k] = v
-            elif str(v).startswith("••••"):
-                continue   # masked echo — keep stored value
-        merged.update({k: v for k, v in body["credentials"].items() if v})
+            cur = {}
+        for k, v in _new_creds.items():
+            if v in (None, "") or str(v).startswith("••••"):
+                continue   # masked echo / empty — keep the stored value
+            cur[k] = v
         sets.append("credentials=?")
-        vals.append(json.dumps(merged))
+        vals.append(_normalize_creds_row(json.dumps(cur)))
     hub = Hub.instance()
     # Data flag — point the market-data source at this account (the UI flag
     # was silently dropped before, so the row-level switch did nothing)
@@ -387,6 +588,163 @@ async def delete_account(account_id: int, authorization: str = Header(default=""
     session_store.clear(account_id)
     db.core().exec("DELETE FROM accounts WHERE id=?", (account_id,))
     return {"ok": True, "deleted": account_id}
+
+
+# ---------------------------------------------------------------- bulk accounts
+# Bulk add / modify / delete from a JSON array — powers the Admin “Bulk JSON”
+# dialog (the textarea is prefilled with the CURRENT accounts so the JSON can
+# be edited in place and applied).
+#
+#   body: {"accounts": [row, ...], "deleteMissing": bool}
+#   row : {"id": "5",              present → modify (absent → create)
+#          "label": “…”, "broker": "breeze|dhan|shoonya|sim",
+#          "mode": "live|sandbox", "credentials": {…},   ← merge into stored
+#          "initialCapital": 500000 | null,              ← null → % of cash
+#          "capitalPct": 100, "capitalMode": "…",
+#          "isActive": true, "isOrderEnabled": true,
+#          "_delete": false}                             ← true → delete row
+@app.post("/pyapi/accounts/bulk")
+async def accounts_bulk(body: dict, authorization: str = Header(default="")):
+    _uid(authorization)
+    rows = body.get("accounts")
+    if not isinstance(rows, list):
+        raise HTTPException(422, "body.accounts must be a JSON array")
+    if len(rows) > 200:
+        raise HTTPException(400, "max 200 accounts per bulk apply")
+    delete_missing = bool(body.get("deleteMissing"))
+    hub = Hub.instance()
+    detail: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            detail.append({"row": i, "ok": False, "error": "row is not an object"})
+            continue
+        rid = str(r.get("id") or "").strip()
+        if r.get("_delete"):
+            if not rid or not rid.isdigit():
+                detail.append({"row": i, "ok": False, "error": "_delete needs a numeric id"})
+                continue
+            acc = db.core().one("SELECT label FROM accounts WHERE id=?", (int(rid),))
+            if not acc:
+                detail.append({"row": i, "id": rid, "ok": False, "error": "account not found"})
+                continue
+            await hub.disconnect_account(int(rid))
+            session_store.clear(int(rid))
+            db.core().exec("DELETE FROM accounts WHERE id=?", (int(rid),))
+            detail.append({"row": i, "id": rid, "ok": True, "action": "deleted",
+                           "label": acc["label"]})
+            continue
+        if rid:
+            seen_ids.add(rid)
+
+    # rows for creates (batched AFTER the loop so ids line up with detail)
+    creates: list[tuple[int, dict]] = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict) or r.get("_delete"):
+            continue
+        rid = str(r.get("id") or "").strip()
+        if rid:
+            continue
+        creates.append((i, r))
+
+    def _after(i: int, ok: bool, **kw) -> dict:
+        d = {"row": i, "ok": ok, **kw}
+        detail.append(d)
+        return d
+
+    # ---- modifies
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict) or r.get("_delete"):
+            continue
+        rid = str(r.get("id") or "").strip()
+        if not rid or not rid.isdigit():
+            continue
+        aid = int(rid)
+        acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+        if not acc:
+            _after(i, False, id=rid, error="account not found")
+            continue
+        patch: dict = {}
+        if r.get("label"):
+            patch["label"] = str(r["label"]).strip()
+        if r.get("mode") in ("live", "sandbox"):
+            patch["mode"] = r["mode"]
+        if isinstance(r.get("credentials"), dict):
+            patch["credentials"] = r["credentials"]
+        if "initialCapital" in r:
+            ic = r.get("initialCapital")
+            if ic in (None, "", 0):
+                # null/0 → switch to %-of-available-cash (clears the fixed amount)
+                patch["capitalBase"] = "AVAILABLE_CASH_PCT"
+            else:
+                patch["initialCapital"] = float(ic)
+        if r.get("capitalPct") is not None:
+            patch["capitalPct"] = float(r["capitalPct"])
+        if r.get("capitalMode"):
+            if r["capitalMode"] not in _CAPITAL_MODES:
+                _after(i, False, id=rid, error=f"unknown capitalMode '{r['capitalMode']}' — "
+                                               f"valid: {', '.join(sorted(_CAPITAL_MODES))}")
+                continue
+            patch["capitalMode"] = r["capitalMode"]
+        if "isActive" in r:
+            patch["isActive"] = bool(r["isActive"])
+        if "isOrderEnabled" in r:
+            patch["isOrderEnabled"] = bool(r["isOrderEnabled"])
+        if not patch:
+            _after(i, True, id=rid, action="unchanged")
+            continue
+        try:
+            await patch_account(aid, patch, authorization=authorization)
+            _after(i, True, id=rid, action="modified", label=patch.get("label") or acc["label"])
+        except HTTPException as e:
+            _after(i, False, id=rid, error=str(e.detail))
+        except Exception as e:
+            _after(i, False, id=rid, error=str(e)[:160])
+
+    # ---- creates
+    for i, r in creates:
+        try:
+            req = AccountReq(
+                broker=str(r.get("broker") or r.get("brokerType") or "").strip() or None,
+                label=str(r.get("label") or "").strip(),
+                mode=r.get("mode") if r.get("mode") in ("live", "sandbox") else None,
+                credentials=r.get("credentials") if isinstance(r.get("credentials"), dict) else {},
+                initialCapital=(None if r.get("initialCapital") in (None, "", 0)
+                                else float(r["initialCapital"])),
+                capitalPct=(float(r["capitalPct"]) if r.get("capitalPct") is not None else None),
+                capitalMode=(r["capitalMode"] if r.get("capitalMode") in _CAPITAL_MODES else None),
+                clientId=str(r["clientId"]) if r.get("clientId") else None,
+            )
+            res = await create_account(req, authorization=authorization)
+            new_id = res.get("id")
+            seen_ids.add(str(new_id))
+            _after(i, True, id=str(new_id), action="created", label=res.get("account", {}).get("label"))
+        except HTTPException as e:
+            _after(i, False, error=str(e.detail))
+        except Exception as e:
+            _after(i, False, error=str(e)[:160])
+
+    # ---- delete-missing (explicit opt-in)
+    deleted_missing: list[str] = []
+    if delete_missing:
+        for row in db.core().query("SELECT id, label FROM accounts ORDER BY id"):
+            sid = str(row["id"])
+            if sid not in seen_ids:
+                await hub.disconnect_account(row["id"])
+                session_store.clear(row["id"])
+                db.core().exec("DELETE FROM accounts WHERE id=?", (row["id"],))
+                deleted_missing.append(f"{sid}:{row['label']}")
+                detail.append({"row": None, "id": sid, "ok": True, "action": "deleted-missing",
+                               "label": row["label"]})
+
+    ok = all(d.get("ok") for d in detail)
+    return {"ok": ok, "counts": {
+                "created": sum(1 for d in detail if d.get("action") == "created"),
+                "modified": sum(1 for d in detail if d.get("action") == "modified"),
+                "deleted": sum(1 for d in detail if d.get("action") in ("deleted", "deleted-missing")),
+                "errors": sum(1 for d in detail if not d.get("ok")),
+            }, "detail": detail}
 
 
 @app.post("/pyapi/accounts/{account_id}/connect")

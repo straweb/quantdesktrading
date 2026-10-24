@@ -35,6 +35,13 @@ async def startup() -> None:
     db.init_schema()
     from backend import auth as auth_mod
     auth_mod.ensure_default_admin()
+    # Round-24: rewrite stored credentials to canonical snake_case keys
+    # (pre-fix rows may hold apiKey/apiSecret/appId — invisible to auth flows)
+    try:
+        from backend.api.rest import migrate_credential_keys
+        migrate_credential_keys()
+    except Exception as _e:
+        config.log("boot", f"credential migration skipped: {_e}", "WARN")
     config.log("boot", f"backend starting — REST:{config.REST_PORT} WS:{config.WS_PORT}")
 
     hub = Hub.instance()

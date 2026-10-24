@@ -99,6 +99,68 @@ class DhanAdapter(BaseBroker):
         config.log("dhan", "access_token obtained via consent flow + persisted")
         return {"status": "connected", "client_id": client_id}
 
+    async def generate_token_from_pin_totp(self, pin: str, totp: str) -> dict:
+        """Direct individual flow (DhanHQ v2 auth docs): POST auth.dhan.co/app/
+        generateAccessToken?dhanClientId=&pin=&totp= -> accessToken — no browser."""
+        client_id = self.credentials.get("client_id", "")
+        async with httpx.AsyncClient(timeout=30) as cx:
+            r = await cx.post(f"{AUTH}/app/generateAccessToken",
+                              params={"dhanClientId": client_id, "pin": pin, "totp": totp},
+                              headers={"Accept": "application/json"})
+            data = r.json() if r.status_code == 200 else {}
+            access = data.get("accessToken", "")
+            if not access:
+                raise BrokerError(f"generateAccessToken failed: HTTP {r.status_code} {str(data)[:200]}")
+        self.session = {"access_token": access, "client_id": client_id}
+        session_store.save(self.account_id, self.name, access, None,
+                           {"client_id": client_id, "expiry": data.get("expiryTime", "")})
+        self.connected = True
+        config.log("dhan", "access_token generated via PIN+TOTP (direct flow)")
+        return {"status": "connected", "client_id": client_id, "expiry": data.get("expiryTime", "")}
+
+    # ------------------------------------------------------------------ static-IP (SEBI rule)
+    # Dhan data/trade APIs answer ONLY from whitelisted static IPs. When the
+    # terminal runs on a different box than the one the user registered, these
+    # helpers read the registered IPs and set/modify them to THIS server's IP.
+    async def ip_get(self) -> dict:
+        async with httpx.AsyncClient(timeout=20) as cx:
+            r = await cx.get(f"{REST}/ip/getIP", headers=self._headers())
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if r.status_code != 200:
+                raise BrokerError(f"getIP failed: HTTP {r.status_code} {str(data)[:160]}")
+            return data
+
+    async def ip_set(self, ip: str, flag: str = "PRIMARY") -> dict:
+        async with httpx.AsyncClient(timeout=20) as cx:
+            r = await cx.post(f"{REST}/ip/setIP", headers=self._headers(),
+                              json={"dhanClientId": self.credentials.get("client_id", ""),
+                                    "ip": ip, "ipFlag": flag})
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if r.status_code != 200:
+                raise BrokerError(f"setIP failed: HTTP {r.status_code} {str(data)[:160]}")
+            config.log("dhan", f"IP {ip} registered as {flag}")
+            return data
+
+    async def ip_modify(self, ip: str, flag: str = "PRIMARY") -> dict:
+        async with httpx.AsyncClient(timeout=20) as cx:
+            r = await cx.put(f"{REST}/ip/modifyIP", headers=self._headers(),
+                             json={"dhanClientId": self.credentials.get("client_id", ""),
+                                   "ip": ip, "ipFlag": flag})
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if r.status_code != 200:
+                raise BrokerError(f"modifyIP failed: HTTP {r.status_code} {str(data)[:160]}")
+            config.log("dhan", f"IP modified to {ip} ({flag})")
+            return data
+
     async def validate_session(self) -> bool:
         try:
             await self.get_funds()
