@@ -1,9 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -13,20 +7,173 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model AdminUser {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         String   @default("admin")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
-model Post {
-  id        String   @id @default(cuid())
-  title     String
-  content   String?
-  published Boolean  @default(false)
-  authorId  String
-  createdAt DateTime @default(now())
+model BrokerAccount {
+  id               String         @id @default(cuid())
+  label            String
+  brokerType       String
+  clientId         String?
+  credentialsEnc   String?
+  status           String         @default("ACTIVE")
+  isActive         Boolean        @default(true)
+  isLiveDataSource Boolean        @default(false)
+  isOrderEnabled   Boolean        @default(false)
+  isCopyMaster     Boolean        @default(false)
+  sortOrder        Int            @default(0)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  capital         CapitalConfig?
+  OrderAudit       OrderAudit[]
+  Strategy         Strategy[]
+}
+
+model CapitalConfig {
+  id             String        @id @default(cuid())
+  accountId      String        @unique
+  initialCapital Float
+  mode           String        @default("INITIAL_PLUS_PNL")
+  capitalBase    String        @default("FIXED")
+  capitalPct     Float         @default(100)
+  realizedPnl    Float         @default(0)
+  chargesPaid    Float         @default(0)
+  deployed       Float         @default(0)
+  firstTradeDone Boolean       @default(false)
+  updatedAt      DateTime      @updatedAt
+  BrokerAccount  BrokerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}
+
+model CopyTradeConfig {
+  id              String   @id @default(cuid())
+  enabled         Boolean  @default(true)
+  masterAccountId String?
+  capitalSharePct Float    @default(100)
+  slippagePct     Float    @default(0.05)
+  roundToLot      Boolean  @default(true)
+  skipFailedLegs  Boolean  @default(true)
+  killSwitch      Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+}
+
+model OrderAudit {
+  id            String         @id @default(cuid())
+  ts            DateTime       @default(now())
+  source        String
+  action        String
+  masterSymbol  String
+  exchange      String
+  side          String
+  qty           Int
+  price         Float?
+  legsJson      String?
+  status        String
+  message       String?
+  accountId     String?
+  account       BrokerAccount? @relation(fields: [accountId], references: [id])
+}
+
+model Strategy {
+  id             String         @id @default(cuid())
+  name           String
+  enabled        Boolean        @default(false)
+  status         String         @default("IDLE")
+  exchange       String         @default("NSE")
+  symbol         String
+  direction      String         @default("LONG")
+  productType    String         @default("MIS")
+  orderType      String         @default("MARKET")
+  limitPrice     Float?
+  qtyMode        String         @default("CAPITAL")
+  fixedQty       Int            @default(1)
+  capitalAmount  Float?
+  capitalMode    String         @default("INITIAL_PLUS_PNL")
+  entryTime      String
+  entryWindowMin Int            @default(10)
+  exitTime       String
+  repeatDays     String         @default("1,2,3,4,5")
+  stopLossPct    Float?
+  targetPct      Float?
+  trailingSlPct  Float?
+  accountId      String?
+  lastRunDate    String?
+  entryOrderId   String?
+  entryPrice     Float?
+  exitOrderId    String?
+  realizedPnl    Float          @default(0)
+  pythonCode     String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  BrokerAccount  BrokerAccount? @relation(fields: [accountId], references: [id])
+  logs          StrategyLog[]
+}
+
+model StrategyLog {
+  id         String   @id @default(cuid())
+  strategyId String
+  ts         DateTime @default(now())
+  level      String   @default("INFO")
+  message    String
+  Strategy   Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  @@index([strategyId, ts])
+}
+
+model SymbolMapping {
+  id           String       @id @default(cuid())
+  masterId     String
+  brokerType   String
+  brokerSymbol String
+  brokerToken  String?
+  multiplier   Int          @default(1)
+  master       SymbolMaster @relation(fields: [masterId], references: [id], onDelete: Cascade)
+
+  @@unique([masterId, brokerType])
+  @@index([brokerType])
+}
+
+model SymbolMaster {
+  id             String          @id @default(cuid())
+  symbol         String
+  name           String
+  exchange       String
+  instrumentType String
+  expiry         String?
+  strike         Float?
+  optionType     String?
+  lotSize        Int             @default(1)
+  tickSize       Float           @default(0.05)
+  underlying     String?
+  basePrice      Float?
+  version        String
+  updatedAt      DateTime        @updatedAt
+  mappings       SymbolMapping[]
+
+  @@unique([symbol, exchange])
+  @@index([symbol])
+  @@index([exchange, instrumentType])
+}
+
+model SyncLog {
+  id          String   @id @default(cuid())
+  source      String
+  exchange    String
+  symbolCount Int
+  mappedCount Int
+  status      String
+  message     String?
+  version     String?
+  createdAt   DateTime @default(now())
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
   updatedAt DateTime @updatedAt
 }

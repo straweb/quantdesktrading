@@ -166,3 +166,24 @@ Work Log:
 
 Stage Summary:
 - Round-21 changes re-verified GREEN on a from-scratch restored environment: old-UI + canonical account payloads → 200 with correct mapping; UI add-broker flow works; stack boots via uv-first start.sh; tsc 0 errors; eslint 0 errors.
+
+---
+Task ID: 22
+Agent: main
+Task: Fix frontend startup crash — "Failed to load external module @prisma/client" → Prisma client/schema recovery
+
+Work Log:
+- Diagnosed start.sh crash: Turbopack couldn't resolve `.prisma/client/default`; instrumentation hook failed → `db` undefined in ALL services (strategy-engine, order-monitor, live-order-sync, /api/* routes 500).
+- Cleared stale .next cache + `npx prisma generate` — module error gone, but `db.*` delegates still undefined: standalone node test showed `p.adminUser === undefined`.
+- ROOT CAUSE: `prisma/schema.prisma` contained ONLY the starter-template User/Post models. The real schema (11 app models) was never committed and was lost in a workspace restore. node_modules reinstall at 04:54 regenerated a template-only client. All 11 app tables + data intact in db/custom.db (47MB).
+- HAZARD identified: db-setup.ts self-heal runs `prisma db push` against the template schema — would have DROPPED all app tables on next trigger. Averted by replacing the template.
+- Backup: db/custom.db.backup-20261024-0519.
+- Reconstructed schema via `npx prisma db pull` (introspection of live SQLite), then restored client-side defaults introspection can't see: `@default(cuid())` on all String id PKs, `@updatedAt` on all updatedAt columns.
+- Renamed 5 relation fields to match code usage: BrokerAccount.capital, OrderAudit.account, Strategy.logs, SymbolMaster.mappings, SymbolMapping.master.
+- start.sh hardened: new "0c" block — if prisma/schema.prisma exists, ensure client generated BEFORE frontend boot; auto `rm -rf .next` when client was missing (stale-cache guard); `npx prisma generate` idempotent on every start (fixes bun/npm postinstall-skip class of failures).
+
+Stage Summary:
+- prisma/schema.prisma fully reconstructed (11 models: AdminUser, BrokerAccount, CapitalConfig, CopyTradeConfig, OrderAudit, Strategy, StrategyLog, SymbolMapping, SymbolMaster, SyncLog, SystemSetting) — MUST be committed to git, it is the single source for the Prisma client.
+- Verified standalone: findMany/create-without-id/delete all pass; relations capital/account/logs/mappings/master pass with real data (SHOONYA + ICICI_BREEZE @ $500000).
+- E2E on restarted stack: login admin OK → /api/accounts, /api/strategies, /api/funds all return real data; background services ticking clean; tsc 0 errors; 0 runtime errors in dev.log.
+- DB backup at db/custom.db.backup-20261024-0519 (can be deleted once confident).

@@ -96,6 +96,24 @@ if [ ! -d node_modules/next ]; then
   echo "[start] dependencies installed"
 fi
 
+# --- 0c. Prisma client must exist BEFORE the dev server boots ---------------
+# A node_modules reinstall (or a postinstall skipped by bun) can leave
+# .prisma/client missing/stale; Turbopack then caches the broken state and
+# every boot after that fails with "Cannot find module '.prisma/client/default'"
+# and db === undefined everywhere. Generate idempotently + wipe the dev cache
+# whenever the client was missing so the cached externals chunk can't be stale.
+if [ -f prisma/schema.prisma ]; then
+  if [ ! -f node_modules/.prisma/client/index.js ]; then
+    echo "[start] Prisma client missing — regenerating + clearing Next.js cache…"
+    rm -rf .next
+  fi
+  if npx prisma generate >> logs/install.log 2>&1; then
+    echo "[start] prisma client ready"
+  else
+    echo "[start] WARNING: prisma generate failed — see logs/install.log (frontend may crash)"
+  fi
+fi
+
 # --- 1. Python backend (REST + WS) ------------------------------------------
 echo "[start] starting Python backend (REST :8000, WS :8001)…"
 nohup "$PYBIN" -m backend.main > logs/backend.log 2>&1 &
