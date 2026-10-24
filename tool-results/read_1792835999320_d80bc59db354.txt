@@ -1,0 +1,1127 @@
+     1→"""
+     2→MarketHub — the single routing point between broker feeds and UI clients
+     3→(OpenAlgo-style: adapters register here; UI never talks to brokers directly).
+     4→
+     5→Responsibilities:
+     6→  - manage connected accounts (adapter + stream client per account)
+     7→  - resolve subscription: unified symbol -> source account -> broker token
+     8→  - fan out ticks/candles to socket.io clients (rooms per interest)
+     9→  - aggregate ticks -> 1m candles (aggregator) with live candle push
+    10→  - enforce global trading mode (LIVE ONLY never attaches sim/sandbox)
+    11→  - drive funds pushes on order/position events (event-driven, never polled)
+    12→  - feed SOURCE management (sim / one broker account) + purge on switch
+    13→  - master-order fanout with per-account capital sizing + trade charges
+    14→"""
+    15→from __future__ import annotations
+    16→
+    17→from typing import Optional
+    18→import asyncio
+    19→import json
+    20→import threading
+    21→import time
+    22→from collections import defaultdict, deque
+    23→
+    24→from backend import config, db
+    25→from backend.market.aggregator import CandleAggregator
+    26→from backend.market.funds import SVC as FUNDS
+    27→
+    28→
+    29→class Hub:
+    30→    _instance: "Optional[Hub]" = None
+    31→    _lock = threading.Lock()
+    32→
+    33→    @classmethod
+    34→    def instance(cls) -> "Hub":
+    35→        with cls._lock:
+    36→            if cls._instance is None:
+    37→                cls._instance = Hub()
+    38→            return cls._instance
+    39→
+    40→    # ------------------------------------------------------------------ init
+    41→    def __init__(self):
+    42→        self.adapters: dict[int, object] = {}          # account_id -> adapter
+    43→        self.streams: dict[int, object] = {}           # account_id -> stream client
+    44→        self.token_map: dict[int, dict] = {}           # account_id -> token -> unified symbol
+    45→        self.symbol_source: dict[str, int] = {}        # symbol -> account_id serving it
+    46→        self.symbol_refs: dict[str, set] = defaultdict(set)   # symbol -> sio sids
+    47→        self.sockets: dict[str, dict] = {}             # sio sid -> {symbols, candle, tf}
+    48→        self.ticks: dict[str, dict] = {}               # unified symbol -> last tick
+    49→        self.agg = CandleAggregator()
+    50→        self.sio = None                                 # socket.io ASGI server (set later)
+    51→        self._push_lock = asyncio.Lock()
+    52→        self._last_pos_push = 0.0
+    53→        self.sim_account_id: Optional[int] = None
+    54→        self.loop: Optional[asyncio.AbstractEventLoop] = None
+    55→        # ---- feed source + health (quantdesk parity) ----
+    56→        self._feed_started_at = time.time()
+    57→        self._last_tick_ts: Optional[float] = None
+    58→        self._last_error: Optional[str] = None
+    59→        self._error_ts: Optional[float] = None
+    60→        self._tick_count = 0
+    61→        self._feed_log: deque[str] = deque(maxlen=60)
+    62→        self._sync_subs: dict[str, dict] = {}          # sid -> {chains, index}
+    63→        self.epoch = 0                                  # bumped on source switch (purge)
+    64→
+    65→    def feed_note(self, msg: str, level: str = "INFO") -> None:
+    66→        self._feed_log.appendleft(f"{time.strftime('%H:%M:%S')} {msg}")
+    67→        if level in ("WARN", "ERROR"):
+    68→            self._last_error = msg
+    69→            self._error_ts = time.time()
+    70→
+    71→    # ------------------------------------------------------------------ settings
+    72→    def trading_mode(self) -> str:
+    73→        row = db.core().one("SELECT value FROM settings WHERE key='trading_mode'")
+    74→        return (row["value"] if row else config.DEFAULT_TRADING_MODE)
+    75→
+    76→    def set_trading_mode(self, mode: str) -> None:
+    77→        db.core().exec("INSERT INTO settings(key,value) VALUES('trading_mode',?) "
+    78→                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (mode,))
+    79→        config.log("hub", f"trading mode set to {mode.upper()}")
+    80→        if self.loop:
+    81→            self.loop.call_soon_threadsafe(
+    82→                lambda: asyncio.ensure_future(self.enforce_mode()))
+    83→
+    84→    # ------------------------------------------------------------------ feed source
+    85→    def feed_source(self) -> str:
+    86→        row = db.core().one("SELECT value FROM settings WHERE key='feed_source'")
+    87→        src = row["value"] if row else "sim"
+    88→        # the stored source account may have been deleted — fall back to sim
+    89→        if src != "sim":
+    90→            try:
+    91→                if int(src) not in self.adapters:
+    92→                    return "sim"
+    93→            except ValueError:
+    94→                return "sim"
+    95→        return src
+    96→
+    97→    def sim_disabled(self) -> bool:
+    98→        row = db.core().one("SELECT value FROM settings WHERE key='sim_disabled'")
+    99→        return (row["value"] if row else "0") == "1"
+   100→
+   101→    def set_sim_disabled(self, flag: bool) -> None:
+   102→        db.core().exec("INSERT INTO settings(key,value) VALUES('sim_disabled',?) "
+   103→                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+   104→                       ("1" if flag else "0",))
+   105→        config.log("hub", f"sim feed {'DISABLED (LIVE-ONLY)' if flag else 'enabled'}")
+   106→        if flag:
+   107→            self._purge_sim_data()
+   108→
+   109→    def feed_sources(self) -> list[dict]:
+   110→        out = [{"id": "sim", "label": "Sim Feed (built-in)", "brokerType": "SIMFEED",
+   111→                "hasSession": not self.sim_disabled()}]
+   112→        for acc in db.core().query("SELECT id,broker,label,mode,status FROM accounts WHERE broker<>'sim' ORDER BY id"):
+   113→            sess = db.core().one("SELECT session_token FROM broker_sessions WHERE account_id=?", (acc["id"],))
+   114→            out.append({"id": str(acc["id"]), "label": acc["label"],
+   115→                        "brokerType": acc["broker"].upper(), "hasSession": bool(sess and sess["session_token"])})
+   116→        return out
+   117→
+   118→    def _purge_sim_data(self) -> None:
+   119→        """Wipe ALL sim-origin market data (ticks + aggregated candles)."""
+   120→        purged = [s for s, t in self.ticks.items() if t.get("source") in ("sim", "simfeed", None)]
+   121→        for s in purged:
+   122→            self.ticks.pop(s, None)
+   123→            self.agg.forget(s)
+   124→        self.epoch += 1
+   125→        config.log("hub", f"purged {len(purged)} sim symbols from tick cache")
+   126→        if self.sio and self.loop:
+   127→            self.loop.call_soon_threadsafe(
+   128→                lambda: asyncio.ensure_future(self._broadcast("feed:epoch", {"epoch": self.epoch})))
+   129→
+   130→    async def set_feed_source(self, source: str) -> dict:
+   131→        """Switch the market-data source. 'sim' or an account id string."""
+   132→        if source != "sim":
+   133→            try:
+   134→                aid = int(source)
+   135→            except ValueError:
+   136→                raise ValueError("source must be 'sim' or an account id")
+   137→            acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+   138→            if not acc:
+   139→                raise ValueError(f"account {source} not found")
+   140→            if self.sim_disabled() and (acc["mode"] == "sandbox" or acc["broker"] == "sim"):
+   141→                raise ValueError("Live-Only mode: sandbox accounts cannot be the data source — create a broker session in Admin → Session")
+   142→            if aid not in self.adapters:
+   143→                raise ValueError("account is not connected — connect it first (Feed chip → link icon)")
+   144→        db.core().exec("INSERT INTO settings(key,value) VALUES('feed_source',?) "
+   145→                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source,))
+   146→        # purge server-side market data so the new source rebuilds from scratch
+   147→        self.ticks.clear()
+   148→        self.agg = CandleAggregator()
+   149→        self.symbol_source.clear()
+   150→        self.epoch += 1
+   151→        self._last_tick_ts = None
+   152→        self.feed_note(f"feed source -> {source}")
+   153→        # re-subscribe every watched symbol under the new source
+   154→        for sid, info in list(self.sockets.items()):
+   155→            for sym in list(info.get("symbols", set())):
+   156→                await self._ensure_source(sym)
+   157→            if info.get("candle"):
+   158→                await self._ensure_source(info["candle"])
+   159→        await self._broadcast("feed:source", {"source": source, "epoch": self.epoch})
+   160→        await self._broadcast("feed:epoch", {"epoch": self.epoch})
+   161→        config.log("hub", f"feed source switched -> {source} (epoch {self.epoch})")
+   162→        return {"ok": True, "source": source}
+   163→
+   164→    def feed_status(self) -> dict:
+   165→        src = self.feed_source()
+   166→        is_live = src != "sim"
+   167→        broker_type = None
+   168→        connected = False
+   169→        session_present = False
+   170→        if is_live:
+   171→            try:
+   172→                aid = int(src)
+   173→            except ValueError:
+   174→                aid = None
+   175→            acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid or 0,))
+   176→            if acc:
+   177→                broker_type = acc["broker"].upper()
+   178→                session_present = bool(db.core().one(
+   179→                    "SELECT session_token FROM broker_sessions WHERE account_id=?", (aid,)))
+   180→                adapter = self.adapters.get(aid or 0)
+   181→                connected = bool(adapter and getattr(adapter, "connected", False))
+   182→        last = self._last_tick_ts
+   183→        fresh = bool(last and (time.time() - last) < 6)
+   184→        return {
+   185→            "source": src, "brokerType": broker_type, "connected": connected if is_live else True,
+   186→            "lastTickTs": int(last * 1000) if last else None,
+   187→            "lastError": self._last_error, "errorTs": int(self._error_ts * 1000) if self._error_ts else None,
+   188→            "symbols": len(self.ticks), "polls": self._tick_count, "errors": 0,
+   189→            "startedAt": int(self._feed_started_at * 1000),
+   190→            "log": list(self._feed_log)[:25],
+   191→            "sessionPresent": session_present, "sourceIsLive": is_live, "fresh": fresh,
+   192→        }
+   193→
+   194→    # ------------------------------------------------------------------ accounts
+   195→    async def connect_account(self, account: dict, credentials: Optional[dict] = None) -> dict:
+   196→        from backend.brokers.registry import get_adapter, get_stream_cls
+   197→        aid = account["id"]
+   198→        # Round-24: normalize credential keys (camelCase stored rows → snake_case)
+   199→        # so every adapter sees api_key/api_secret/client_id/... regardless of the
+   200→        # spelling the UI saved.
+   201→        try:
+   202→            from backend.api.rest import _normalize_creds, _normalize_creds_row
+   203→            credentials = _normalize_creds(dict(credentials or {}))
+   204→            _stored = account.get("credentials")
+   205→            if isinstance(_stored, str) and _stored:
+   206→                account = {**account, "credentials": _normalize_creds_row(_stored)}
+   207→        except Exception:
+   208→            pass
+   209→        if aid in self.adapters:
+   210→            await self.disconnect_account(aid, keep_session=True)
+   211→        adapter = get_adapter(account, credentials)
+   212→        try:
+   213→            await adapter.authenticate()
+   214→        except Exception as e:
+   215→            db.core().exec("UPDATE accounts SET status='error', status_message=? WHERE id=?",
+   216→                           (str(e)[:180], aid))
+   217→            self._broker_log(aid, f"connect failed: {e}", "ERROR")
+   218→            raise
+   219→        # mode enforcement: live mode cannot attach sandbox/sim envs
+   220→        if self.trading_mode() == "live" and account.get("mode") == "sandbox":
+   221→            raise Exception("LIVE ONLY mode is on — this account is configured as sandbox")
+   222→        stream = adapter.make_stream(self._on_broker_tick)
+   223→        self.adapters[aid] = adapter
+   224→        self.streams[aid] = stream
+   225→        self._load_token_map(aid)
+   226→        await stream.start()
+   227→        db.core().exec("UPDATE accounts SET status='connected', status_message='' WHERE id=?", (aid,))
+   228→        self._broker_log(aid, "account connected; feed started")
+   229→        await self._broadcast("account_status", {
+   230→            "account_id": aid, "broker": account["broker"], "status": "connected"})
+   231→        config.log("hub", f"account#{aid} ({account['broker']}) connected; feed started")
+   232→        # default master sync on CONNECT (background — new symbols list daily)
+   233→        if account.get("broker") != "sim":
+   234→            from backend import masters
+   235→            asyncio.ensure_future(masters.auto_sync_on_connect(dict(account)))
+   236→        return {"status": "connected"}
+   237→
+   238→    def _load_token_map(self, aid: int) -> None:
+   239→        broker = db.core().one("SELECT broker FROM accounts WHERE id=?", (aid,))
+   240→        name = broker["broker"] if broker else "sim"
+   241→        try:
+   242→            rows = db.broker_db(name).query("SELECT token,symbol FROM master")
+   243→        except Exception as e:
+   244→            # a broker db without the master table (never synced) must never
+   245→            # blow up the connect path with a 500 — an empty map is fine
+   246→            config.log("hub", f"token map for account#{aid} ({name}): master table unavailable ({e}) — empty map", "WARN")
+   247→            rows = []
+   248→        self.token_map[aid] = {r["token"]: r["symbol"] for r in rows}
+   249→        config.log("hub", f"token map for account#{aid} ({name}): {len(self.token_map[aid])} mappings")
+   250→
+   251→    def _broker_log(self, account_id: int, message: str, level: str = "INFO") -> None:
+   252→        try:
+   253→            db.core().exec("INSERT INTO broker_logs(account_id,ts,level,message) VALUES(?,?,?,?)",
+   254→                           (account_id, time.time(), level, message[:400]))
+   255→        except Exception:
+   256→            pass
+   257→
+   258→    async def disconnect_account(self, account_id: int, keep_session: bool = True) -> None:
+   259→        stream = self.streams.pop(account_id, None)
+   260→        if stream:
+   261→            try:
+   262→                await stream.stop()
+   263→            except Exception:
+   264→                pass
+   265→        adapter = self.adapters.pop(account_id, None)
+   266→        if adapter:
+   267→            try:
+   268→                await adapter.disconnect()
+   269→            except Exception:
+   270→                pass
+   271→        if not keep_session:
+   272→            from backend import session_store
+   273→            session_store.clear(account_id)
+   274→        db.core().exec("UPDATE accounts SET status='disconnected', status_message='' WHERE id=?",
+   275→                       (account_id,))
+   276→        for sym, aid in list(self.symbol_source.items()):
+   277→            if aid == account_id:
+   278→                self.symbol_source.pop(sym, None)
+   279→        await self._broadcast("account_status", {
+   280→            "account_id": account_id, "status": "disconnected"})
+   281→        config.log("hub", f"account#{account_id} disconnected")
+   282→
+   283→    def account_adapter(self, account_id: int):
+   284→        return self.adapters.get(account_id)
+   285→
+   286→    async def enforce_mode(self) -> None:
+   287→        """Drop sim/sandbox attachments when LIVE ONLY."""
+   288→        mode = self.trading_mode()
+   289→        if mode != "live":
+   290→            return
+   291→        for aid, adapter in list(self.adapters.items()):
+   292→            acc = db.core().one("SELECT mode FROM accounts WHERE id=?", (aid,))
+   293→            if acc and acc["mode"] == "sandbox":
+   294→                config.log("hub", f"LIVE ONLY: detaching sandbox account#{aid}", "WARN")
+   295→                await self.disconnect_account(aid)
+   296→        await self._broadcast("mode", {"mode": mode})
+   297→
+   298→    # ------------------------------------------------------------------ default sim account
+   299→    def ensure_sim_account(self) -> int:
+   300→        row = db.core().one("SELECT * FROM accounts WHERE broker='sim' ORDER BY id LIMIT 1")
+   301→        if row:
+   302→            self.sim_account_id = row["id"]
+   303→            return row["id"]
+   304→        now = time.time()
+   305→        db.core().exec(
+   306→            "INSERT INTO accounts(broker,label,mode,credentials,created_at,updated_at) "
+   307→            "VALUES('sim','Simulated Feed','sandbox','{}',?,?)", (now, now))
+   308→        self.sim_account_id = db.core().one(
+   309→            "SELECT id FROM accounts WHERE broker='sim' ORDER BY id LIMIT 1")["id"]
+   310→        return self.sim_account_id
+   311→
+   312→    # ------------------------------------------------------------------ subscriptions
+   313→    def resolve_symbol(self, symbol: str) -> str:
+   314→        """Map a bare/UI symbol ('NIFTY') to a master-backed one ('NSE:NIFTY')."""
+   315→        symbol = (symbol or "").upper()
+   316→        if not symbol or ":" in symbol:
+   317→            return symbol
+   318→        for tm in self.token_map.values():
+   319→            for sym in tm.values():
+   320→                if sym == symbol or sym.endswith(":" + symbol):
+   321→                    return sym
+   322→        return f"NSE:{symbol}"
+   323→
+   324→    async def subscribe(self, sid: str, symbols: list[str]) -> None:
+   325→        self.sockets.setdefault(sid, {"symbols": set(), "candle": None, "tf": 1})
+   326→        for sym in symbols:
+   327→            sym = self.resolve_symbol(sym)
+   328→            self.sockets[sid]["symbols"].add(sym)
+   329→            self.symbol_refs[sym].add(sid)
+   330→            await self._ensure_source(sym)
+   331→            if sym in self.ticks:      # immediate snapshot so UI is instant on refresh
+   332→                await self._emit_to(sid, "tick", self.ticks[sym])
+   333→
+   334→    async def unsubscribe(self, sid: str, symbols: list[str]) -> None:
+   335→        info = self.sockets.get(sid)
+   336→        for sym in symbols:
+   337→            sym = sym.upper()
+   338→            if info:
+   339→                info["symbols"].discard(sym)
+   340→            refs = self.symbol_refs.get(sym)
+   341→            if refs:
+   342→                refs.discard(sid)
+   343→                if not refs:
+   344→                    self.symbol_refs.pop(sym, None)
+   345→                    await self._release_source(sym)
+   346→
+   347→    async def watch_candles(self, sid: str, symbol: str, tf: int = 1) -> list[dict]:
+   348→        """Historical snapshot + register live candle updates for the socket."""
+   349→        symbol = self.resolve_symbol(symbol)
+   350→        info = self.sockets.setdefault(sid, {"symbols": set(), "candle": None, "tf": tf})
+   351→        info["candle"], info["tf"] = symbol, tf
+   352→        await self._ensure_source(symbol)
+   353→        candles = await self.get_history(symbol, tf)
+   354→        await self._emit_to(sid, "candles:history", {"symbol": symbol, "tf": tf, "candles": candles})
+   355→        if symbol in self.ticks:
+   356→            await self._emit_to(sid, "tick", self.ticks[symbol])
+   357→        return candles
+   358→
+   359→    async def _ensure_source(self, symbol: str) -> None:
+   360→        # FNO session simulator serves its symbols itself (no broker stream)
+   361→        from backend import fnosim
+   362→        if fnosim.SVC.serves(symbol):
+   363→            return
+   364→        if symbol in self.symbol_source and self.symbol_source[symbol] in self.adapters:
+   365→            return
+   366→        mode = self.trading_mode()
+   367→        # explicit feed source first (quantdesk: exactly ONE active source)
+   368→        src = self.feed_source()
+   369→        if src != "sim":
+   370→            try:
+   371→                aid = int(src)
+   372→                if aid in self.adapters:
+   373→                    token = self._token_for(aid, symbol)
+   374→                    if token is not None:
+   375→                        stream = self.streams[aid]
+   376→                        ok = await self._stream_subscribe(stream, aid, symbol, token)
+   377→                        if ok:
+   378→                            self.symbol_source[symbol] = aid
+   379→                            return
+   380→            except ValueError:
+   381→                pass
+   382→        # fall back to any suitable account (live-only respects mode)
+   383→        candidates: list[int] = []
+   384→        for aid in self.adapters:
+   385→            acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+   386→            if not acc:
+   387→                continue
+   388→            if mode == "live" and acc["mode"] != "live":
+   389→                continue
+   390→            candidates.append(aid)
+   391→        if mode != "live" and not self.sim_disabled() and self.sim_account_id \
+   392→                and self.sim_account_id in self.adapters:
+   393→            candidates.append(self.sim_account_id)
+   394→        for aid in candidates:
+   395→            token = self._token_for(aid, symbol)
+   396→            if token is None:
+   397→                continue
+   398→            stream = self.streams[aid]
+   399→            ok = await self._stream_subscribe(stream, aid, symbol, token)
+   400→            if ok:
+   401→                self.symbol_source[symbol] = aid
+   402→                config.log("hub", f"source for {symbol}: account#{aid} (token={token})")
+   403→                return
+   404→        # no source — explicit feed:down, NEVER silent sim fallback
+   405→        if mode == "live" or self.sim_disabled():
+   406→            await self._broadcast("feed:down", {
+   407→                "symbol": symbol, "reason": "no live broker feed connected — connect an account in the FEED chip"})
+   408→        else:
+   409→            await self._broadcast("feed:down", {
+   410→                "symbol": symbol, "reason": f"no feed source for {symbol} — sync master contracts"})
+   411→
+   412→    def _token_for(self, aid: int, symbol: str) -> Optional[str]:
+   413→        tm = self.token_map.get(aid, {})
+   414→        if symbol in tm.values():       # reverse lookup
+   415→            for tok, sym in tm.items():
+   416→                if sym == symbol:
+   417→                    return tok
+   418→        if symbol in self.ticks:
+   419→            return None
+   420→        return None
+   421→
+   422→    async def _stream_subscribe(self, stream, aid: int, symbol: str, token: str) -> bool:
+   423→        try:
+   424→            if hasattr(stream, "universe"):                       # sim
+   425→                await stream.subscribe([token])
+   426→                return True
+   427→            broker = db.core().one("SELECT broker FROM accounts WHERE id=?", (aid,))
+   428→            name = broker["broker"] if broker else "sim"
+   429→            if name == "dhan":
+   430→                row = db.broker_db("dhan").one("SELECT * FROM master WHERE token=?", (token,))
+   431→                if not row:
+   432→                    return False
+   433→                from backend.brokers.dhan.mapping import EXCH_SEG
+   434→                await stream.subscribe([{"ExchangeSegment": EXCH_SEG.get(row["exchange"], "NSE_EQ"),
+   435→                                         "SecurityId": token, "unified": symbol}])
+   436→                return True
+   437→            if name == "shoonya":
+   438→                await stream.subscribe([f"NSE|{token}" if symbol.startswith("NSE") else f"NFO|{token}"])
+   439→                return True
+   440→            await stream.subscribe([token])                       # breeze: plain tokens
+   441→            return True
+   442→        except Exception as e:
+   443→            config.log("hub", f"subscribe {symbol} via account#{aid} failed: {e}", "WARN")
+   444→            return False
+   445→
+   446→    async def _release_source(self, symbol: str) -> None:
+   447→        aid = self.symbol_source.pop(symbol, None)
+   448→        if aid is None or aid not in self.adapters:
+   449→            return
+   450→        token = self._token_for(aid, symbol)
+   451→        stream = self.streams.get(aid)
+   452→        if stream and token:
+   453→            try:
+   454→                if hasattr(stream, "unsubscribe"):
+   455→                    await stream.unsubscribe([token])
+   456→            except Exception:
+   457→                pass
+   458→        self.agg.forget(symbol)
+   459→
+   460→    # ------------------------------------------------------------------ history
+   461→    async def get_history(self, symbol: str, tf_minutes: int) -> list[dict]:
+   462→        symbol = self.resolve_symbol(symbol)
+   463→        # FNO session simulator: charts read the session-seeded ring buffer
+   464→        from backend import fnosim
+   465→        if fnosim.SVC.serves(symbol):
+   466→            return self.agg.history(symbol, tf_minutes, limit=900)
+   467→        aid = self.symbol_source.get(symbol)
+   468→        if not aid:
+   469→            await self._ensure_source(symbol)
+   470→            aid = self.symbol_source.get(symbol)
+   471→        if aid and self.adapters.get(aid):
+   472→            try:
+   473→                hist = await self.adapters[aid].get_history(symbol, tf_minutes, days=3)
+   474→                if hist:
+   475→                    config.log("hub", f"history {symbol} {tf_minutes}m: {len(hist)} broker candles")
+   476→                    return hist[-1000:]
+   477→            except Exception as e:
+   478→                config.log("hub", f"broker history failed {symbol}: {e} — using session aggregate", "WARN")
+   479→        return self.agg.history(symbol, tf_minutes)
+   480→
+   481→    # ------------------------------------------------------------------ tick path (hot loop)
+   482→    def _on_broker_tick(self, tick: dict) -> None:
+   483→        """Called from broker stream clients (possibly other threads)."""
+   484→        symbol = tick.get("symbol")
+   485→        if not symbol:
+   486→            aid = tick.pop("_aid", None)
+   487→            if aid is not None:
+   488→                symbol = self.token_map.get(aid, {}).get(str(tick.get("token", "")))
+   489→        if not symbol:
+   490→            return
+   491→        if self.sim_account_id is not None:
+   492→            acc = db.core().one("SELECT mode FROM accounts WHERE id=?", (self.sim_account_id,))
+   493→            if acc and acc["mode"] == "sandbox" and self.trading_mode() == "live" \
+   494→                    and tick.get("source") == "sim" and self.symbol_source.get(symbol) != self.sim_account_id:
+   495→                return   # LIVE ONLY: refuse sim ticks for non-sim sources
+   496→        tick["symbol"] = symbol
+   497→        prev = self.ticks.get(symbol)
+   498→        tick["prev_close"] = tick.get("prev_close") or (prev or {}).get("prev_close")
+   499→        self.ticks[symbol] = tick
+   500→        ltp = tick.get("ltp") or 0
+   501→        vol_delta = (tick.get("vol") or 0) - ((prev or {}).get("vol") or 0)
+   502→        if vol_delta < 0:
+   503→            vol_delta = 0
+   504→        closed = self.agg.on_tick(symbol, ltp, vol_delta, tick.get("ts") or int(time.time() * 1000))
+   505→        if self.loop is None:
+   506→            self.loop = asyncio.get_event_loop()
+   507→        self._tick_count += 1
+   508→        self._last_tick_ts = time.time()
+   509→        self.loop.call_soon_threadsafe(self._fanout, symbol, tick, closed)
+   510→
+   511→    def _fanout(self, symbol: str, tick: dict, closed: Optional[dict]) -> None:
+   512→        try:
+   513→            asyncio.get_event_loop().create_task(self._fanout_async(symbol, tick, closed))
+   514→        except RuntimeError:
+   515→            pass
+   516→
+   517→    async def _fanout_async(self, symbol: str, tick: dict, closed: Optional[dict]) -> None:
+   518→        if not self.sio:
+   519→            return
+   520→        sio = self.sio
+   521→        if self.symbol_refs.get(symbol):
+   522→            await sio.emit("tick", tick)
+   523→        live = self.agg.live_candle(symbol)
+   524→        if live:
+   525→            await sio.emit("candle", {"symbol": symbol, "tf": 1, "live": True, **live})
+   526→        if closed:
+   527→            await sio.emit("candle", {"symbol": symbol, "tf": 1, "live": False, **closed})
+   528→        self._update_position_pnl(symbol, tick)
+   529→
+   530→    # ------------------------------------------------------------------ positions/pnl/funds events
+   531→    def _update_position_pnl(self, symbol: str, tick: dict) -> None:
+   532→        rows = db.core().query("SELECT * FROM positions WHERE symbol=? AND qty<>0", (symbol,))
+   533→        if not rows:
+   534→            return
+   535→        ltp = tick.get("ltp") or 0
+   536→        changed = False
+   537→        for r in rows:
+   538→            pnl = (ltp - r["avg_price"]) * r["qty"]
+   539→            db.core().exec("UPDATE positions SET ltp=?, pnl=? WHERE id=?", (ltp, round(pnl, 2), r["id"]))
+   540→            changed = True
+   541→        now = time.time()
+   542→        if changed and now - self._last_pos_push > 0.5:
+   543→            self._last_pos_push = now
+   544→            self.loop.call_soon_threadsafe(
+   545→                lambda: asyncio.ensure_future(self._push_positions_and_funds()))
+   546→
+   547→    async def _push_positions_and_funds(self) -> None:
+   548→        await self.push_positions()
+   549→        async with self._push_lock:
+   550→            # funds push on position change: every connected account
+   551→            for account_id in self.adapters:
+   552→                await FUNDS.push_funds(account_id, reason="event")
+   553→
+   554→    async def push_positions(self) -> None:
+   555→        if not self.sio:
+   556→            return
+   557→        rows = db.core().query(
+   558→            "SELECT * FROM positions WHERE qty<>0 ORDER BY symbol")
+   559→        out = []
+   560→        for p in rows:
+   561→            net_x, ch_x = self._exit_net_of(p)
+   562→            out.append({**p, "netIfExit": net_x, "exitCharges": ch_x})
+   563→        await self.sio.emit("positions", out)
+   564→
+   565→    def _exit_net_of(self, p: dict) -> tuple[float, float]:
+   566→        """(net in pocket if this position were closed at LTP now, est. exit
+   567→        charges) — exit leg priced by the ACCOUNT'S OWN charges schedule
+   568→        (brokerage + STT + txn + GST + SEBI + stamp).  Entry charges are
+   569→        already sunk into account netPnl, so pocket = netPnl + Σ netIfExit."""
+   570→        from backend import charges_config
+   571→        from backend.charges import instrument_of
+   572→        qty = int(p["qty"] or 0)
+   573→        ltp = float(p["ltp"] or 0)
+   574→        if not qty or ltp <= 0:
+   575→            return 0.0, 0.0
+   576→        gross = (ltp - float(p["avg_price"] or 0)) * qty
+   577→        try:
+   578→            mrow = self._master_row(p["symbol"])
+   579→            inst = instrument_of(mrow)
+   580→            acc = db.core().one("SELECT broker FROM accounts WHERE id=?", (p["account_id"],))
+   581→            side = "SELL" if qty > 0 else "BUY"      # the closing leg
+   582→            ch = charges_config.calc_charges_for(
+   583→                p["account_id"], (acc or {}).get("broker", ""), inst,
+   584→                p["product"] or "MIS", side, abs(qty) * ltp)
+   585→            return round(gross - ch["total"], 2), ch["total"]
+   586→        except Exception:
+   587→            return round(gross, 2), 0.0
+   588→
+   589→    def _exit_net_map(self) -> dict[int, float]:
+   590→        """account_id -> Σ net-if-exited-at-LTP over its open positions."""
+   591→        out: dict[int, float] = {}
+   592→        for p in db.core().query("SELECT * FROM positions WHERE qty<>0"):
+   593→            net_x, _ = self._exit_net_of(p)
+   594→            out[p["account_id"]] = out.get(p["account_id"], 0.0) + net_x
+   595→        return out
+   596→
+   597→    async def on_order_event(self, account_id: int, kind: str, payload: dict) -> None:
+   598→        """Called after place/cancel — pushes orders + funds (event-driven)."""
+   599→        if not self.sio:
+   600→            return
+   601→        FUNDS.invalidate(account_id)
+   602→        await self.sio.emit("order_update", {"kind": kind, **payload})
+   603→        await self.push_orders()
+   604→        await self.push_positions()
+   605→        await FUNDS.push_funds(account_id, reason="event")
+   606→
+   607→    async def push_orders(self) -> None:
+   608→        if not self.sio:
+   609→            return
+   610→        rows = db.core().query(
+   611→            "SELECT * FROM orders ORDER BY id DESC LIMIT 80")
+   612→        await self.sio.emit("orders", rows)
+   613→
+   614→    # ------------------------------------------------------------------ master-order fanout
+   615→    # (quantdesk parity: one request fans out to every order-enabled account
+   616→    #  with per-account capital sizing; legs recorded + audited)
+   617→    async def place_master_order(self, body: dict) -> dict:
+   618→        symbol = (body.get("symbol") or "").upper()
+   619→        exchange = (body.get("exchange") or symbol.split(":")[0] or "NSE").upper()
+   620→        side = (body.get("side") or "BUY").upper()
+   621→        order_type = (body.get("orderType") or "MARKET").upper()
+   622→        product_type = body.get("productType") or "MIS"
+   623→        limit_price = body.get("limitPrice")
+   624→        trigger_price = body.get("triggerPrice")
+   625→        source = body.get("source") or "MANUAL"
+   626→        reduce_only = bool(body.get("reduceOnly"))
+   627→        capital_pct = body.get("capitalPct")
+   628→        qty_in = body.get("qty") or 0
+   629→        master_id = f"MO{time.time_ns() // 1000}"
+   630→
+   631→        accs = db.core().query("SELECT * FROM accounts WHERE is_active=1 AND is_order_enabled=1 ORDER BY id")
+   632→        if body.get("legAccounts"):
+   633→            wanted = {str(a) for a in body["legAccounts"]}
+   634→            accs = [a for a in accs if str(a["id"]) in wanted]
+   635→        if self.trading_mode() == "live" or self.sim_disabled():
+   636→            accs = [a for a in accs if a["broker"] != "sim" and a["mode"] == "live"]
+   637→        if not accs:
+   638→            raise ValueError("no order-enabled account connected (check the capital chips)")
+   639→
+   640→        mrow = None
+   641→        for name in db.broker_dbs_keys():
+   642→            r = db.broker_db(name).one("SELECT * FROM master WHERE symbol=?", (symbol,))
+   643→            if r:
+   644→                mrow = r
+   645→                break
+   646→        from backend.charges import instrument_of
+   647→        instrument = instrument_of(mrow)
+   648→        lot_size = int((mrow or {}).get("lotsize") or 1)
+   649→
+   650→        legs: list[dict] = []
+   651→        fills: list[tuple[float, int]] = []   # (price, qty)
+   652→        for acc in accs:
+   653→            aid = acc["id"]
+   654→            adapter = self.adapters.get(aid)
+   655→            if not adapter:
+   656→                legs.append(self._leg(aid, acc, "REJECTED", message="account not connected"))
+   657→                continue
+   658→            # ---- sizing (qty semantics: LOTS for FUT/OPT, units for EQ —
+   659→            #      positions are always stored in UNITS = lots x lotsize) ----
+   660→            is_fno = instrument in ("CE", "PE", "FUT") and lot_size > 1
+   661→            if reduce_only:
+   662→                pos = db.core().one(
+   663→                    "SELECT * FROM positions WHERE account_id=? AND symbol=? AND qty<>0", (aid, symbol))
+   664→                if not pos:
+   665→                    legs.append(self._leg(aid, acc, "SKIPPED", message="no position to close"))
+   666→                    continue
+   667→                # flatten EXACTLY what is held (units) — never over/undershoot
+   668→                leg_qty = abs(int(pos["qty"]))
+   669→            elif qty_in:
+   670→                leg_qty = int(qty_in) * lot_size if is_fno else int(qty_in)
+   671→            else:
+   672→                usable = self._usable_capital(acc)
+   673→                pct = float(capital_pct) if capital_pct else 100.0
+   674→                ref_price = (self.ticks.get(symbol) or {}).get("ltp") or limit_price or 0
+   675→                if not ref_price:
+   676→                    legs.append(self._leg(aid, acc, "REJECTED", message="no price to size against — subscribe the symbol first"))
+   677→                    continue
+   678→                budget = usable * (pct / 100.0)
+   679→                if is_fno:
+   680→                    leg_qty = max(lot_size, int(budget / (ref_price * lot_size)) * lot_size)
+   681→                else:
+   682→                    leg_qty = max(1, int(budget / ref_price))
+   683→            try:
+   684→                # position snapshot BEFORE the fill (the adapter applies it
+   685→                # synchronously — post-fill reads see the new qty/avg)
+   686→                pos_before = db.core().one(
+   687→                    "SELECT * FROM positions WHERE account_id=? AND symbol=? AND product=?",
+   688→                    (aid, symbol, product_type))
+   689→                result = await adapter.place_order(
+   690→                    symbol, side, leg_qty, order_type, limit_price, product_type, trigger_price)
+   691→                fill = result.get("filled_price")
+   692→                broker_oid = result.get("order_id", "")
+   693→                status = "FILLED" if fill else "OPEN"
+   694→                # sim adapter records its own orders row — never double-insert
+   695→                already = broker_oid and db.core().one(
+   696→                    "SELECT id FROM orders WHERE broker_order_id=?", (broker_oid,))
+   697→                if not already:
+   698→                    now = time.time()
+   699→                    db.core().exec(
+   700→                        "INSERT INTO orders(account_id,broker,symbol,side,qty,price,trigger_price,order_type,product,"
+   701→                        "status,filled_qty,avg_price,broker_order_id,message,created_at,updated_at) "
+   702→                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+   703→                        (aid, acc["broker"], symbol, side, leg_qty, limit_price, trigger_price, order_type,
+   704→                         product_type, "complete" if fill else "open", leg_qty if fill else 0, fill,
+   705→                         broker_oid, "", now, now))
+   706→                if fill:
+   707→                    fills.append((float(fill), leg_qty))
+   708→                    self._record_fill(aid, acc, symbol, exchange, side, leg_qty,
+   709→                                      float(fill), product_type, instrument, broker_oid,
+   710→                                      master_id, pos_before)
+   711→                legs.append(self._leg(aid, acc, status, qty=leg_qty, price=fill,
+   712→                                      broker_order_id=broker_oid))
+   713→                self._broker_log(aid, f"order {side} {leg_qty} {symbol} @ {fill or limit_price} ({source})")
+   714→                FUNDS.invalidate(aid)
+   715→            except Exception as e:
+   716→                legs.append(self._leg(aid, acc, "REJECTED", qty=leg_qty, message=str(e)[:200]))
+   717→                self._broker_log(aid, f"order rejected {side} {leg_qty} {symbol}: {e}", "ERROR")
+   718→
+   719→        filled = [l for l in legs if l["status"] == "FILLED"]
+   720→        avg = (sum(p * q for p, q in fills) / sum(q for _, q in fills)) if fills else None
+   721→        status = "SUCCESS" if filled and len(filled) == len([l for l in legs if l["status"] != "SKIPPED"]) \
+   722→            else ("PARTIAL" if filled else "FAILED")
+   723→        result = {
+   724→            "masterOrderId": master_id, "symbol": symbol, "exchange": exchange,
+   725→            "side": side, "lots": qty_in, "status": status, "legs": legs,
+   726→            "avgFillPrice": round(avg, 2) if avg else None,
+   727→            "message": None if filled else (next((l.get("message") for l in legs if l.get("message")), "all legs failed")),
+   728→        }
+   729→        db.core().exec(
+   730→            "INSERT INTO audit_log(ts,source,action,master_symbol,side,qty,status,message,legs_json) "
+   731→            "VALUES(?,?,?,?,?,?,?,?,?)",
+   732→            (time.time(), source, "PLACE", symbol, side, qty_in, status, result["message"],
+   733→             json.dumps(legs)[:2000]))
+   734→        if self.sio:
+   735→            await self.push_orders()
+   736→            await self.push_positions()
+   737→            for l in legs:
+   738→                if l["status"] in ("FILLED", "OPEN"):
+   739→                    await FUNDS.push_funds(int(l["accountId"]), reason="event")
+   740→        return result
+   741→
+   742→    async def cancel_master_order(self, account_id: str, order_id: str) -> dict:
+   743→        aid = int(account_id)
+   744→        adapter = self.adapters.get(aid)
+   745→        row = db.core().one("SELECT * FROM orders WHERE broker_order_id=? AND account_id=?", (order_id, aid))
+   746→        if not row:
+   747→            raise ValueError("order not found")
+   748→        if adapter:
+   749→            await adapter.cancel_order(order_id, row["symbol"])
+   750→        db.core().exec("UPDATE orders SET status='cancelled', updated_at=? WHERE id=?",
+   751→                       (time.time(), row["id"]))
+   752→        await self.on_order_event(aid, "cancelled", {"order_id": order_id})
+   753→        return {"ok": True}
+   754→
+   755→    async def squareoff_all(self, kill: bool = False, symbols: Optional[list[str]] = None) -> dict:
+   756→        rows = db.core().query("SELECT * FROM positions WHERE qty<>0")
+   757→        if symbols:
+   758→            rows = [r for r in rows if r["symbol"] in symbols]
+   759→        placed = 0
+   760→        filled = 0
+   761→        for r in rows:
+   762→            side = "SELL" if r["qty"] > 0 else "BUY"
+   763→            lot = self._lot_of(r["symbol"])
+   764→            qty = abs(int(r["qty"]))   # positions are stored in UNITS
+   765→            try:
+   766→                res = await self.place_master_order({
+   767→                    "symbol": r["symbol"], "exchange": r["symbol"].split(":")[0],
+   768→                    "side": side, "qty": 0, "orderType": "MARKET",
+   769→                    "productType": r["product"] or "MIS", "source": "KILLSWITCH" if kill else "SQUAREOFF",
+   770→                    "reduceOnly": True, "legAccounts": [str(r["account_id"])],
+   771→                })
+   772→                placed += 1
+   773→                filled += len([l for l in res.get("legs", []) if l["status"] == "FILLED"])
+   774→            except Exception as e:
+   775→                self._broker_log(r["account_id"], f"squareoff failed {r['symbol']}: {e}", "ERROR")
+   776→        return {"ok": True, "orders": placed, "filledLegs": filled}
+   777→
+   778→    async def cancel_all_orders(self, symbols: Optional[list[str]] = None) -> dict:
+   779→        rows = db.core().query("SELECT * FROM orders WHERE status='open'")
+   780→        if symbols:
+   781→            rows = [r for r in rows if r["symbol"] in symbols]
+   782→        n = 0
+   783→        for r in rows:
+   784→            try:
+   785→                await self.cancel_master_order(str(r["account_id"]), r["broker_order_id"] or "")
+   786→                n += 1
+   787→            except Exception:
+   788→                pass
+   789→        return {"ok": True, "cancelled": n}
+   790→
+   791→    # ------------------------------------------------------------------ sizing / fills
+   792→    def _lot_of(self, symbol: str) -> int:
+   793→        for name in db.broker_dbs_keys():
+   794→            r = db.broker_db(name).one("SELECT lotsize FROM master WHERE symbol=?", (symbol,))
+   795→            if r and r["lotsize"]:
+   796→                return int(r["lotsize"])
+   797→        return 1
+   798→
+   799→    def _leg(self, aid: int, acc: dict, status: str, qty: int = 0, price: Optional[float] = None,
+   800→             broker_order_id: Optional[str] = None, message: Optional[str] = None) -> dict:
+   801→        return {"accountId": str(aid), "accountLabel": acc["label"],
+   802→                "brokerType": acc["broker"].upper(), "brokerOrderId": broker_order_id,
+   803→                "status": status, "qty": qty, "price": price, "message": message,
+   804→                "sandbox": acc["mode"] != "live" or acc["broker"] == "sim"}
+   805→
+   806→    def _usable_capital(self, acc: dict) -> float:
+   807→        """Deployable capital for sizing, per the account's house mode."""
+   808→        initial = acc["initial_capital"]
+   809→        if initial is None:
+   810→            cash = self._account_cash(acc["id"])
+   811→            initial = (cash or 1_000_000.0) * ((acc["capital_pct"] or 100) / 100.0)
+   812→        realized = acc["realized_pnl"] or 0.0
+   813→        mode = acc.get("capital_mode") or "INITIAL_PLUS_PNL"
+   814→        if mode == "PROFIT_ONLY":
+   815→            return max(0.0, initial + max(0.0, realized))
+   816→        if mode == "INITIAL_WITH_LOSS_REDUCTION":
+   817→            return max(0.0, initial + min(0.0, realized))
+   818→        if mode == "LIVE_BALANCE":
+   819→            # FULL broker balance — whatever the broker reports as available
+   820→            # right now (already net of margin used by open positions and
+   821→            # including realized + unrealized PnL).  Falls back to the
+   822→            # INITIAL_PLUS_PNL math until the first funds snapshot lands.
+   823→            live = self._account_cash(acc["id"])
+   824→            if live is not None:
+   825→                return max(0.0, live)
+   826→        return max(0.0, initial + realized)
+   827→
+   828→    def _account_cash(self, account_id: int) -> Optional[float]:
+   829→        row = db.core().one("SELECT data FROM funds_snapshot WHERE account_id=?", (account_id,))
+   830→        if not row:
+   831→            return None
+   832→        try:
+   833→            return float(json.loads(row["data"]).get("available") or 0) or None
+   834→        except Exception:
+   835→            return None
+   836→
+   837→    def _record_fill(self, account_id: int, acc: dict, symbol: str, exchange: str,
+   838→                     side: str, qty: int, price: float, product: str,
+   839→                     instrument: str, broker_order_id: str, master_id: str,
+   840→                     pos_before: Optional[dict] = None) -> None:
+   841→        """Record a trade with charges + realized pnl on reducing fills.
+   842→        qty is UNITS (lots x lotsize for FNO) — matches positions storage.
+   843→        pos_before = position row captured BEFORE the fill was applied.
+   844→        Charges come from the ACCOUNT'S OWN editable schedule
+   845→        (charges_config — defaults are today's market values per broker)."""
+   846→        from backend import charges_config
+   847→        c = db.core()
+   848→        value = price * qty
+   849→        charges = charges_config.calc_charges_for(
+   850→            account_id, acc.get("broker", ""), instrument, product, side, value)
+   851→        before = pos_before if pos_before is not None else c.one(
+   852→            "SELECT * FROM positions WHERE account_id=? AND symbol=? AND product=?",
+   853→            (account_id, symbol, product))
+   854→        realized = 0.0
+   855→        if before and before["qty"] != 0:
+   856→            signed = qty if side == "BUY" else -qty
+   857→            if before["qty"] * signed < 0:   # reducing / closing
+   858→                closed = min(abs(before["qty"]), qty)
+   859→                direction = 1 if before["qty"] > 0 else -1
+   860→                realized = (price - before["avg_price"]) * closed * direction
+   861→        c.exec("""INSERT INTO trades(account_id,order_id,symbol,exchange,side,qty,price,value,charges,realized_pnl,ts)
+   862→                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+   863→               (account_id, broker_order_id, symbol, exchange, side, qty, price, round(value, 2),
+   864→                json.dumps(charges), round(realized, 2), time.time()))
+   865→        aggr = c.one("SELECT COALESCE(SUM(realized_pnl),0) s, COALESCE(SUM(json_extract(charges,'$.total')),0) ch "
+   866→                     "FROM trades WHERE account_id=?", (account_id,))
+   867→        c.exec("UPDATE accounts SET realized_pnl=?, charges_paid=?, first_trade_done=1 WHERE id=?",
+   868→               (round(aggr["s"], 2), round(aggr["ch"], 2), account_id))
+   869→        self._broker_log(account_id,
+   870→                         f"fill {side} {qty} {symbol} @ {price} charges ₹{charges['total']} pnl ₹{realized}")
+   871→
+   872→    # ------------------------------------------------------------------ aggregates for sync pushers
+   873→    def core_payload(self) -> dict:
+   874→        accounts = []
+   875→        positions = []
+   876→        orders = []
+   877→        trades = []
+   878→        funds = []
+   879→        open_net_map = self._exit_net_map()
+   880→        for acc in db.core().query("SELECT * FROM accounts ORDER BY id"):
+   881→            aid = acc["id"]
+   882→            sess = db.core().one("SELECT session_token FROM broker_sessions WHERE account_id=?", (aid,))
+   883→            adapter = self.adapters.get(aid)
+   884→            connected = bool(adapter and getattr(adapter, "connected", False))
+   885→            open_pos = db.core().one("SELECT COUNT(*) c FROM positions WHERE account_id=? AND qty<>0", (aid,))["c"]
+   886→            open_ord = db.core().one("SELECT COUNT(*) c FROM orders WHERE account_id=? AND status='open'", (aid,))["c"]
+   887→            cash = self._account_cash(aid)
+   888→            initial = acc["initial_capital"]
+   889→            initial_fixed = initial
+   890→            if initial is None:
+   891→                initial = (cash or 1_000_000.0) * ((acc["capital_pct"] or 100) / 100.0)
+   892→            usable = self._usable_capital(acc)
+   893→            deployed = db.core().one(
+   894→                "SELECT COALESCE(SUM(qty*COALESCE(avg_price,0)),0) d FROM positions "
+   895→                "WHERE account_id=? AND qty<>0", (aid,))["d"] or 0
+   896→            src = self.feed_source()
+   897→            net_pnl = round((acc["realized_pnl"] or 0) - (acc["charges_paid"] or 0), 2)
+   898→            open_net = round(open_net_map.get(aid, 0.0), 2)
+   899→            accounts.append({
+   900→                "id": str(aid), "label": acc["label"], "brokerType": acc["broker"].upper(),
+   901→                "status": "connected" if connected else acc["status"],
+   902→                "isActive": bool(adapter), "isLiveDataSource": str(aid) == src,
+   903→                "isOrderEnabled": bool(acc["is_order_enabled"]), "isCopyMaster": False,
+   904→                "hasSession": bool(sess and sess["session_token"]) or acc["broker"] == "sim",
+   905→                "usableCapital": round(usable, 2), "initialCapital": round(initial, 2),
+   906→                "capitalBase": "AVAILABLE_CASH_PCT" if initial_fixed is None else "FIXED",
+   907→                "capitalPct": acc["capital_pct"] or 100,
+   908→                "availableCash": cash, "initialCapitalFixed": initial_fixed,
+   909→                "realizedPnl": acc["realized_pnl"] or 0, "chargesPaid": acc["charges_paid"] or 0,
+   910→                "netPnl": net_pnl,
+   911→                "openNet": open_net,
+   912→                "pocket": round(net_pnl + open_net, 2),
+   913→                "deployed": round(deployed, 2), "mode": acc["capital_mode"] or "INITIAL_PLUS_PNL",
+   914→                "modeLabel": {"PROFIT_ONLY": "Profit only",
+   915→                              "INITIAL_PLUS_PNL": "Initial + PnL",
+   916→                              "INITIAL_WITH_LOSS_REDUCTION": "Initial − losses",
+   917→                              "LIVE_BALANCE": "Broker balance"}.get(acc["capital_mode"] or "", "Initial + PnL"),
+   918→                "firstTradeDone": bool(acc["first_trade_done"]),
+   919→                "openPositions": open_pos, "openOrders": open_ord,
+   920→                "clientId": None, "modeLabel2": None,
+   921→            })
+   922→        for p in db.core().query("SELECT * FROM positions WHERE qty<>0"):
+   923→            acc = db.core().one("SELECT label,broker FROM accounts WHERE id=?", (p["account_id"],))
+   924→            mrow = self._master_row(p["symbol"])
+   925→            lot = int((mrow or {}).get("lotsize") or 1)
+   926→            net_x, ch_x = self._exit_net_of(p)
+   927→            positions.append({
+   928→                "accountId": str(p["account_id"]),
+   929→                "accountLabel": acc["label"] if acc else str(p["account_id"]),
+   930→                "brokerType": (acc["broker"].upper() if acc else "SIM"),
+   931→                "symbol": p["symbol"], "exchange": p["symbol"].split(":")[0] or "NSE",
+   932→                "productType": p["product"] or "MIS",
+   933→                "netQty": p["qty"], "buyQty": p["qty"] if p["qty"] > 0 else 0,
+   934→                "sellQty": -p["qty"] if p["qty"] < 0 else 0,
+   935→                "avgPrice": p["avg_price"], "realizedPnl": 0,
+   936→                "ltp": p["ltp"], "unrealizedPnl": p["pnl"], "lotSize": lot,
+   937→                "netIfExit": net_x, "exitCharges": ch_x,
+   938→                "updatedAt": _iso(p["updated_at"]), "instrumentType": (mrow or {}).get("instrument") or "EQ",
+   939→            })
+   940→        for o in db.core().query("SELECT * FROM orders ORDER BY id DESC LIMIT 60"):
+   941→            acc = db.core().one("SELECT label,broker FROM accounts WHERE id=?", (o["account_id"],))
+   942→            orders.append({
+   943→                "id": str(o["id"]), "symbol": o["symbol"], "exchange": o["symbol"].split(":")[0] or "NSE",
+   944→                "side": o["side"], "qty": o["qty"], "filledQty": o["filled_qty"] or 0,
+   945→                "orderType": o["order_type"], "productType": o["product"],
+   946→                "status": (o["status"] or "").upper(), "avgPrice": o["avg_price"],
+   947→                "message": o["message"], "createdAt": _iso(o["created_at"]),
+   948→                "updatedAt": _iso(o["updated_at"]),
+   949→                "accountId": str(o["account_id"]),
+   950→                "accountLabel": acc["label"] if acc else "",
+   951→                "brokerType": (acc["broker"].upper() if acc else "SIM"),
+   952→            })
+   953→        for t in db.core().query("SELECT * FROM trades ORDER BY id DESC LIMIT 60"):
+   954→            acc = db.core().one("SELECT label,broker FROM accounts WHERE id=?", (t["account_id"],))
+   955→            trades.append({
+   956→                "id": str(t["id"]), "orderId": t["order_id"], "symbol": t["symbol"],
+   957→                "exchange": t["exchange"], "side": t["side"], "qty": t["qty"],
+   958→                "price": t["price"], "value": t["value"],
+   959→                "chargesTotal": _charges_total(t["charges"]), "charges": _charges_dict(t["charges"]),
+   960→                "realizedPnl": t["realized_pnl"],
+   961→                "netPnl": round((t["realized_pnl"] or 0) - (_charges_total(t["charges"]) or 0), 2),
+   962→                "ts": _iso(t["ts"]),
+   963→                "accountId": str(t["account_id"]),
+   964→                "accountLabel": acc["label"] if acc else "",
+   965→                "brokerType": (acc["broker"].upper() if acc else "SIM"),
+   966→            })
+   967→        for acc in db.core().query("SELECT * FROM accounts ORDER BY id"):
+   968→            cash = self._account_cash(acc["id"]) or 0
+   969→            acc_net = round((acc["realized_pnl"] or 0) - (acc["charges_paid"] or 0), 2)
+   970→            acc_open = round(open_net_map.get(acc["id"], 0.0), 2)
+   971→            funds.append({
+   972→                "accountId": str(acc["id"]), "label": acc["label"],
+   973→                "brokerType": acc["broker"].upper(), "cash": round(cash, 2),
+   974→                "initialCapital": round(acc["initial_capital"] or 0, 2),
+   975→                "realizedPnl": acc["realized_pnl"] or 0,
+   976→                "netPnl": acc_net,
+   977→                "openNet": acc_open,
+   978→                "pocket": round(acc_net + acc_open, 2),
+   979→                "chargesPaid": acc["charges_paid"] or 0, "deployed": 0,
+   980→            })
+   981→        return {"accounts": accounts, "positions": positions, "orders": orders,
+   982→                "trades": trades, "funds": funds, "session": self.session_stats(),
+   983→                "sessionStart": _iso(self._feed_started_at), "ts": int(time.time() * 1000)}
+   984→
+   985→    def session_stats(self) -> dict:
+   986→        rows = db.core().query("SELECT * FROM trades")
+   987→        closes = 0
+   988→        wins = 0
+   989→        pts = 0.0
+   990→        realized = 0.0
+   991→        charges = 0.0
+   992→        per: dict[str, dict] = {}
+   993→        top: dict[str, float] = {}
+   994→        for t in rows:
+   995→            ch = _charges_dict(t["charges"])
+   996→            charges += ch.get("total", 0) or 0
+   997→            rp = t["realized_pnl"] or 0
+   998→            realized += rp
+   999→            if rp != 0:
+  1000→                closes += 1
+  1001→                if rp > 0:
+  1002→                    wins += 1
+  1003→                # points captured = price move per unit (realized / qty in units)
+  1004→                p = (rp / t["qty"]) if t["qty"] else 0.0
+  1005→                pts += p
+  1006→                top[t["symbol"]] = top.get(t["symbol"], 0) + p
+  1007→            aid = str(t["account_id"])
+  1008→            acc = db.core().one("SELECT label,broker FROM accounts WHERE id=?", (t["account_id"],))
+  1009→            slot = per.setdefault(aid, {"accountId": aid, "label": acc["label"] if acc else "",
+  1010→                                        "brokerType": (acc["broker"].upper() if acc else "SIM"),
+  1011→                                        "trades": 0, "closes": 0, "wins": 0, "pts": 0.0,
+  1012→                                        "realized": 0.0, "unrealized": 0.0, "charges": 0.0})
+  1013→            slot["trades"] += 1
+  1014→            slot["charges"] += ch.get("total", 0) or 0
+  1015→            slot["realized"] += rp
+  1016→            if rp != 0:
+  1017→                slot["closes"] += 1
+  1018→                if rp > 0:
+  1019→                    slot["wins"] += 1
+  1020→        unrealized = db.core().one("SELECT COALESCE(SUM(pnl),0) s FROM positions WHERE qty<>0")["s"] or 0
+  1021→        unrealized_net = 0.0
+  1022→        for p in db.core().query("SELECT * FROM positions WHERE qty<>0"):
+  1023→            unrealized_net += self._exit_net_of(p)[0]
+  1024→        for aid in per:
+  1025→            u = db.core().one("SELECT COALESCE(SUM(pnl),0) s FROM positions WHERE account_id=? AND qty<>0", (int(aid),))
+  1026→            per[aid]["unrealized"] = u["s"] if u else 0
+  1027→            acc = db.core().one("SELECT realized_pnl,charges_paid FROM accounts WHERE id=?", (int(aid),))
+  1028→            acc_net = ((acc["realized_pnl"] or 0) - (acc["charges_paid"] or 0)) if acc else 0
+  1029→            a_open = 0.0
+  1030→            for p in db.core().query("SELECT * FROM positions WHERE account_id=? AND qty<>0", (int(aid),)):
+  1031→                a_open += self._exit_net_of(p)[0]
+  1032→            per[aid]["pocket"] = round(acc_net + a_open, 2)
+  1033→        return {
+  1034→            "winRate": (wins / closes * 100) if closes else None,
+  1035→            "pts": round(pts, 1), "realized": round(realized, 2),
+  1036→            "unrealized": round(unrealized, 2),
+  1037→            "unrealizedNet": round(unrealized_net, 2),
+  1038→            "net": round(realized + unrealized, 2),
+  1039→            "pocket": round(realized - charges + unrealized_net, 2),
+  1040→            "closes": closes, "wins": wins, "trades": len(rows),
+  1041→            "charges": round(charges, 2),
+  1042→            "perAccount": list(per.values()),
+  1043→            "topSymbols": [{"symbol": s, "pts": round(p, 1)} for s, p in
+  1044→                           sorted(top.items(), key=lambda kv: -abs(kv[1]))[:8]],
+  1045→        }
+  1046→
+  1047→    def _master_row(self, symbol: str) -> Optional[dict]:
+  1048→        for name in db.broker_dbs_keys():
+  1049→            r = db.broker_db(name).one("SELECT * FROM master WHERE symbol=?", (symbol,))
+  1050→            if r:
+  1051→                return r
+  1052→        return None
+  1053→
+  1054→    # ------------------------------------------------------------------ sync subscriptions
+  1055→    async def set_sync_subs(self, sid: str, chains: list[dict], index: list[str]) -> None:
+  1056→        self._sync_subs[sid] = {"chains": chains or [], "index": index or []}
+  1057→        # make sure chain legs + index constituents have a feed source
+  1058→        from backend.options_chain import ensure_chain_subscribed, ensure_index_subscribed
+  1059→        for c in (chains or []):
+  1060→            u = (c.get("underlying") or "").upper()
+  1061→            if u:
+  1062→                await self._ensure_source(u)
+  1063→                try:
+  1064→                    await ensure_chain_subscribed(u, c.get("expiry"))
+  1065→                except Exception as e:
+  1066→                    self.feed_note(f"chain legs {u}: {e}", "WARN")
+  1067→        for sym in (index or []):
+  1068→            try:
+  1069→                await ensure_index_subscribed(sym.upper())
+  1070→            except Exception as e:
+  1071→                self.feed_note(f"index {sym}: {e}", "WARN")
+  1072→
+  1073→    def drop_sync_subs(self, sid: str) -> None:
+  1074→        self._sync_subs.pop(sid, None)
+  1075→
+  1076→    def chain_payload(self, underlying: str, expiry: Optional[str]) -> dict:
+  1077→        from backend.options_chain import build_chain
+  1078→        return build_chain(underlying.upper(), expiry)
+  1079→
+  1080→    def index_payload(self, symbol: str) -> dict:
+  1081→        from backend.options_chain import index_components
+  1082→        return index_components(symbol.upper())
+  1083→
+  1084→    # ------------------------------------------------------------------ broadcast helpers
+  1085→    async def _broadcast(self, event: str, data: dict) -> None:
+  1086→        if self.sio:
+  1087→            await self.sio.emit(event, data)
+  1088→
+  1089→    async def _emit_to(self, sid: str, event: str, data) -> None:
+  1090→        if self.sio:
+  1091→            await self.sio.emit(event, data, to=sid)
+  1092→
+  1093→    async def on_connect(self, sid: str) -> None:
+  1094→        self.sockets[sid] = {"symbols": set(), "candle": None, "tf": 1}
+  1095→        await self._emit_to(sid, "mode", {"mode": self.trading_mode()})
+  1096→        await self._emit_to(sid, "feed:source", {"source": self.feed_source(), "epoch": self.epoch})
+  1097→
+  1098→    async def on_disconnect(self, sid: str) -> None:
+  1099→        info = self.sockets.pop(sid, None)
+  1100→        self.drop_sync_subs(sid)
+  1101→        if not info:
+  1102→            return
+  1103→        syms = list(info.get("symbols", set()))
+  1104→        if info.get("candle"):
+  1105→            syms.append(info["candle"])
+  1106→        await self.unsubscribe(sid, syms)
+  1107→
+  1108→
+  1109→def _iso(ts: Optional[float]) -> str:
+  1110→    if not ts:
+  1111→        return ""
+  1112→    try:
+  1113→        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) + "Z"
+  1114→    except Exception:
+  1115→        return ""
+  1116→
+  1117→
+  1118→def _charges_dict(raw) -> dict:
+  1119→    try:
+  1120→        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+  1121→    except Exception:
+  1122→        return {}
+  1123→
+  1124→
+  1125→def _charges_total(raw) -> float:
+  1126→    return (_charges_dict(raw) or {}).get("total", 0) or 0
+  1127→

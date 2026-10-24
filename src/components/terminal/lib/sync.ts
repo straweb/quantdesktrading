@@ -55,6 +55,10 @@ function ensureSubWire() {
     socket.on(ch, d => emitLocal(ch, d))
   }
   socket.on('connect', () => emitSub())
+  // Round-26: bridge the hub's feed-lifecycle events into local channels so
+  // the FeedChip can surface "no data / feed down" honestly per symbol.
+  socket.on('feed:down', d => emitLocal('feed:down', d))
+  socket.on('feed:epoch', d => { emitLocal('feed:epoch', d); emitLocal('feed:down', null) })
 }
 
 /** Register per-socket sync parameters (chains / index lists). */
@@ -217,6 +221,9 @@ export interface SyncAdmin {
     lastTickTs: number | null; lastError: string | null; errorTs: number | null
     symbols: number; polls: number; errors: number; startedAt: number
     log: string[]; sessionPresent: boolean; sourceIsLive: boolean; fresh: boolean
+    // Round-26 source-discipline fields
+    dropped?: number; dropReasons?: Record<string, number>
+    epoch?: number; waiting?: boolean; noSource?: boolean; liveOnly?: boolean
   }
   feedSource: { source: string; simDisabled?: boolean; sources: { id: string; label: string; brokerType: string | null; hasSession?: boolean }[] }
   accountsMeta: { id: string; label: string; brokerType: string; isActive: boolean; hasCreds: boolean; hasSession?: boolean }[]

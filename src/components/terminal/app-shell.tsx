@@ -15,7 +15,7 @@ import type { FnoSimResp } from './lib/client-api'
 import type { AccountRow } from './lib/client-api'
 import { useTerminal, type AppView } from './lib/store'
 import { onFeedStatus, ensureSocket } from './lib/socket'
-import { useSyncChannel, type SyncCore, type SyncAdmin } from './lib/sync'
+import { onSync, useSyncChannel, type SyncCore, type SyncAdmin } from './lib/sync'
 import { TerminalView } from './terminal-view'
 import { AdminView } from './admin/admin-view'
 import { StrategyView } from './strategy/strategy-view'
@@ -693,6 +693,17 @@ function FeedChip({ up }: { up: boolean }) {
   // live-feed health for the ACTIVE broker source
   const liveHealthy = !!feedStatus?.sourceIsLive && !!feedStatus?.fresh
   const liveErr = feedStatus?.sourceIsLive ? feedStatus?.lastError : null
+  // Round-26: hub feed-lifecycle errors (per-symbol feed:down with the exact
+  // reason) + honest no-data states — sim data is NEVER silently substituted
+  const feedDown = useSyncChannel<{ symbol: string; reason: string } | null>('feed:down')
+  const noSource = !!(feedStatus as { noSource?: boolean } | undefined)?.noSource
+  const waiting = !!(feedStatus as { waiting?: boolean } | undefined)?.waiting
+  const dropped = (feedStatus as { dropped?: number } | undefined)?.dropped ?? 0
+  // Round-26: a hub purge from ANYWHERE (Admin toggle, another browser tab)
+  // must clear every client-side market-data holder here too
+  useEffect(() => {
+    return onSync('feed:epoch', () => bumpDataEpoch())
+  }, [bumpDataEpoch])
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -701,7 +712,7 @@ function FeedChip({ up }: { up: boolean }) {
           className={`flex items-center gap-1 px-1.5 py-1 rounded border transition-colors ${
             up ? 'border-[#00c896]/30 bg-up/40 text-[#00c896] hover:bg-up/60' : 'border-[#ff4d5e]/30 bg-down/40 text-[#ff4d5e] hover:bg-down/60'
           }`}
-          title={`Market data source — click to view / switch${source !== 'sim' ? ` · live feed ${liveHealthy ? 'ticking' : `STALLED${liveErr ? `: ${liveErr}` : ''}`}` : ''}`}
+          title={`Market data source — click to view / switch${source !== 'sim' ? ` · live feed ${liveHealthy ? 'ticking' : (waiting ? 'connected — waiting for data (closed/holiday?)' : `STALLED${liveErr ? `: ${liveErr}` : ''}`)}` : ''}${noSource ? ' · NO SOURCE PICKED (Live-Only)' : ''}`}
         >
           <CircleDot className={`h-3 w-3 ${up ? 'pulse-dot' : ''}`} />
           <span className="font-bold">FEED {up ? 'LIVE' : 'DOWN'}</span>
@@ -719,13 +730,25 @@ function FeedChip({ up }: { up: boolean }) {
         <div className="px-1 pb-1 text-[9px] text-muted-foreground leading-snug">
           Market data source — one feed active at a time. Live rows show real feed health; click <b>cap</b> to change % / fixed capital anytime, even while connected.
         </div>
+        {feedDown && (
+          <div className="mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border border-[#ff4d5e]/40 bg-[#ff4d5e]/10 text-[#ff4d5e]">
+            <b>FEED DOWN</b> — {feedDown.symbol ? `${feedDown.symbol}: ` : ''}{feedDown.reason}
+          </div>
+        )}
+        {noSource && (
+          <div className="mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border border-[#e0a63f]/40 bg-[#e0a63f]/10 text-[#e0a63f]">
+            <b>NO DATA SOURCE</b> — Live-Only mode is on and the sim feed is disabled. Pick a live broker account above; until then every panel stays empty (no fallback data).
+          </div>
+        )}
         {feedStatus?.sourceIsLive && (
           <div className={`mx-1 rounded px-2 py-1.5 text-[9px] leading-snug border ${
             liveHealthy ? 'border-[#00c896]/30 bg-up/30 text-[#00c896]' : 'border-[#e0a63f]/40 bg-[#e0a63f]/10 text-[#e0a63f]'
           }`}>
             {liveHealthy
-              ? <>Live broker feed ticking — {feedStatus.symbols} symbols · last tick {tickAge}s ago · {feedStatus.polls} polls</>
-              : <>Live feed NOT flowing{feedStatus.lastError ? ` — ${feedStatus.lastError}` : ''}{!feedStatus.sessionPresent ? ' · no session — create it in Admin → Session' : ''} · details in Admin → Broker Diagnostics</>}
+              ? <>Live broker feed ticking — {feedStatus.symbols} symbols · last tick {tickAge}s ago · {feedStatus.polls} polls{dropped > 0 ? ` · ${dropped} off-source ticks blocked` : ''}</>
+              : waiting
+                ? <><b>LIVE — no data yet.</b> The broker source is connected but hasn’t sent a tick (market closed / holiday, or the symbol isn’t in its master). Panels stay empty — the hub never falls back to sim or other accounts. Details in Admin → Broker Diagnostics.</>
+                : <>Live feed NOT flowing{feedStatus.lastError ? ` — ${feedStatus.lastError}` : ''}{!feedStatus.sessionPresent ? ' · no session — create it in Admin → Session' : ''} · details in Admin → Broker Diagnostics</>}
           </div>
         )}
         {sources.map(s => {

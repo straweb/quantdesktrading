@@ -57,16 +57,25 @@ class FeedReq(BaseModel):
 async def feed_post(body: FeedReq, authorization: str = Header(default="")):
     uid(authorization)
     hub = Hub.instance()
+    steer_note = None
     if body.simDisabled is not None:
         hub.set_sim_disabled(body.simDisabled)
         if body.simDisabled and hub.feed_source() == "sim":
-            raise HTTPException(400, "Live-Only mode: sim feed is disabled — pick a live broker source")
+            # Round-26: the toggle now SUCCEEDS with guidance instead of a 400 —
+            # the hub goes honest-down (noSource) and every panel stays EMPTY
+            # until a live source is picked.  No silent sim data, ever.
+            steer_note = ("LIVE-ONLY on — pick a live broker source in the FEED chip; "
+                          "until then every panel stays empty (no sim/fallback data).")
+            hub.feed_note("Live-Only enabled with no live source — data stays empty (feed:down) until a broker source is picked", "WARN")
     if body.source is not None:
         try:
             await hub.set_feed_source(body.source)
         except ValueError as e:
             raise HTTPException(400, str(e))
-    return {"ok": True, "source": hub.feed_source(), "simDisabled": hub.sim_disabled()}
+    out = {"ok": True, "source": hub.feed_source(), "simDisabled": hub.sim_disabled()}
+    if steer_note:
+        out["message"] = steer_note
+    return out
 
 
 @router.get("/feed/status")
@@ -1289,38 +1298,61 @@ async def broker_auth_post(body: dict, authorization: str = Header(default="")):
     action = (body.get("action") or "").strip().lower()
     if not action:
         raise HTTPException(400, "action required (consent | complete | syncIp)")
-    aid = int(body.get("accountId"))
-    acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
-    if not acc:
-        raise HTTPException(404, "account not found")
+    # Round-26: NEVER a bare 500 — every broker-network/parse error below
+    # becomes a structured {ok:false,message} the dialog can render.  (The
+    # user-visible symptom was 'POST /broker-auth 500 Internal Server Error'
+    # on a transient Dhan consent failure, fine on retry.)
     try:
-        creds = _creds_view(json.loads(acc["credentials"] or "{}"))
-    except Exception:
-        creds = {}
-    broker = acc["broker"].lower()
+        aid = int(body.get("accountId"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "accountId required (numeric)")
+    try:
+        acc = db.core().one("SELECT * FROM accounts WHERE id=?", (aid,))
+        if not acc:
+            raise HTTPException(404, "account not found")
+        try:
+            creds = _creds_view(json.loads(acc["credentials"] or "{}"))
+        except Exception:
+            creds = {}
+        broker = acc["broker"].lower()
 
-    if action == "syncip":
-        return await _dhan_sync_ip(aid, acc, creds, broker)
-    if action == "consent":
-        return await _auth_consent(aid, acc, creds, broker)
-    if action == "complete":
-        code = (body.get("code") or "").strip()
-        if not code:
-            raise HTTPException(400, "code required — paste the redirect value (or PIN:TOTP / pwd:factor2)")
-        if broker == "shoonya":
-            res = await _shoonya_complete(aid, acc, creds, code)
-        elif broker == "dhan":
-            res = await _dhan_complete(aid, acc, creds, code)
-        elif broker == "breeze":
-            res = await _breeze_complete(aid, acc, creds, code)
-        else:
-            raise HTTPException(400, f"broker '{broker}' has no interactive auth flow")
-        if res.get("ok"):
-            # first-login-of-the-day housekeeping: master contract refresh +
-            # token-map reload + best-effort hub connect (feed + funds live)
-            await _post_session_success(aid, acc, broker)
-        return res
-    raise HTTPException(400, f"unknown action '{action}'")
+        if action == "syncip":
+            return await _dhan_sync_ip(aid, acc, creds, broker)
+        if action == "consent":
+            return await _auth_consent(aid, acc, creds, broker)
+        if action == "complete":
+            code = (body.get("code") or "").strip()
+            if not code:
+                raise HTTPException(400, "code required — paste the redirect value (or PIN:TOTP / pwd:factor2)")
+            if broker == "shoonya":
+                res = await _shoonya_complete(aid, acc, creds, code)
+            elif broker == "dhan":
+                res = await _dhan_complete(aid, acc, creds, code)
+            elif broker == "breeze":
+                res = await _breeze_complete(aid, acc, creds, code)
+            else:
+                raise HTTPException(400, f"broker '{broker}' has no interactive auth flow")
+            if res.get("ok"):
+                # first-login-of-the-day housekeeping: master contract refresh +
+                # token-map reload + best-effort hub connect (feed + funds live)
+                await _post_session_success(aid, acc, broker)
+            return res
+        raise HTTPException(400, f"unknown action '{action}'")
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        config.log("broker-auth", f"{action} timed out (account#{body.get('accountId')})", "WARN")
+        return {"ok": False,
+                "message": "The broker did not answer in time (network/timeout). "
+                           "Press the button again — transient failures usually clear on retry."}
+    except Exception as e:
+        config.log("broker-auth", f"{action} failed hard (account#{body.get('accountId')}): "
+                                  f"{type(e).__name__}: {e}", "ERROR")
+        msg = str(e) or type(e).__name__
+        return {"ok": False,
+                "message": f"Auth step failed ({type(e).__name__}): {msg[:220]} — "
+                           "this is usually transient; press the button again. "
+                           "If it repeats, check Admin → Broker Diagnostics."}
 
 
 async def _post_session_success(aid: int, acc: dict, broker: str) -> None:
@@ -1366,7 +1398,14 @@ def _mk_adapter(acc: dict, creds: dict):
 async def _auth_consent(aid: int, acc: dict, creds: dict, broker: str) -> dict:
     if broker == "dhan":
         adapter = _mk_adapter(acc, creds)
-        res = await adapter.generate_consent()
+        try:
+            res = await adapter.generate_consent()
+        except Exception as e:   # BrokerError / httpx errors — never a 500
+            config.log("broker-auth", f"dhan consent failed: {e}", "WARN")
+            return {"ok": False,
+                    "message": f"Dhan consent failed: {str(e)[:180]} — press again (transient "
+                               "failures are common); if it repeats check the app id/secret "
+                               "and the server IP whitelist (Session → Sync server IP)"}
         return {"ok": True, "loginUrl": res["login_url"],
                 "message": f"Consent created ({str(res['consentAppId'])[:12]}…) — log in and paste the redirect tokenId"}
     # other brokers have a static login URL — surface it

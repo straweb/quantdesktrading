@@ -79,11 +79,18 @@ class ShoonyaStream:
                     await ws.send(json.dumps({
                         "t": "c", "uid": s.get("uid", ""), "actid": s.get("actid", ""),
                         "source": "API", "accesstoken": s["susertoken"]}))
-                    # wait auth ack
+                    # wait auth ack; hedging repo uses t:"a" for the app
+                    # login — retry with it when the connect-shape is refused
                     raw = await asyncio.wait_for(ws.recv(), timeout=10)
                     ack = json.loads(raw)
                     if ack.get("t") != "ak" or ack.get("s") != "OK":
-                        raise Exception(f"auth rejected: {raw[:120]}")
+                        await ws.send(json.dumps({
+                            "t": "a", "uid": s.get("uid", ""), "actid": s.get("actid", ""),
+                            "source": "API", "accesstoken": s["susertoken"]}))
+                        raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        ack = json.loads(raw)
+                        if ack.get("t") != "ak" or ack.get("s") != "OK":
+                            raise Exception(f"auth rejected: {raw[:120]}")
                     self.connected = True
                     backoff = 2
                     config.log("shoonya-feed", "NorenWSAPI connected + authenticated")
@@ -119,7 +126,7 @@ class ShoonyaStream:
         except Exception:
             return
         t = m.get("t")
-        if t in ("tk", "tf"):
+        if t in ("tk", "tf", "df", "dk"):
             lp = m.get("lp")
             if lp in (None, ""):
                 return
@@ -127,11 +134,17 @@ class ShoonyaStream:
                 ltp = float(lp)
             except (TypeError, ValueError):
                 return
+            # Noren 'pc' is the % change vs prev close — derive the price
+            try:
+                pc_pct = float(m.get("pc") or 0)
+            except (TypeError, ValueError):
+                pc_pct = 0.0
+            prev_close = round(ltp / (1 + pc_pct / 100.0), 2) if pc_pct else None
             self.on_tick({
                 "symbol": f"{m.get('e', 'NSE')}:{m.get('ts', '')}" if m.get("ts") else "",
                 "token": str(m.get("tk") or ""),
                 "ltp": ltp,
-                "prev_close": float(m.get("pc") or 0) or None,
+                "prev_close": prev_close,
                 "open": float(m.get("o") or 0) or None,
                 "high": float(m.get("h") or 0) or None,
                 "low": float(m.get("l") or 0) or None,
@@ -139,6 +152,7 @@ class ShoonyaStream:
                 "vol": float(m.get("v") or 0),
                 "bid": float(m.get("bp1") or 0) or None,
                 "ask": float(m.get("sp1") or 0) or None,
+                "oi": float(m.get("toi") or 0) or None,
                 "ts": int(float(m.get("ft") or 0) * 1000),
                 "source": "shoonya",
             })

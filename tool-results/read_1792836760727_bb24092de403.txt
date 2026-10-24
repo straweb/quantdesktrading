@@ -1,0 +1,956 @@
+     1→"""
+     2→Dhan WebSocket Client Implementation
+     3→Handles both 5-level and 20-level market depth connections
+     4→"""
+     5→
+     6→import json
+     7→import struct
+     8→import threading
+     9→import time
+    10→from collections.abc import Callable
+    11→from typing import Any, Dict, List, Optional
+    12→from urllib.parse import urlencode
+    13→
+    14→import websocket
+    15→
+    16→from database.auth_db import get_auth_token
+    17→from utils.logging import get_logger
+    18→
+    19→
+    20→class DhanWebSocket:
+    21→    """
+    22→    Dhan WebSocket client for real-time market data
+    23→    Supports both 5-level depth (regular feed) and 20-level depth connections
+    24→    """
+    25→
+    26→    # Feed response codes
+    27→    FEED_RESPONSE_CODES = {
+    28→        2: "TICKER",
+    29→        4: "QUOTE",
+    30→        5: "OI",
+    31→        6: "PREV_CLOSE",
+    32→        8: "FULL",
+    33→        41: "DEPTH_20_BID",
+    34→        51: "DEPTH_20_ASK",
+    35→        50: "DISCONNECT",
+    36→    }
+    37→
+    38→    # Request codes.
+    39→    #
+    40→    # Dhan does support explicit unsubscribe, contrary to a long-standing
+    41→    # comment in this file. Verified on the live feed: subscribing to
+    42→    # MCX_COMM/581725 with code 15 delivered ticks, and code 16 stopped them
+    43→    # dead (issue #1924).
+    44→    #
+    45→    # UNSUBSCRIBE_20_DEPTH is the one code not confirmed here. Dhan's live
+    46→    # annexure documents 24, but the vendored copy in broker-api-docs says 25,
+    47→    # and it could not be settled on the wire because 20-depth returns no
+    48→    # packets outside NSE market hours. 24 follows the live documentation;
+    49→    # re-check against a live depth feed before relying on it.
+    50→    REQUEST_CODES = {
+    51→        "SUBSCRIBE_TICKER": 15,
+    52→        "UNSUBSCRIBE_TICKER": 16,
+    53→        "SUBSCRIBE_QUOTE": 17,
+    54→        "UNSUBSCRIBE_QUOTE": 18,
+    55→        "SUBSCRIBE_FULL": 21,
+    56→        "UNSUBSCRIBE_FULL": 22,
+    57→        "SUBSCRIBE_20_DEPTH": 23,
+    58→        "UNSUBSCRIBE_20_DEPTH": 24,
+    59→        "DISCONNECT": 12,
+    60→    }
+    61→
+    62→    # Health check (issue #1372 — silent-stall watchdog).
+    63→    # Detects TCP-alive but data-flow-dead conditions that ping/pong alone
+    64→    # cannot catch (VPS / NAT environments commonly keep the TCP connection
+    65→    # alive while the broker stops sending application-level frames).
+    66→    HEALTH_CHECK_INTERVAL = 30
+    67→    DATA_TIMEOUT = 90
+    68→
+    69→    def __init__(
+    70→        self,
+    71→        client_id: str,
+    72→        access_token: str,
+    73→        is_20_depth: bool = False,
+    74→        user_id: str | None = None,
+    75→    ):
+    76→        """
+    77→        Initialize Dhan WebSocket client
+    78→
+    79→        Args:
+    80→            client_id: Dhan client ID
+    81→            access_token: Access token for authentication
+    82→            is_20_depth: If True, connects to 20-level depth endpoint
+    83→            user_id: OpenAlgo user id, used to re-read a fresh access token from
+    84→                the database on reconnect (tokens roll over daily at ~3 AM IST)
+    85→        """
+    86→        self.client_id = client_id
+    87→        self.access_token = access_token
+    88→        self.is_20_depth = is_20_depth
+    89→        self.user_id = user_id
+    90→
+    91→        # WebSocket connection
+    92→        self.ws = None
+    93→        self.ws_thread = None
+    94→        self.running = False
+    95→        self.connected = False
+    96→        self._was_connected = False  # tracks if connection was ever established
+    97→
+    98→        # Callbacks
+    99→        self.on_open = None
+   100→        self.on_message = None
+   101→        self.on_data = None
+   102→        self.on_error = None
+   103→        self.on_close = None
+   104→
+   105→        # Subscription tracking
+   106→        self.subscriptions = {}
+   107→        self.lock = threading.Lock()
+   108→
+   109→        # Fatal error tracking (non-recoverable errors like expired subscription)
+   110→        self._fatal_error = False
+   111→        self._fatal_error_message = None
+   112→
+   113→        # Health monitoring (issue #1372). last_message_time is stamped on
+   114→        # every inbound frame; the watchdog thread closes the socket if no
+   115→        # frames arrive within DATA_TIMEOUT — _run_websocket then handles
+   116→        # the close as a normal disconnect and reconnects with backoff.
+   117→        self.last_message_time: float | None = None
+   118→        self._health_check_thread: threading.Thread | None = None
+   119→
+   120→        # Logging
+   121→        self.logger = get_logger(f"dhan_websocket_{'20depth' if is_20_depth else '5depth'}")
+   122→
+   123→        # Build WebSocket URL
+   124→        self._build_url()
+   125→
+   126→    def _build_url(self):
+   127→        """Build the WebSocket URL based on depth level"""
+   128→        if self.is_20_depth:
+   129→            base_url = "wss://depth-api-feed.dhan.co/twentydepth"
+   130→            params = {"token": self.access_token, "clientId": self.client_id, "authType": "2"}
+   131→        else:
+   132→            base_url = "wss://api-feed.dhan.co"
+   133→            params = {
+   134→                "version": "2",
+   135→                "token": self.access_token,
+   136→                "clientId": self.client_id,
+   137→                "authType": "2",
+   138→            }
+   139→
+   140→        self.ws_url = f"{base_url}?{urlencode(params)}"
+   141→        self.logger.debug(
+   142→            f"Dhan WebSocket URL constructed: {self.ws_url[:100]}..."
+   143→        )  # Log first 100 chars for security
+   144→
+   145→    def _refresh_access_token(self):
+   146→        """Re-read a fresh access token from the database and rebuild ws_url.
+   147→
+   148→        Indian broker tokens roll over daily at ~3 AM IST. On reconnect we must
+   149→        re-read the current token from the database (bypassing the auth cache,
+   150→        which can hold a stale token after rollover) and rebuild the URL that
+   151→        embeds the token. If no fresh token is available, keep the existing one
+   152→        rather than crashing.
+   153→        """
+   154→        if not self.user_id:
+   155→            return
+   156→        try:
+   157→            fresh_token = get_auth_token(self.user_id, bypass_cache=True)
+   158→            if not fresh_token:
+   159→                self.logger.warning(
+   160→                    "No fresh auth token found on reconnect - keeping existing token"
+   161→                )
+   162→                return
+   163→            with self.lock:
+   164→                self.access_token = fresh_token
+   165→                self._build_url()
+   166→            self.logger.info("Refreshed Dhan access token from database for reconnect")
+   167→        except Exception as e:
+   168→            self.logger.error(f"Error refreshing access token on reconnect: {e}")
+   169→
+   170→    def connect(self):
+   171→        """Establish WebSocket connection"""
+   172→        if self.running:
+   173→            self.logger.warning("Already connected or connecting")
+   174→            return
+   175→
+   176→        self.running = True
+   177→        self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
+   178→        self.ws_thread.start()
+   179→
+   180→    def _run_websocket(self):
+   181→        """Run the WebSocket connection in a separate thread with exponential backoff"""
+   182→        reconnect_attempt = 0
+   183→        max_reconnect_attempts = 10
+   184→        base_delay = 5
+   185→        max_delay = 60
+   186→
+   187→        while self.running:
+   188→            try:
+   189→                self.ws = websocket.WebSocketApp(
+   190→                    self.ws_url,
+   191→                    on_open=self._on_open,
+   192→                    on_message=self._on_message,
+   193→                    on_error=self._on_error,
+   194→                    on_close=self._on_close,
+   195→                    # Stamp the liveness clock on protocol ping/pong too, not just
+   196→                    # on broker code-0 heartbeats — so the data-stall watchdog can
+   197→                    # never false-fire while the socket is provably alive.
+   198→                    on_ping=lambda ws, msg: setattr(self, "last_message_time", time.time()),
+   199→                    on_pong=lambda ws, msg: setattr(self, "last_message_time", time.time()),
+   200→                )
+   201→
+   202→                # Run the WebSocket with ping interval
+   203→                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+   204→
+   205→            except Exception as e:
+   206→                self.logger.error(f"WebSocket connection error: {e}", exc_info=True)
+   207→                self.connected = False
+   208→
+   209→            # Check for fatal error - stop immediately without reconnecting
+   210→            if self._fatal_error:
+   211→                self.logger.error(
+   212→                    f"Stopping WebSocket due to fatal error: {self._fatal_error_message}"
+   213→                )
+   214→                self.running = False
+   215→                break
+   216→
+   217→            if self.running:
+   218→                # Reset counter if the connection was successfully established
+   219→                # before it dropped. self.connected can't be used here because
+   220→                # _on_close already set it to False before run_forever returned.
+   221→                if self._was_connected:
+   222→                    reconnect_attempt = 0
+   223→                    self._was_connected = False
+   224→
+   225→                reconnect_attempt += 1
+   226→                if reconnect_attempt >= max_reconnect_attempts:
+   227→                    self.logger.error(
+   228→                        f"Maximum reconnection attempts ({max_reconnect_attempts}) reached. Stopping."
+   229→                    )
+   230→                    self.running = False
+   231→                    break
+   232→
+   233→                # Calculate delay with exponential backoff
+   234→                delay = min(base_delay * (2 ** (reconnect_attempt - 1)), max_delay)
+   235→                self.logger.info(
+   236→                    f"Reconnecting in {delay} seconds... (attempt {reconnect_attempt}/{max_reconnect_attempts})"
+   237→                )
+   238→                time.sleep(delay)
+   239→
+   240→                # Re-read a fresh access token from the database before the loop
+   241→                # rebuilds the WebSocketApp with self.ws_url. Without this, a
+   242→                # reconnect after the ~3 AM IST daily token rollover would reuse
+   243→                # the dead construction-time token and the feed would stay dead
+   244→                # until a process restart.
+   245→                self._refresh_access_token()
+   246→
+   247→    def disconnect(self):
+   248→        """Disconnect from WebSocket with proper resource cleanup"""
+   249→        # Store connected state before clearing
+   250→        was_connected = self.connected
+   251→
+   252→        self.running = False
+   253→        self.connected = False
+   254→
+   255→        # Send disconnect message if was connected
+   256→        if self.ws and was_connected:
+   257→            try:
+   258→                disconnect_msg = json.dumps({"RequestCode": self.REQUEST_CODES["DISCONNECT"]})
+   259→                if hasattr(self.ws, "send") and callable(self.ws.send):
+   260→                    self.ws.send(disconnect_msg)
+   261→            except Exception as e:
+   262→                self.logger.debug(f"Error sending disconnect message: {e}")
+   263→
+   264→        # Close WebSocket with try/finally to ensure reference is cleared
+   265→        if self.ws:
+   266→            try:
+   267→                self.ws.close()
+   268→            except Exception as e:
+   269→                self.logger.debug(f"Error closing WebSocket: {e}")
+   270→            finally:
+   271→                self.ws = None  # Always clear WebSocket reference
+   272→
+   273→        # Wait for WebSocket thread to finish.
+   274→        # Under eventlet, thread.join(timeout) raises eventlet.timeout.Timeout
+   275→        # instead of returning silently, so we must catch it.
+   276→        if self.ws_thread and self.ws_thread.is_alive():
+   277→            try:
+   278→                self.ws_thread.join(timeout=2)
+   279→            except Exception:
+   280→                # Catches eventlet.timeout.Timeout (and any other join errors)
+   281→                pass
+   282→            if self.ws_thread and self.ws_thread.is_alive():
+   283→                self.logger.debug("WebSocket thread timeout - will be orphaned (daemon)")
+   284→            else:
+   285→                self.logger.debug("WebSocket thread stopped")
+   286→        self.ws_thread = None  # Clear thread reference
+   287→
+   288→        # Clear subscription tracking
+   289→        with self.lock:
+   290→            self.subscriptions.clear()
+   291→
+   292→    def subscribe(self, instruments: list[dict[str, str]], mode: str = "FULL"):
+   293→        """
+   294→        Subscribe to market data for instruments
+   295→
+   296→        Args:
+   297→            instruments: List of dicts with 'ExchangeSegment' and 'SecurityId'
+   298→            mode: Subscription mode - 'TICKER', 'QUOTE', 'FULL', '20_DEPTH'
+   299→        """
+   300→        if not self.connected:
+   301→            self.logger.error("Not connected to WebSocket")
+   302→            return False
+   303→
+   304→        # Validate mode
+   305→        if self.is_20_depth and mode != "20_DEPTH":
+   306→            self.logger.error("20-depth connection only supports 20_DEPTH mode")
+   307→            return False
+   308→
+   309→        if not self.is_20_depth and mode == "20_DEPTH":
+   310→            self.logger.error("Regular connection doesn't support 20_DEPTH mode")
+   311→            return False
+   312→
+   313→        # Get request code
+   314→        request_code_key = f"SUBSCRIBE_{mode}"
+   315→        if request_code_key not in self.REQUEST_CODES:
+   316→            self.logger.error(f"Invalid subscription mode: {mode}")
+   317→            return False
+   318→
+   319→        request_code = self.REQUEST_CODES[request_code_key]
+   320→
+   321→        # Prepare subscription message
+   322→        # Split instruments into batches (max 100 for regular, all for 20-depth)
+   323→        max_batch_size = 100 if not self.is_20_depth else 50
+   324→
+   325→        for i in range(0, len(instruments), max_batch_size):
+   326→            batch = instruments[i : i + max_batch_size]
+   327→
+   328→            subscribe_msg = {
+   329→                "RequestCode": request_code,
+   330→                "InstrumentCount": len(batch),
+   331→                "InstrumentList": batch,
+   332→            }
+   333→
+   334→            try:
+   335→                if self.ws and hasattr(self.ws, "send") and callable(self.ws.send):
+   336→                    self.ws.send(json.dumps(subscribe_msg))
+   337→
+   338→                    # Track subscriptions
+   339→                    with self.lock:
+   340→                        for inst in batch:
+   341→                            key = f"{inst['ExchangeSegment']}_{inst['SecurityId']}"
+   342→                            self.subscriptions[key] = {"mode": mode, "instrument": inst}
+   343→
+   344→                    self.logger.debug(f"Subscribed to {len(batch)} instruments in {mode} mode")
+   345→                else:
+   346→                    self.logger.error("WebSocket not properly initialized for sending")
+   347→                    return False
+   348→
+   349→            except Exception as e:
+   350→                self.logger.error(f"Error subscribing to instruments: {e}", exc_info=True)
+   351→                return False
+   352→
+   353→        return True
+   354→
+   355→    def unsubscribe(self, instruments: list[dict[str, str]]):
+   356→        """Unsubscribe from market data for instruments.
+   357→
+   358→        Sends the unsubscribe request Dhan actually supports, rather than only
+   359→        forgetting the instrument locally. Without this a long-lived process
+   360→        that rotates symbols accumulates subscriptions broker-side toward the
+   361→        5,000-per-connection limit, invisibly - Dhan does not acknowledge
+   362→        subscribes, so nothing on the wire reveals the leak, and only a
+   363→        reconnect clears it (issue #1924).
+   364→
+   365→        The unsubscribe code depends on the mode the instrument was subscribed
+   366→        in, so each one is grouped by its tracked mode. Local tracking is
+   367→        cleared only after the request is sent, so a send failure leaves the
+   368→        instrument tracked and it stays consistent with the broker.
+   369→        """
+   370→        if not instruments:
+   371→            return True
+   372→
+   373→        # Not connected means there is no broker-side subscription left to
+   374→        # cancel - the connection dropping already cleared it. Just drop local
+   375→        # tracking, which also stops _resubscribe_all() restoring it later.
+   376→        if not self.connected:
+   377→            with self.lock:
+   378→                for inst in instruments:
+   379→                    self.subscriptions.pop(
+   380→                        f"{inst['ExchangeSegment']}_{inst['SecurityId']}", None
+   381→                    )
+   382→            self.logger.debug(
+   383→                f"Not connected; dropped {len(instruments)} instruments from tracking"
+   384→            )
+   385→            return True
+   386→
+   387→        # Group by the mode each instrument was actually subscribed in, and
+   388→        # send the tracked instrument dict rather than the caller's, so the
+   389→        # payload matches what was subscribed.
+   390→        by_mode: dict[str, list[tuple[str, dict[str, str]]]] = {}
+   391→        with self.lock:
+   392→            for inst in instruments:
+   393→                key = f"{inst['ExchangeSegment']}_{inst['SecurityId']}"
+   394→                tracked = self.subscriptions.get(key)
+   395→                if tracked is None:
+   396→                    continue
+   397→                by_mode.setdefault(tracked["mode"], []).append((key, tracked["instrument"]))
+   398→
+   399→        if not by_mode:
+   400→            self.logger.debug("No tracked subscriptions matched the unsubscribe request")
+   401→            return True
+   402→
+   403→        # Same batch limits as subscribe().
+   404→        max_batch_size = 50 if self.is_20_depth else 100
+   405→        all_ok = True
+   406→
+   407→        for mode, entries in by_mode.items():
+   408→            request_code = self.REQUEST_CODES.get(f"UNSUBSCRIBE_{mode}")
+   409→            if request_code is None:
+   410→                self.logger.error(f"No unsubscribe code for mode {mode}; leaving it subscribed")
+   411→                all_ok = False
+   412→                continue
+   413→
+   414→            for i in range(0, len(entries), max_batch_size):
+   415→                batch = entries[i : i + max_batch_size]
+   416→                unsubscribe_msg = {
+   417→                    "RequestCode": request_code,
+   418→                    "InstrumentCount": len(batch),
+   419→                    "InstrumentList": [inst for _, inst in batch],
+   420→                }
+   421→
+   422→                try:
+   423→                    if not (self.ws and hasattr(self.ws, "send") and callable(self.ws.send)):
+   424→                        self.logger.error("WebSocket not properly initialized for sending")
+   425→                        return False
+   426→
+   427→                    self.ws.send(json.dumps(unsubscribe_msg))
+   428→
+   429→                    # Only now is it safe to forget them.
+   430→                    with self.lock:
+   431→                        for key, _ in batch:
+   432→                            self.subscriptions.pop(key, None)
+   433→
+   434→                    self.logger.debug(
+   435→                        f"Unsubscribed from {len(batch)} instruments in {mode} mode "
+   436→                        f"(RequestCode {request_code})"
+   437→                    )
+   438→                except Exception as e:
+   439→                    self.logger.error(
+   440→                        f"Error unsubscribing from instruments: {e}", exc_info=True
+   441→                    )
+   442→                    all_ok = False
+   443→
+   444→        return all_ok
+   445→
+   446→    def _on_open(self, ws):
+   447→        """Handle WebSocket connection open"""
+   448→        self.connected = True
+   449→        self._was_connected = True
+   450→        # Seed the watchdog so it doesn't false-trigger on a slow startup
+   451→        # before the first tick lands.
+   452→        self.last_message_time = time.time()
+   453→        self.logger.debug("WebSocket connection established")
+   454→
+   455→        # Start (or restart) the data-stall watchdog
+   456→        self._start_health_check()
+   457→
+   458→        # Replay tracked subscriptions so a reconnect transparently restores
+   459→        # the prior feed (issue #1372 — was caller responsibility).
+   460→        self._resubscribe_all()
+   461→
+   462→        if self.on_open:
+   463→            self.on_open(self)
+   464→
+   465→    def _resubscribe_all(self):
+   466→        """Re-subscribe to all tracked instruments after a reconnect.
+   467→
+   468→        Snapshot under the lock, group by mode, batch per Dhan limits
+   469→        (100 regular / 50 20-depth), and send the raw subscribe message
+   470→        without re-mutating self.subscriptions (which is already populated).
+   471→        Failure of any single batch is logged but does not abort the
+   472→        rest — partial recovery is better than no recovery.
+   473→        """
+   474→        with self.lock:
+   475→            if not self.subscriptions:
+   476→                return
+   477→            snapshot = list(self.subscriptions.values())
+   478→
+   479→        # Group instruments by subscription mode
+   480→        by_mode: dict[str, list[dict]] = {}
+   481→        for entry in snapshot:
+   482→            mode = entry.get("mode")
+   483→            instrument = entry.get("instrument")
+   484→            if not mode or not instrument:
+   485→                continue
+   486→            by_mode.setdefault(mode, []).append(instrument)
+   487→
+   488→        max_batch_size = 50 if self.is_20_depth else 100
+   489→
+   490→        for mode, instruments in by_mode.items():
+   491→            request_code = self.REQUEST_CODES.get(f"SUBSCRIBE_{mode}")
+   492→            if request_code is None:
+   493→                self.logger.warning(
+   494→                    f"Skipping resubscribe for unknown mode {mode}"
+   495→                )
+   496→                continue
+   497→
+   498→            for i in range(0, len(instruments), max_batch_size):
+   499→                batch = instruments[i : i + max_batch_size]
+   500→                msg = {
+   501→                    "RequestCode": request_code,
+   502→                    "InstrumentCount": len(batch),
+   503→                    "InstrumentList": batch,
+   504→                }
+   505→                try:
+   506→                    if self.ws and hasattr(self.ws, "send") and callable(self.ws.send):
+   507→                        self.ws.send(json.dumps(msg))
+   508→                        self.logger.info(
+   509→                            f"Resubscribed batch of {len(batch)} instruments in {mode} mode"
+   510→                        )
+   511→                except Exception as e:
+   512→                    self.logger.error(
+   513→                        f"Error resubscribing batch in {mode}: {e}", exc_info=True
+   514→                    )
+   515→
+   516→    def _start_health_check(self):
+   517→        """Start the data-stall watchdog thread (issue #1372).
+   518→
+   519→        Idempotent — a re-entry from a fresh _on_open while the previous
+   520→        thread is still alive is a no-op; the previous loop will exit on
+   521→        its next iteration when self.connected goes False.
+   522→        """
+   523→        if self._health_check_thread and self._health_check_thread.is_alive():
+   524→            return
+   525→        self._health_check_thread = threading.Thread(
+   526→            target=self._health_check_loop, daemon=True
+   527→        )
+   528→        self._health_check_thread.start()
+   529→
+   530→    def _health_check_loop(self):
+   531→        """Detect silent data stalls — close the socket if no frames arrive
+   532→        within DATA_TIMEOUT. _run_websocket handles the close as a normal
+   533→        disconnect and reconnects with the existing exponential backoff.
+   534→        """
+   535→        while self.running and self.connected:
+   536→            time.sleep(self.HEALTH_CHECK_INTERVAL)
+   537→            if not self.running or not self.connected:
+   538→                break
+   539→            if self.last_message_time is None:
+   540→                continue
+   541→            elapsed = time.time() - self.last_message_time
+   542→            if elapsed > self.DATA_TIMEOUT:
+   543→                self.logger.error(
+   544→                    f"Data stall detected - no data for {elapsed:.1f}s "
+   545→                    f"(threshold {self.DATA_TIMEOUT}s). Forcing reconnect..."
+   546→                )
+   547→                if self.ws:
+   548→                    try:
+   549→                        self.ws.close()
+   550→                    except Exception as e:
+   551→                        self.logger.warning(
+   552→                            f"Error closing WebSocket during stall reconnect: {e}"
+   553→                        )
+   554→                break
+   555→
+   556→    def _on_error(self, ws, error):
+   557→        """Handle WebSocket errors with detection of fatal/non-recoverable errors"""
+   558→        error_str = str(error)
+   559→        self.logger.error(f"WebSocket error: {error}")
+   560→
+   561→        # Detect fatal errors that should stop reconnection
+   562→        if self._is_fatal_error(error_str):
+   563→            self._fatal_error = True
+   564→            self._fatal_error_message = self._get_fatal_error_message(error_str)
+   565→            self.logger.error(
+   566→                f"Fatal WebSocket error detected - stopping reconnection. "
+   567→                f"Reason: {self._fatal_error_message}"
+   568→            )
+   569→            self.running = False  # Stop the reconnection loop
+   570→
+   571→        if self.on_error:
+   572→            self.on_error(self, error)
+   573→
+   574→    def _is_fatal_error(self, error_str: str) -> bool:
+   575→        """Check if a WebSocket error is fatal (non-recoverable)"""
+   576→        error_lower = error_str.lower()
+   577→        fatal_indicators = [
+   578→            "429",                          # HTTP 429 Too Many Requests
+   579→            "too many requests",            # Rate limited / subscription expired
+   580→            "client id is blocked",         # IP/client blocked by Dhan
+   581→            "subscription",                 # Subscription related errors
+   582→            "plan",                         # Plan/subscription expired
+   583→        ]
+   584→        return any(indicator in error_lower for indicator in fatal_indicators)
+   585→
+   586→    def _get_fatal_error_message(self, error_str: str) -> str:
+   587→        """Get a user-friendly message for fatal WebSocket errors"""
+   588→        error_lower = error_str.lower()
+   589→
+   590→        if "429" in error_lower or "too many requests" in error_lower or "client id is blocked" in error_lower:
+   591→            return (
+   592→                "Dhan WebSocket connection blocked (HTTP 429 - Too Many Requests). "
+   593→                "This usually means your Dhan data subscription has expired or is inactive. "
+   594→                "Please check your Dhan data subscription status at https://dhan.co and ensure "
+   595→                "you have an active market data subscription plan."
+   596→            )
+   597→
+   598→        return f"Dhan WebSocket fatal error: {error_str}"
+   599→
+   600→    def _on_close(self, ws, close_status_code, close_msg):
+   601→        """Handle WebSocket connection close"""
+   602→        self.connected = False
+   603→
+   604→        # Only log warning for unexpected disconnects (not during intentional shutdown)
+   605→        if self.running and (close_status_code is None or close_status_code == 1000):
+   606→            self.logger.warning(
+   607→                f"WebSocket closed unexpectedly: status={close_status_code}, "
+   608→                f"message='{close_msg}'. This may indicate: 1) Multiple concurrent connections "
+   609→                f"with same credentials, 2) Invalid/expired token, or 3) Server-side rate limiting."
+   610→            )
+   611→        elif not self.running:
+   612→            self.logger.debug(f"WebSocket closed during shutdown: status={close_status_code}")
+   613→        else:
+   614→            self.logger.debug(f"WebSocket connection closed: {close_status_code} - {close_msg}")
+   615→
+   616→        if self.on_close:
+   617→            self.on_close(self)
+   618→
+   619→    def _on_message(self, ws, message):
+   620→        """Handle incoming WebSocket messages"""
+   621→        try:
+   622→            # Stamp every inbound frame for the data-stall watchdog. Even
+   623→            # broker heartbeats (response code 0) keep the timestamp fresh,
+   624→            # which is what we want — a healthy broker session is one that
+   625→            # sends *something* within DATA_TIMEOUT.
+   626→            self.last_message_time = time.time()
+   627→
+   628→            # All Dhan responses are binary
+   629→            if isinstance(message, (bytes, bytearray)):
+   630→                self.logger.debug(f"Received binary message of length: {len(message)} bytes")
+   631→                self._parse_binary_message(message)
+   632→            else:
+   633→                self.logger.warning(f"Received non-binary message: {type(message)}: {message}")
+   634→
+   635→        except Exception as e:
+   636→            self.logger.error(f"Error processing message: {e}", exc_info=True)
+   637→
+   638→    def _parse_binary_message(self, data: bytes):
+   639→        """Parse binary message from Dhan"""
+   640→        if self.is_20_depth:
+   641→            self._parse_20_depth_message(data)
+   642→        else:
+   643→            self._parse_regular_message(data)
+   644→
+   645→    def _parse_regular_message(self, data: bytes):
+   646→        """Parse regular (5-depth) binary message"""
+   647→        offset = 0
+   648→
+   649→        while offset < len(data):
+   650→            if offset + 8 > len(data):
+   651→                break
+   652→
+   653→            # Parse header (8 bytes)
+   654→            feed_response_code = struct.unpack("<B", data[offset : offset + 1])[0]
+   655→            message_length = struct.unpack("<H", data[offset + 1 : offset + 3])[0]
+   656→            exchange_segment = struct.unpack("<B", data[offset + 3 : offset + 4])[0]
+   657→            security_id = struct.unpack("<I", data[offset + 4 : offset + 8])[0]
+   658→
+   659→            self.logger.debug(
+   660→                f"Parsed header - Code: {feed_response_code}, Length: {message_length}, Exchange: {exchange_segment}, Security: {security_id}"
+   661→            )
+   662→
+   663→            # Parse payload based on response code
+   664→            payload_start = offset + 8
+   665→            payload_end = offset + message_length
+   666→
+   667→            if payload_end > len(data):
+   668→                self.logger.warning("Incomplete message received")
+   669→                break
+   670→
+   671→            payload = data[payload_start:payload_end]
+   672→
+   673→            # Parse based on feed response code
+   674→            parsed_data = None
+   675→
+   676→            if feed_response_code == 2:  # Ticker
+   677→                self.logger.debug("Parsing TICKER packet")
+   678→                parsed_data = self._parse_ticker_packet(payload, exchange_segment, security_id)
+   679→            elif feed_response_code == 4:  # Quote
+   680→                self.logger.debug("Parsing QUOTE packet")
+   681→                parsed_data = self._parse_quote_packet(payload, exchange_segment, security_id)
+   682→            elif feed_response_code == 5:  # OI
+   683→                self.logger.debug("Parsing OI packet")
+   684→                parsed_data = self._parse_oi_packet(payload, exchange_segment, security_id)
+   685→            elif feed_response_code == 6:  # Prev Close
+   686→                self.logger.debug("Parsing PREV_CLOSE packet")
+   687→                parsed_data = self._parse_prev_close_packet(payload, exchange_segment, security_id)
+   688→            elif feed_response_code == 8:  # Full
+   689→                self.logger.debug("Parsing FULL packet")
+   690→                parsed_data = self._parse_full_packet(payload, exchange_segment, security_id)
+   691→            elif feed_response_code == 50:  # Disconnect
+   692→                self.logger.debug("Parsing DISCONNECT packet")
+   693→                self._handle_disconnect_packet(payload)
+   694→            elif feed_response_code == 0:
+   695→                # Response code 0 is a heartbeat/acknowledgment from Dhan - silently ignore
+   696→                pass
+   697→            else:
+   698→                self.logger.debug(f"Unknown feed response code: {feed_response_code}")
+   699→
+   700→            if parsed_data and self.on_data:
+   701→                self.logger.debug(f"Sending parsed data to callback: {parsed_data.get('type')}")
+   702→                self.on_data(self, parsed_data)
+   703→            elif parsed_data:
+   704→                self.logger.warning("Parsed data available but no callback set")
+   705→
+   706→            # Move to next message
+   707→            offset = payload_end
+   708→
+   709→    def _parse_20_depth_message(self, data: bytes):
+   710→        """Parse 20-level depth binary message"""
+   711→        offset = 0
+   712→
+   713→        # self.logger.info(f"Parsing 20-depth message with {len(data)} bytes")
+   714→
+   715→        while offset < len(data):
+   716→            if offset + 12 > len(data):
+   717→                break
+   718→
+   719→            # Parse header (12 bytes for 20-depth)
+   720→            message_length = struct.unpack("<H", data[offset : offset + 2])[0]
+   721→            feed_response_code = struct.unpack("<B", data[offset + 2 : offset + 3])[0]
+   722→            exchange_segment = struct.unpack("<B", data[offset + 3 : offset + 4])[0]
+   723→            security_id = struct.unpack("<I", data[offset + 4 : offset + 8])[0]
+   724→            # Skip message sequence (4 bytes)
+   725→
+   726→            # Parse payload
+   727→            payload_start = offset + 12
+   728→            payload_end = offset + message_length
+   729→
+   730→            if payload_end > len(data):
+   731→                self.logger.warning("Incomplete 20-depth message received")
+   732→                break
+   733→
+   734→            payload = data[payload_start:payload_end]
+   735→
+   736→            # Parse based on feed response code
+   737→            if feed_response_code in [41, 51]:  # 20-depth bid/ask
+   738→                side = "BID" if feed_response_code == 41 else "ASK"
+   739→                # self.logger.info(f"Parsing 20-depth {side} packet for security {security_id}")
+   740→
+   741→                parsed_data = self._parse_20_depth_packet(
+   742→                    payload, exchange_segment, security_id, is_bid=(feed_response_code == 41)
+   743→                )
+   744→
+   745→                if parsed_data and self.on_data:
+   746→                    # self.logger.info(f"Sending 20-depth {side} data to callback")
+   747→                    self.on_data(self, parsed_data)
+   748→                else:
+   749→                    self.logger.warning(f"Failed to parse 20-depth {side} data")
+   750→            elif feed_response_code == 0:
+   751→                # Response code 0 is a heartbeat/acknowledgment from Dhan - silently ignore
+   752→                pass
+   753→            else:
+   754→                self.logger.debug(f"Unknown 20-depth response code: {feed_response_code}")
+   755→
+   756→            # Move to next message
+   757→            offset = payload_end
+   758→
+   759→    def _parse_ticker_packet(
+   760→        self, payload: bytes, exchange_segment: int, security_id: int
+   761→    ) -> dict[str, Any]:
+   762→        """Parse ticker packet (LTP and LTT)"""
+   763→        if len(payload) < 8:
+   764→            return None
+   765→
+   766→        ltp = struct.unpack("<f", payload[0:4])[0]
+   767→        ltt = struct.unpack("<I", payload[4:8])[0]
+   768→
+   769→        return {
+   770→            "type": "ticker",
+   771→            "exchange_segment": exchange_segment,
+   772→            "security_id": str(security_id),
+   773→            "ltp": ltp,
+   774→            "ltt": ltt,
+   775→        }
+   776→
+   777→    def _parse_quote_packet(
+   778→        self, payload: bytes, exchange_segment: int, security_id: int
+   779→    ) -> dict[str, Any]:
+   780→        """Parse quote packet"""
+   781→        if len(payload) < 42:
+   782→            return None
+   783→
+   784→        return {
+   785→            "type": "quote",
+   786→            "exchange_segment": exchange_segment,
+   787→            "security_id": str(security_id),
+   788→            "ltp": struct.unpack("<f", payload[0:4])[0],
+   789→            "ltq": struct.unpack("<H", payload[4:6])[0],
+   790→            "ltt": struct.unpack("<I", payload[6:10])[0],
+   791→            "atp": struct.unpack("<f", payload[10:14])[0],
+   792→            "volume": struct.unpack("<I", payload[14:18])[0],
+   793→            "total_sell_quantity": struct.unpack("<I", payload[18:22])[0],
+   794→            "total_buy_quantity": struct.unpack("<I", payload[22:26])[0],
+   795→            "open": struct.unpack("<f", payload[26:30])[0],
+   796→            "close": struct.unpack("<f", payload[30:34])[0],
+   797→            "high": struct.unpack("<f", payload[34:38])[0],
+   798→            "low": struct.unpack("<f", payload[38:42])[0],
+   799→        }
+   800→
+   801→    def _parse_oi_packet(
+   802→        self, payload: bytes, exchange_segment: int, security_id: int
+   803→    ) -> dict[str, Any]:
+   804→        """Parse OI packet"""
+   805→        if len(payload) < 4:
+   806→            return None
+   807→
+   808→        return {
+   809→            "type": "oi",
+   810→            "exchange_segment": exchange_segment,
+   811→            "security_id": str(security_id),
+   812→            "oi": struct.unpack("<I", payload[0:4])[0],
+   813→        }
+   814→
+   815→    def _parse_prev_close_packet(
+   816→        self, payload: bytes, exchange_segment: int, security_id: int
+   817→    ) -> dict[str, Any]:
+   818→        """Parse previous close packet"""
+   819→        if len(payload) < 8:
+   820→            return None
+   821→
+   822→        return {
+   823→            "type": "prev_close",
+   824→            "exchange_segment": exchange_segment,
+   825→            "security_id": str(security_id),
+   826→            "prev_close": struct.unpack("<f", payload[0:4])[0],
+   827→            "prev_oi": struct.unpack("<I", payload[4:8])[0],
+   828→        }
+   829→
+   830→    def _parse_full_packet(
+   831→        self, payload: bytes, exchange_segment: int, security_id: int
+   832→    ) -> dict[str, Any]:
+   833→        """Parse full packet (includes 5-level depth)"""
+   834→        # Payload should be 154 bytes (162 total - 8 byte header)
+   835→        if len(payload) < 154:
+   836→            self.logger.warning(
+   837→                f"FULL packet payload too short: {len(payload)} bytes, expected 154"
+   838→            )
+   839→            return None
+   840→
+   841→        self.logger.debug(f"Parsing FULL packet with payload length: {len(payload)}")
+   842→
+   843→        result = {
+   844→            "type": "full",
+   845→            "exchange_segment": exchange_segment,
+   846→            "security_id": str(security_id),
+   847→            "ltp": struct.unpack("<f", payload[0:4])[0],
+   848→            "ltq": struct.unpack("<H", payload[4:6])[0],
+   849→            "ltt": struct.unpack("<I", payload[6:10])[0],
+   850→            "atp": struct.unpack("<f", payload[10:14])[0],
+   851→            "volume": struct.unpack("<I", payload[14:18])[0],
+   852→            "total_sell_quantity": struct.unpack("<I", payload[18:22])[0],
+   853→            "total_buy_quantity": struct.unpack("<I", payload[22:26])[0],
+   854→            "oi": struct.unpack("<I", payload[26:30])[0],
+   855→            "oi_high": struct.unpack("<I", payload[30:34])[0],
+   856→            "oi_low": struct.unpack("<I", payload[34:38])[0],
+   857→            "open": struct.unpack("<f", payload[38:42])[0],
+   858→            "close": struct.unpack("<f", payload[42:46])[0],
+   859→            "high": struct.unpack("<f", payload[46:50])[0],
+   860→            "low": struct.unpack("<f", payload[50:54])[0],
+   861→            "depth": {"buy": [], "sell": []},
+   862→        }
+   863→
+   864→        # Parse 5-level depth (100 bytes starting at offset 54)
+   865→        depth_offset = 54
+   866→        for i in range(5):
+   867→            packet_offset = depth_offset + (i * 20)
+   868→
+   869→            bid_qty = struct.unpack("<I", payload[packet_offset : packet_offset + 4])[0]
+   870→            ask_qty = struct.unpack("<I", payload[packet_offset + 4 : packet_offset + 8])[0]
+   871→            bid_orders = struct.unpack("<H", payload[packet_offset + 8 : packet_offset + 10])[0]
+   872→            ask_orders = struct.unpack("<H", payload[packet_offset + 10 : packet_offset + 12])[0]
+   873→            bid_price = struct.unpack("<f", payload[packet_offset + 12 : packet_offset + 16])[0]
+   874→            ask_price = struct.unpack("<f", payload[packet_offset + 16 : packet_offset + 20])[0]
+   875→
+   876→            result["depth"]["buy"].append(
+   877→                {"price": bid_price, "quantity": bid_qty, "orders": bid_orders}
+   878→            )
+   879→
+   880→            result["depth"]["sell"].append(
+   881→                {"price": ask_price, "quantity": ask_qty, "orders": ask_orders}
+   882→            )
+   883→
+   884→        self.logger.debug(
+   885→            f"FULL packet parsed successfully: LTP={result.get('ltp')}, Volume={result.get('volume')}"
+   886→        )
+   887→        return result
+   888→
+   889→    def _parse_20_depth_packet(
+   890→        self, payload: bytes, exchange_segment: int, security_id: int, is_bid: bool
+   891→    ) -> dict[str, Any]:
+   892→        """Parse 20-level depth packet"""
+   893→        if len(payload) < 320:  # 20 levels * 16 bytes
+   894→            return None
+   895→
+   896→        levels = []
+   897→        for i in range(20):
+   898→            offset = i * 16
+   899→            price = struct.unpack("<d", payload[offset : offset + 8])[0]
+   900→            quantity = struct.unpack("<I", payload[offset + 8 : offset + 12])[0]
+   901→            orders = struct.unpack("<I", payload[offset + 12 : offset + 16])[0]
+   902→
+   903→            levels.append({"price": price, "quantity": quantity, "orders": orders})
+   904→
+   905→        return {
+   906→            "type": "depth_20",
+   907→            "exchange_segment": exchange_segment,
+   908→            "security_id": str(security_id),
+   909→            "side": "buy" if is_bid else "sell",
+   910→            "levels": levels,
+   911→        }
+   912→
+   913→    def _handle_disconnect_packet(self, payload: bytes):
+   914→        """Handle disconnect packet"""
+   915→        if len(payload) >= 2:
+   916→            disconnect_code = struct.unpack("<H", payload[0:2])[0]
+   917→            self.logger.warning(f"Received disconnect packet with code: {disconnect_code}")
+   918→
+   919→            # Common disconnect codes
+   920→            disconnect_reasons = {805: "Maximum websocket connections exceeded"}
+   921→
+   922→            reason = disconnect_reasons.get(disconnect_code, "Unknown reason")
+   923→            self.logger.warning(f"Disconnect reason: {reason}")
+   924→
+   925→    def cleanup(self):
+   926→        """
+   927→        Full cleanup of all resources. Call this when completely done with the instance.
+   928→        """
+   929→        self.logger.debug("Running full cleanup of DhanWebSocket...")
+   930→        self.disconnect()
+   931→
+   932→        # Clear all callbacks to prevent circular references
+   933→        self.on_open = None
+   934→        self.on_message = None
+   935→        self.on_data = None
+   936→        self.on_error = None
+   937→        self.on_close = None
+   938→
+   939→        self.logger.debug("DhanWebSocket cleanup completed")
+   940→
+   941→    def __del__(self):
+   942→        """Destructor to ensure resources are cleaned up"""
+   943→        try:
+   944→            if hasattr(self, 'running') and self.running:
+   945→                self.running = False
+   946→                self.connected = False
+   947→                # Try to close WebSocket if still open
+   948→                if hasattr(self, 'ws') and self.ws:
+   949→                    try:
+   950→                        self.ws.close()
+   951→                    except Exception:
+   952→                        pass
+   953→                    self.ws = None
+   954→        except Exception:
+   955→            pass  # Ignore errors during destruction
+   956→

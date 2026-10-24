@@ -47,9 +47,17 @@ Session flows (per broker, every attempt logged to console + `broker_logs`):
 | `POST /api/broker-sessions` | `{accountId?}` — force-validate one account (or all) now |
 | `POST /api/broker-test` | `{accountId}` — 4-step connectivity test: credentials → adapter mode → funds ₹ → quote LTP (timed, each underlying call logged) |
 | `GET /api/broker-logs` | per-account raw call logs (every outbound broker call is tagged `[BROKER][tag]` and mirrored here) |
-| `GET /api/feed/status` | live broker feed engine status: active source, ticking state, last tick age, last error, recent log lines |
+| `GET /api/feed/status` | live broker feed engine status: active source, ticking state, last tick age, last error, recent log lines — **round-26 adds** `dropped` (ticks rejected by the source gate + `dropReasons`: `sim-off` / `not-source` / `cross-account`), `epoch` (purge generation), `waiting` (live source connected but zero ticks — market closed/holiday), `noSource` (Live-Only with no live source picked), `liveOnly` |
 | `GET /api/broker-orderbook` | live order book for one account |
 | `GET /api/admin/audit` | order audit trail |
+
+### Feed source discipline (round-26)
+
+- **Exactly ONE source** serves every symbol — the user's pick in the FEED chip (a live broker account, or sim). There is **no fallback**: not to other connected accounts, not to sandbox, not to sim. If the picked source cannot serve a symbol (no master mapping / not connected / broker rejects), the hub broadcasts `feed:down {symbol, reason}` and the panel stays EMPTY with the reason shown in the FEED chip.
+- **Hard tick gate** — `_on_broker_tick` drops any tick that is not from the active source: sim ticks die under Live-Only / live mode / an explicit live source; broker ticks from any other account are dropped (`cross-account`), even if that account happens to serve the symbol. Counters surface in `/feed/status`.
+- **Purge on every switch/toggle** — `set_feed_source` and the Live-Only toggle release the old stream's subscriptions, clear ticks + aggregates + routing, bump `epoch` and broadcast `feed:epoch`; browser clients clear all cached ticks/candles/quotes on that event. `POST /pyapi/feed {simDisabled:true}` hard-stops the sim engine (adapter + stream disconnected, stale routing dropped) and it self-heals when Live-Only is turned back off.
+- Boot respects Live-Only: `main.py` does NOT connect the sim account when `sim_disabled=1` — nothing synthetic can ever tick before the user picks a live source.
+- `POST /pyapi/feed {simDisabled:true}` while the source is still `sim` now **succeeds with guidance** (`message` field) instead of a 400 — the hub honest-downs (`noSource`) until a live source is picked.
 
 ### Workspace
 

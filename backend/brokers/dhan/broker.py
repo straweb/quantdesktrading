@@ -183,15 +183,25 @@ class DhanAdapter(BaseBroker):
                 rem = r.get("remarks") or {}
                 raise BrokerError(f"Dhan API: {rem.get('error_message') or rem.get('error_code') or 'failure'} "
                                   "— check the access token and the static-IP whitelist")
-        avail = float(r.get("availableBalance") or 0)
-        used = float(r.get("utilizedAmount") or 0)
+        # Round-26 (hedging-verified): the field is Dhan's own typo
+        # 'availabelBalance', and it INCLUDES pledged collateral — subtract
+        # collateralAmount so the terminal sees deployable cash only.
+        def _f(k):
+            try:
+                return float(r.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        avail = max(0.0, _f("availabelBalance") or _f("availableBalance") - _f("collateralAmount"))
+        used = _f("utilizedAmount")
         return {"available": round(avail, 2), "used": round(used, 2),
                 "total": round(avail + used, 2), "raw": r, "source": "dhan-live"}
 
     async def get_positions(self) -> list[dict]:
         r = await self._request("GET", f"{REST}/positions", headers=self._headers(), tag="positions")
+        # Round-26 (hedging-verified): Dhan v2 returns a BARE LIST here
+        rows = r if isinstance(r, list) else (r.get("data") if isinstance(r.get("data"), list) else [])
         out = []
-        for p in (r.get("data") if isinstance(r.get("data"), list) else []):
+        for p in rows:
             out.append({"symbol": str(p.get("tradingSymbol", "")),
                         "qty": float(p.get("netQty") or 0),
                         "avg_price": float(p.get("averageTradedPrice") or 0),
@@ -202,7 +212,7 @@ class DhanAdapter(BaseBroker):
 
     async def get_orderbook(self) -> list[dict]:
         r = await self._request("GET", f"{REST}/orders", headers=self._headers(), tag="orders")
-        return r.get("data") if isinstance(r.get("data"), list) else []
+        return r if isinstance(r, list) else (r.get("data") if isinstance(r.get("data"), list) else [])
 
     # ------------------------------------------------------------------ orders
     async def place_order(self, symbol, side, qty, order_type="MARKET", price=None,
@@ -210,13 +220,35 @@ class DhanAdapter(BaseBroker):
         m = self._resolve(symbol)
         if not m:
             raise BrokerError(f"symbol {symbol} not in Dhan master — run master sync")
+        ot = (order_type or "MARKET").upper()
+        # Round-26 (hedging-verified): Dhan v2 product/order-type vocab —
+        # MIS->INTRADAY; NRML->MARGIN; SL-M is unreliable on the live API so
+        # STOP_LOSS_MARKET is rewritten to STOP_LOSS with a tick-snapped limit.
+        product_map = {"MIS": "INTRADAY", "INTRADAY": "INTRADAY", "CNC": "CNC",
+                       "NRML": "MARGIN", "MARGIN": "MARGIN", "MTF": "MTF"}
+        order_map = {"MARKET": "MARKET", "LIMIT": "LIMIT",
+                     "SL": "STOP_LOSS", "STOPLOSS": "STOP_LOSS", "STOP_LOSS": "STOP_LOSS",
+                     "SL-M": "STOP_LOSS_MARKET", "SL-MKT": "STOP_LOSS_MARKET",
+                     "STOP_LOSS_MARKET": "STOP_LOSS_MARKET"}
+        otype = order_map.get(ot, "MARKET")
+        px = float(price or 0)
+        if otype == "STOP_LOSS_MARKET" and trigger_price:
+            # MPP guard: SL-M gets mangled by the live API (DH-906) — send a
+            # STOP_LOSS with a protective limit a few ticks beyond the trigger
+            tick = 0.05
+            protective = round((float(trigger_price) + (8 * tick if side.upper() == "BUY"
+                                  else -8 * tick)) / tick) * tick
+            otype = "STOP_LOSS"
+            px = max(0.05, protective)
         payload = {
             "dhanClientId": self.session.get("client_id", ""),
             "transactionType": side.upper(),
             "exchangeSegment": m["exchangeSegment"],
-            "productType": "MIS" if product in ("MIS", "CNC") else product,
-            "orderType": "MARKET" if order_type.upper() == "MARKET" else "LIMIT",
-            "price": float(price or 0),
+            "productType": product_map.get((product or "MIS").upper(), "INTRADAY"),
+            "orderType": otype,
+            "validity": "DAY",
+            "price": px,
+            "triggerPrice": float(trigger_price or 0),
             "quantity": int(qty),
             "securityId": m["securityId"],
         }

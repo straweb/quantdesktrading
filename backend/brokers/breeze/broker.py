@@ -115,9 +115,27 @@ class BreezeAdapter(BaseBroker):
     async def get_funds(self) -> dict:
         r = await self._request("GET", f"{API_URL}funds", headers=self._mk_headers("{}"),
                                 data="{}", tag="funds")
-        s = r.get("Success") or {}
-        avail = float(s.get("net") or 0)
-        used = abs(float(s.get("utilised_debits") or 0))
+        # Round-26 (hedging-verified): Breeze returns Success[0] with the
+        # allocated/unallocated/block split — there is no 'net' field (the old
+        # parse always produced ₹0).
+        suc = r.get("Success")
+        rows = suc if isinstance(suc, list) else ([suc] if isinstance(suc, dict) else [])
+        s = rows[0] if rows else {}
+
+        def _n(k):
+            try:
+                return float(s.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        if s:
+            avail = max(0.0, _n("allocated_equity") + _n("unallocated_balance")
+                        + _n("total_bank_balance") - _n("block_by_trade_balance"))
+            used = abs(_n("allocated_fno") + _n("allocated_commodity")
+                       + _n("block_by_trade_balance"))
+        else:   # legacy shape fallback
+            avail = float((s.get("net") if isinstance(s, dict) else 0) or 0)
+            used = abs(float((s.get("utilised_debits") if isinstance(s, dict) else 0) or 0))
         return {"available": round(avail, 2), "used": round(used, 2),
                 "total": round(avail + used, 2), "raw": s, "source": "breeze-live"}
 

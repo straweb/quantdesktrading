@@ -141,6 +141,18 @@ export function ensureSocket(): Socket {
     })
   })
 
+  // Round-26: when the hub purges (feed-source switch / Live-Only toggle) it
+  // bumps the epoch — every client-side market-data holder must drop its
+  // cached ticks IMMEDIATELY so sim data can never linger under a live source.
+  const purgeLocalTicks = () => {
+    g.__ztermLastTicks = {}
+    g.__ztermListeners.forEach(fn => {
+      try { fn({}) } catch { /* listener guards itself */ }
+    })
+  }
+  socket.on('feed:epoch', purgeLocalTicks)
+  socket.on('feed:source', purgeLocalTicks)
+
   g.__ztermSocket = socket
   return socket
 }

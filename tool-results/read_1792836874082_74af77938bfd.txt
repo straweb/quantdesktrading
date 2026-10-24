@@ -1,0 +1,866 @@
+     1→"""
+     2→ICICI Direct Breeze order & account APIs for OpenAlgo.
+     3→
+     4→Service-facing functions (OpenAlgo contract):
+     5→
+     6→    place_order_api(data, auth)              -> (res, response_data, orderid)
+     7→    place_smartorder_api(data, auth)         -> (res, response_data, orderid)
+     8→    modify_order(data, auth)                 -> (response_message, status_code)
+     9→    cancel_order(orderid, auth)              -> (response_message, status_code)
+    10→    cancel_all_orders_api(data, auth)        -> (canceled_orders, failed)
+    11→    close_all_positions(api_key, auth)       -> (message, status_code)
+    12→    get_open_position(symbol, exch, prod, a) -> int net quantity
+    13→    get_order_book(auth) / get_trade_book(auth)
+    14→    get_positions(auth) / get_holdings(auth) -> raw Breeze response dicts
+    15→
+    16→Breeze notes encoded here:
+    17→
+    18→- ``/order`` (book) and ``/trades`` (trade book) REQUIRE exchange_code,
+    19→  from_date and to_date, and the window may not exceed 90 days. Books are
+    20→  fetched per exchange and merged; completed-day windows are cached
+    21→  in-process because they never change.
+    22→- Order quantities/prices are sent as strings; blank values are omitted.
+    23→- Order ids live in ``Success.order_id``.
+    24→"""
+    25→
+    26→import os
+    27→import threading
+    28→import time
+    29→from datetime import datetime, timedelta
+    30→from types import SimpleNamespace
+    31→
+    32→from broker.icici.api.breeze_client import (
+    33→    breeze_request,
+    34→    get_credentials,
+    35→    response_error,
+    36→    response_status,
+    37→)
+    38→from broker.icici.mapping.order_data import (
+    39→    map_position_data,
+    40→)
+    41→from broker.icici.mapping.transform_data import (
+    42→    map_order_type,
+    43→    map_product_type,
+    44→    reverse_map_product_type,
+    45→    transform_data,
+    46→)
+    47→from utils.logging import get_logger
+    48→
+    49→
+    50→logger = get_logger(__name__)
+    51→
+    52→
+    53→# ---------------------------------------------------------------------------
+    54→# Tunables
+    55→# ---------------------------------------------------------------------------
+    56→
+    57→# Breeze caps order/trade windows at 90 days; stay safely inside.
+    58→BOOK_LOOKBACK_DAYS = int(os.getenv("ICICI_BOOK_LOOKBACK_DAYS", "7"))
+    59→
+    60→# Breeze validated window: 'Number of days between from_date & to_date
+    61→# should not be more than 90' for orders/trades. Chunk well below it.
+    62→BOOK_WINDOW_DAYS = 9
+    63→
+    64→# Exchanges swept for books. MCX included; CDS excluded (Breeze NDX
+    65→# segment has no OpenAlgo trading contract).
+    66→BOOK_EXCHANGES = ("NSE", "BSE", "NFO", "BFO", "MCX")
+    67→
+    68→# Short-TTL caches (positions/orders change only on order events, and the
+    69→# UI / smart-order loops poll frequently).
+    70→_POSITION_CACHE_TTL = 2.0
+    71→_ORDER_INDEX_TTL = 2.5
+    72→_COMPLETED_WINDOW_TTL = 1800.0
+    73→
+    74→
+    75→# ---------------------------------------------------------------------------
+    76→# In-process caches (module level — services build fresh objects per call)
+    77→# ---------------------------------------------------------------------------
+    78→
+    79→_CACHE_LOCK = threading.RLock()
+    80→
+    81→_position_cache: dict[str, tuple[float, dict]] = {}
+    82→
+    83→_order_index_cache: dict[str, tuple[float, dict]] = {}
+    84→
+    85→_completed_window_cache: dict[str, tuple[float, list]] = {}
+    86→
+    87→
+    88→def _cache_key(auth) -> str:
+    89→    try:
+    90→        creds = get_credentials(auth)
+    91→        return f"{creds.user_id}:{creds.session_key[:12]}"
+    92→    except Exception:
+    93→        return str(hash(str(auth)))[:24]
+    94→
+    95→
+    96→def _invalidate_position_cache(auth) -> None:
+    97→    with _CACHE_LOCK:
+    98→        _position_cache.pop(_cache_key(auth), None)
+    99→
+   100→
+   101→def _invalidate_order_index(auth) -> None:
+   102→    with _CACHE_LOCK:
+   103→        _order_index_cache.pop(_cache_key(auth), None)
+   104→
+   105→
+   106→# ---------------------------------------------------------------------------
+   107→# Helpers
+   108→# ---------------------------------------------------------------------------
+   109→
+   110→def _breeze_date(value: datetime) -> str:
+   111→    return value.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+   112→
+   113→
+   114→def _is_success(response) -> bool:
+   115→    return response_status(response) == 200
+   116→
+   117→
+   118→def _rows(response) -> list:
+   119→    if not isinstance(response, dict):
+   120→        return []
+   121→
+   122→    success = response.get("Success")
+   123→
+   124→    if isinstance(success, list):
+   125→        return success
+   126→
+   127→    if isinstance(success, dict):
+   128→        return [success]
+   129→
+   130→    return []
+   131→
+   132→
+   133→def _response(status_code: int, body: dict) -> SimpleNamespace:
+   134→    """
+   135→    Minimal response object with the ``.status`` attribute the services
+   136→    read (``res.status == 200``).
+   137→    """
+   138→
+   139→    return SimpleNamespace(status=status_code, headers={}, text=str(body))
+   140→
+   141→
+   142→def _error(message: str, status_code: int = 400):
+   143→    return (
+   144→        _response(status_code, {"status": "error", "message": message}),
+   145→        {"status": "error", "message": message},
+   146→        None,
+   147→    )
+   148→
+   149→
+   150→def _extract_order_id(response) -> str | None:
+   151→    if not isinstance(response, dict):
+   152→        return None
+   153→
+   154→    success = response.get("Success")
+   155→
+   156→    if isinstance(success, dict):
+   157→        order_id = (
+   158→            success.get("order_id")
+   159→            or success.get("orderid")
+   160→            or success.get("Order_Id")
+   161→        )
+   162→
+   163→        if order_id:
+   164→            return str(order_id)
+   165→
+   166→    return None
+   167→
+   168→
+   169→# ---------------------------------------------------------------------------
+   170→# Book windows
+   171→# ---------------------------------------------------------------------------
+   172→
+   173→def _book_windows() -> list[tuple[datetime, datetime]]:
+   174→    """
+   175→    Most-recent-first (start, end) UTC windows covering the lookback range,
+   176→    each not wider than BOOK_WINDOW_DAYS.
+   177→    """
+   178→
+   179→    now = datetime.now()
+   180→
+   181→    windows = []
+   182→
+   183→    start = now - timedelta(days=BOOK_LOOKBACK_DAYS)
+   184→
+   185→    cursor = start
+   186→
+   187→    while cursor < now:
+   188→        window_end = min(cursor + timedelta(days=BOOK_WINDOW_DAYS), now)
+   189→
+   190→        windows.append((cursor, window_end))
+   191→
+   192→        cursor = window_end + timedelta(seconds=1)
+   193→
+   194→    windows.reverse()
+   195→
+   196→    return windows
+   197→
+   198→
+   199→def _fetch_book_page(
+   200→    auth,
+   201→    endpoint: str,
+   202→    exchange: str,
+   203→    from_date: datetime,
+   204→    to_date: datetime,
+   205→) -> list:
+   206→    """
+   207→    One (exchange, window) book page.
+   208→
+   209→    Completed windows (end before today) are cached — they never change.
+   210→    """
+   211→
+   212→    is_completed = to_date < datetime.now().replace(
+   213→        hour=0, minute=0, second=0, microsecond=0
+   214→    )
+   215→
+   216→    cache_key = (
+   217→        f"{_cache_key(auth)}:{endpoint}:{exchange}:"
+   218→        f"{from_date.date()}:{to_date.date()}"
+   219→    )
+   220→
+   221→    if is_completed:
+   222→        with _CACHE_LOCK:
+   223→            cached = _completed_window_cache.get(cache_key)
+   224→
+   225→            if cached and (time.monotonic() - cached[0]) < _COMPLETED_WINDOW_TTL:
+   226→                return cached[1]
+   227→
+   228→    response = breeze_request(
+   229→        auth,
+   230→        "GET",
+   231→        endpoint,
+   232→        {
+   233→            "exchange_code": exchange,
+   234→            "from_date": _breeze_date(from_date),
+   235→            "to_date": _breeze_date(to_date),
+   236→        },
+   237→    )
+   238→
+   239→    rows = _rows(response)
+   240→
+   241→    if not _is_success(response) and rows:
+   242→        logger.warning(
+   243→            "Breeze %s book page %s %s..%s reported error: %s",
+   244→            endpoint,
+   245→            exchange,
+   246→            from_date,
+   247→            to_date,
+   248→            response_error(response),
+   249→        )
+   250→
+   251→    if is_completed:
+   252→        with _CACHE_LOCK:
+   253→            _completed_window_cache[cache_key] = (
+   254→                time.monotonic(),
+   255→                rows,
+   256→            )
+   257→
+   258→    return rows
+   259→
+   260→
+   261→def _index_orders(auth, rows: list) -> None:
+   262→    """Remember orderid -> exchange (+ fields) for cancel/modify."""
+   263→
+   264→    key = _cache_key(auth)
+   265→
+   266→    with _CACHE_LOCK:
+   267→        cached = _order_index_cache.get(key)
+   268→
+   269→        index = cached[1] if cached else {}
+   270→
+   271→        for row in rows:
+   272→            order_id = str(
+   273→                row.get("order_id")
+   274→                or row.get("orderid")
+   275→                or ""
+   276→            )
+   277→
+   278→            if not order_id:
+   279→                continue
+   280→
+   281→            index[order_id] = {
+   282→                "exchange": str(
+   283→                    row.get("exchange_code") or ""
+   284→                ).upper(),
+   285→                "stock_code": row.get("stock_code", ""),
+   286→                "quantity": row.get("quantity", "0"),
+   287→                "price": row.get("price", "0"),
+   288→                "stoploss": row.get("stoploss", "0"),
+   289→                "order_type": row.get("order_type", "limit"),
+   290→                "validity": row.get("validity", "day"),
+   291→                "disclosed_quantity": row.get("disclosed_quantity", "0"),
+   292→                "product": row.get("product_type", ""),
+   293→            }
+   294→
+   295→        _order_index_cache[key] = (time.monotonic(), index)
+   296→
+   297→
+   298→def _get_order_index(auth, refresh: bool = False) -> dict:
+   299→    key = _cache_key(auth)
+   300→
+   301→    with _CACHE_LOCK:
+   302→        cached = _order_index_cache.get(key)
+   303→
+   304→        if cached and not refresh:
+   305→            return cached[1]
+   306→
+   307→    rows = []
+   308→
+   309→    for exchange in BOOK_EXCHANGES:
+   310→        for from_date, to_date in _book_windows():
+   311→            rows.extend(
+   312→                _fetch_book_page(
+   313→                    auth, "order", exchange, from_date, to_date
+   314→                )
+   315→            )
+   316→
+   317→    _index_orders(auth, rows)
+   318→
+   319→    with _CACHE_LOCK:
+   320→        cached = _order_index_cache.get(key)
+   321→
+   322→        return cached[1] if cached else {}
+   323→
+   324→
+   325→def _resolve_order(orderid: str, auth) -> dict | None:
+   326→    """
+   327→    Locate one order by id. Falls back to a forced index refresh when the
+   328→    cached book does not contain it (order placed milliseconds ago).
+   329→    """
+   330→
+   331→    index = _get_order_index(auth)
+   332→
+   333→    entry = index.get(str(orderid))
+   334→
+   335→    if entry is None:
+   336→        index = _get_order_index(auth, refresh=True)
+   337→
+   338→        entry = index.get(str(orderid))
+   339→
+   340→    return entry
+   341→
+   342→
+   343→# ---------------------------------------------------------------------------
+   344→# Books & account data
+   345→# ---------------------------------------------------------------------------
+   346→
+   347→def get_order_book(auth):
+   348→    """
+   349→    Merged order book across exchanges.
+   350→
+   351→    Returns {"Success": [...], "Status": 200, "Error": None}.
+   352→    """
+   353→
+   354→    all_rows = []
+   355→
+   356→    try:
+   357→        for exchange in BOOK_EXCHANGES:
+   358→            exchange_rows = []
+   359→
+   360→            for from_date, to_date in _book_windows():
+   361→                exchange_rows.extend(
+   362→                    _fetch_book_page(
+   363→                        auth, "order", exchange, from_date, to_date
+   364→                    )
+   365→                )
+   366→
+   367→            if exchange_rows:
+   368→                all_rows.extend(exchange_rows)
+   369→
+   370→        _index_orders(auth, all_rows)
+   371→
+   372→        return {
+   373→            "Success": all_rows,
+   374→            "Status": 200,
+   375→            "Error": None,
+   376→        }
+   377→
+   378→    except Exception as exc:
+   379→        logger.exception("Error fetching ICICI order book")
+   380→
+   381→        return {
+   382→            "Success": all_rows,
+   383→            "Status": 500,
+   384→            "Error": str(exc),
+   385→        }
+   386→
+   387→
+   388→def get_trade_book(auth):
+   389→    """
+   390→    Merged trade book across exchanges (same window rules as orders).
+   391→    """
+   392→
+   393→    all_rows = []
+   394→
+   395→    try:
+   396→        for exchange in BOOK_EXCHANGES:
+   397→            for from_date, to_date in _book_windows():
+   398→                all_rows.extend(
+   399→                    _fetch_book_page(
+   400→                        auth, "trades", exchange, from_date, to_date
+   401→                    )
+   402→                )
+   403→
+   404→        return {
+   405→            "Success": all_rows,
+   406→            "Status": 200,
+   407→            "Error": None,
+   408→        }
+   409→
+   410→    except Exception as exc:
+   411→        logger.exception("Error fetching ICICI trade book")
+   412→
+   413→        return {
+   414→            "Success": all_rows,
+   415→            "Status": 500,
+   416→            "Error": str(exc),
+   417→        }
+   418→
+   419→
+   420→def get_positions(auth):
+   421→    """
+   422→    Portfolio positions. Breeze serves them without parameters.
+   423→    """
+   424→
+   425→    return breeze_request(auth, "GET", "portfoliopositions", {})
+   426→
+   427→
+   428→def get_holdings(auth):
+   429→    """
+   430→    Portfolio holdings (demat + T1). Breeze requires an exchange code;
+   431→    NSE is the documented default. BSE rows are merged only when the NSE
+   432→    query comes back empty, which avoids double counting dual-listed
+   433→    stocks.
+   434→    """
+   435→
+   436→    response = breeze_request(
+   437→        auth,
+   438→        "GET",
+   439→        "portfolioholdings",
+   440→        {"exchange_code": "nse"},
+   441→    )
+   442→
+   443→    if response_status(response) == 200 and not _rows(response):
+   444→        bse_response = breeze_request(
+   445→            auth,
+   446→            "GET",
+   447→            "portfolioholdings",
+   448→            {"exchange_code": "bse"},
+   449→        )
+   450→
+   451→        if response_status(bse_response) == 200 and _rows(bse_response):
+   452→            return {
+   453→                "Success": _rows(bse_response),
+   454→                "Status": 200,
+   455→                "Error": None,
+   456→            }
+   457→
+   458→    return response
+   459→
+   460→
+   461→# ---------------------------------------------------------------------------
+   462→# Place / smart order
+   463→# ---------------------------------------------------------------------------
+   464→
+   465→def place_order_api(data, auth):
+   466→    """
+   467→    Place an order. Returns (response, response_data, orderid) where
+   468→    ``response.status`` carries the effective HTTP-ish status.
+   469→    """
+   470→
+   471→    try:
+   472→        payload = transform_data(data)
+   473→    except Exception as exc:
+   474→        logger.exception("ICICI order payload transform failed")
+   475→
+   476→        return _error(f"Invalid order payload: {exc}", 400)
+   477→
+   478→    logger.info("Payload for ICICI place_order_api: %s", payload)
+   479→
+   480→    response = breeze_request(auth, "POST", "order", payload)
+   481→
+   482→    status_code = response_status(response)
+   483→
+   484→    order_id = _extract_order_id(response) if status_code == 200 else None
+   485→
+   486→    if status_code == 200 and order_id:
+   487→        logger.info("ICICI order placed: %s", order_id)
+   488→
+   489→        _invalidate_position_cache(auth)
+   490→        _invalidate_order_index(auth)
+   491→
+   492→        return (
+   493→            _response(200, response),
+   494→            {"status": "success", "orderid": order_id},
+   495→            order_id,
+   496→        )
+   497→
+   498→    message = response_error(response) or "Failed to place order"
+   499→
+   500→    logger.error("ICICI place_order failed: %s", message)
+   501→
+   502→    return _error(message, status_code if status_code != 200 else 500)
+   503→
+   504→
+   505→def place_smartorder_api(data, auth):
+   506→    """
+   507→    Smart order: reconcile the live position towards ``position_size``.
+   508→    """
+   509→
+   510→    res = None
+   511→    response_data = {
+   512→        "status": "error",
+   513→        "message": "No action required or invalid parameters",
+   514→    }
+   515→    orderid = None
+   516→
+   517→    try:
+   518→        symbol = data.get("symbol")
+   519→        exchange = data.get("exchange")
+   520→        product = data.get("product")
+   521→
+   522→        if not all([symbol, exchange, product]):
+   523→            return res, response_data, orderid
+   524→
+   525→        position_size = int(data.get("position_size", "0") or 0)
+   526→
+   527→        current_position = int(
+   528→            get_open_position(symbol, exchange, product, auth)
+   529→        )
+   530→
+   531→        logger.debug(
+   532→            "Smart order %s: target=%s current=%s",
+   533→            symbol,
+   534→            position_size,
+   535→            current_position,
+   536→        )
+   537→
+   538→        action = None
+   539→        quantity = 0
+   540→
+   541→        if position_size == 0 and current_position == 0:
+   542→            action = str(data.get("action", "BUY")).upper()
+   543→            quantity = int(data.get("quantity", "0") or 0)
+   544→        elif position_size == 0 and current_position > 0:
+   545→            action = "SELL"
+   546→            quantity = abs(current_position)
+   547→        elif position_size == 0 and current_position < 0:
+   548→            action = "BUY"
+   549→            quantity = abs(current_position)
+   550→        elif current_position == 0:
+   551→            action = "BUY" if position_size > 0 else "SELL"
+   552→            quantity = abs(position_size)
+   553→        elif position_size > current_position:
+   554→            action = "BUY"
+   555→            quantity = position_size - current_position
+   556→        elif position_size < current_position:
+   557→            action = "SELL"
+   558→            quantity = current_position - position_size
+   559→
+   560→        if action and quantity > 0:
+   561→            order_data = dict(data)
+   562→            order_data["action"] = action
+   563→            order_data["quantity"] = str(quantity)
+   564→
+   565→            res, response, orderid = place_order_api(order_data, auth)
+   566→
+   567→            _invalidate_position_cache(auth)
+   568→
+   569→            return res, response, orderid
+   570→
+   571→        response_data = {
+   572→            "status": "success",
+   573→            "message": "No action needed. Position already matched.",
+   574→        }
+   575→
+   576→        return res, response_data, orderid
+   577→
+   578→    except Exception as exc:
+   579→        logger.exception("Error in place_smartorder_api")
+   580→
+   581→        return res, {"status": "error", "message": str(exc)}, orderid
+   582→
+   583→
+   584→# ---------------------------------------------------------------------------
+   585→# Open position (used by smart orders / close position)
+   586→# ---------------------------------------------------------------------------
+   587→
+   588→def _get_positions_cached(auth) -> list[dict]:
+   589→    key = _cache_key(auth)
+   590→
+   591→    with _CACHE_LOCK:
+   592→        cached = _position_cache.get(key)
+   593→
+   594→        if cached and (time.monotonic() - cached[0]) < _POSITION_CACHE_TTL:
+   595→            return cached[1]
+   596→
+   597→    rows = map_position_data(get_positions(auth))
+   598→
+   599→    with _CACHE_LOCK:
+   600→        _position_cache[key] = (time.monotonic(), rows)
+   601→
+   602→    return rows
+   603→
+   604→
+   605→def get_open_position(tradingsymbol, exchange, product, auth) -> int:
+   606→    """
+   607→    Net open quantity for one OpenAlgo symbol. Position rows were already
+   608→    mapped to OpenAlgo symbols, so matching is direct.
+   609→    """
+   610→
+   611→    try:
+   612→        positions = _get_positions_cached(auth)
+   613→    except Exception:
+   614→        logger.exception("Error reading ICICI positions")
+   615→
+   616→        return 0
+   617→
+   618→    exchange = str(exchange or "").upper()
+   619→    product = str(product or "").upper()
+   620→
+   621→    for position in positions:
+   622→        if (
+   623→            position.get("symbol") == tradingsymbol
+   624→            and str(position.get("exchange") or "").upper() == exchange
+   625→            and str(position.get("product") or "").upper() == product
+   626→        ):
+   627→            return int(position.get("quantity") or 0)
+   628→
+   629→    return 0
+   630→
+   631→
+   632→# ---------------------------------------------------------------------------
+   633→# Modify / cancel
+   634→# ---------------------------------------------------------------------------
+   635→
+   636→def modify_order(data, auth):
+   637→    """
+   638→    Modify an order. Returns (response_message, status_code).
+   639→
+   640→    Breeze's PUT /order requires exchange_code, resolved from the indexed
+   641→    order book (the OpenAlgo payload carries only the order id).
+   642→    """
+   643→
+   644→    orderid = str(data.get("orderid") or "")
+   645→
+   646→    if not orderid:
+   647→        return {"status": "error", "message": "orderid is required"}, 400
+   648→
+   649→    entry = _resolve_order(orderid, auth)
+   650→
+   651→    if entry is None:
+   652→        return (
+   653→            {
+   654→                "status": "error",
+   655→                "message": f"Order {orderid} not found in ICICI order book",
+   656→            },
+   657→            404,
+   658→        )
+   659→
+   660→    payload = {
+   661→        "order_id": orderid,
+   662→        "exchange_code": entry.get("exchange") or "NSE",
+   663→        "order_type": map_order_type(
+   664→            data.get("pricetype") or entry.get("order_type") or "LIMIT"
+   665→        ),
+   666→        "quantity": str(int(float(data.get("quantity") or entry.get("quantity") or 0))),
+   667→        "price": str(data.get("price") or entry.get("price") or "0"),
+   668→        "validity": str(data.get("validity") or entry.get("validity") or "day"),
+   669→        "disclosed_quantity": str(
+   670→            int(
+   671→                float(
+   672→                    data.get("disclosed_quantity")
+   673→                    or entry.get("disclosed_quantity")
+   674→                    or 0
+   675→                )
+   676→            )
+   677→        ),
+   678→    }
+   679→
+   680→    trigger = data.get("trigger_price")
+   681→
+   682→    if trigger not in (None, "", 0, "0") and payload["order_type"] == "stoploss":
+   683→        payload["stoploss"] = str(trigger)
+   684→
+   685→    logger.info("Payload for ICICI modify_order: %s", payload)
+   686→
+   687→    response = breeze_request(auth, "PUT", "order", payload)
+   688→
+   689→    status_code = response_status(response)
+   690→
+   691→    if status_code == 200:
+   692→        _invalidate_position_cache(auth)
+   693→        _invalidate_order_index(auth)
+   694→
+   695→        return {"status": "success", "orderid": orderid}, 200
+   696→
+   697→    message = response_error(response) or "Failed to modify order"
+   698→
+   699→    logger.error("ICICI modify_order failed: %s", message)
+   700→
+   701→    return {"status": "error", "message": message}, status_code
+   702→
+   703→
+   704→def cancel_order(orderid, auth):
+   705→    """
+   706→    Cancel one order. Returns (response_message, status_code).
+   707→    """
+   708→
+   709→    orderid = str(orderid or "")
+   710→
+   711→    entry = _resolve_order(orderid, auth)
+   712→
+   713→    if entry is None:
+   714→        return (
+   715→            {
+   716→                "status": "error",
+   717→                "message": f"Order {orderid} not found in ICICI order book",
+   718→            },
+   719→            404,
+   720→        )
+   721→
+   722→    payload = {
+   723→        "order_id": orderid,
+   724→        "exchange_code": entry.get("exchange") or "NSE",
+   725→    }
+   726→
+   727→    logger.info("Payload for ICICI cancel_order: %s", payload)
+   728→
+   729→    response = breeze_request(auth, "DELETE", "order", payload)
+   730→
+   731→    status_code = response_status(response)
+   732→
+   733→    if status_code == 200:
+   734→        _invalidate_position_cache(auth)
+   735→        _invalidate_order_index(auth)
+   736→
+   737→        return {"status": "success", "orderid": orderid}, 200
+   738→
+   739→    message = response_error(response) or "Failed to cancel order"
+   740→
+   741→    logger.error("ICICI cancel_order failed: %s", message)
+   742→
+   743→    return {"status": "error", "message": message}, status_code
+   744→
+   745→
+   746→def cancel_all_orders_api(data, auth):
+   747→    """
+   748→    Cancel every open order. Returns (canceled_orders, failed_cancellations).
+   749→    """
+   750→
+   751→    canceled_orders: list[str] = []
+   752→    failed_cancellations: list[str] = []
+   753→
+   754→    book = get_order_book(auth)
+   755→
+   756→    for row in _rows(book):
+   757→        order_id = str(row.get("order_id") or "")
+   758→
+   759→        if not order_id:
+   760→            continue
+   761→
+   762→        status = str(row.get("status") or "").upper()
+   763→
+   764→        if status in ("EXECUTED", "COMPLETED", "TRADED", "CANCELLED",
+   765→                      "CANCELED", "REJECTED", "EXPIRED"):
+   766→            continue
+   767→
+   768→        pending = int(float(row.get("pending_quantity") or 0) or 0)
+   769→
+   770→        if pending <= 0:
+   771→            continue
+   772→
+   773→        message, status_code = cancel_order(order_id, auth)
+   774→
+   775→        if status_code == 200:
+   776→            canceled_orders.append(order_id)
+   777→        else:
+   778→            failed_cancellations.append(
+   779→                {"orderid": order_id, "reason": message.get("message", "")}
+   780→            )
+   781→
+   782→    return canceled_orders, failed_cancellations
+   783→
+   784→
+   785→# ---------------------------------------------------------------------------
+   786→# Close all positions
+   787→# ---------------------------------------------------------------------------
+   788→
+   789→def close_all_positions(current_api_key, auth):
+   790→    """
+   791→    Square off every open position with opposite MARKET orders.
+   792→
+   793→    Returns (message, status_code).
+   794→    """
+   795→
+   796→    try:
+   797→        positions = map_position_data(get_positions(auth))
+   798→    except Exception:
+   799→        logger.exception("Error reading ICICI positions for square-off")
+   800→
+   801→        return {"status": "error", "message": "Failed to read positions"}, 500
+   802→
+   803→    open_positions = [p for p in positions if int(p.get("quantity") or 0) != 0]
+   804→
+   805→    if not open_positions:
+   806→        return {"status": "success", "message": "No Open Positions Found"}, 200
+   807→
+   808→    failures: list[str] = []
+   809→
+   810→    for position in open_positions:
+   811→        quantity = abs(int(position.get("quantity") or 0))
+   812→
+   813→        action = "SELL" if int(position.get("quantity") or 0) > 0 else "BUY"
+   814→
+   815→        place_order_payload = {
+   816→            "apikey": current_api_key,
+   817→            "strategy": "Squareoff",
+   818→            "symbol": position.get("symbol", ""),
+   819→            "action": action,
+   820→            "exchange": position.get("exchange", ""),
+   821→            "pricetype": "MARKET",
+   822→            "product": reverse_map_product_type(
+   823→                position.get("exchange", ""),
+   824→                position.get("product", ""),
+   825→            )
+   826→            or "MIS",
+   827→            "quantity": str(quantity),
+   828→        }
+   829→
+   830→        logger.info("Close position payload: %s", place_order_payload)
+   831→
+   832→        res, api_response, order_id = place_order_api(
+   833→            place_order_payload, auth
+   834→        )
+   835→
+   836→        if getattr(res, "status", None) != 200 or not order_id:
+   837→            reason = (
+   838→                api_response.get("message", "order was refused")
+   839→                if isinstance(api_response, dict)
+   840→                else "order was refused"
+   841→            )
+   842→
+   843→            failures.append(
+   844→                f"{position.get('symbol')} ({position.get('exchange')}): {reason}"
+   845→            )
+   846→
+   847→            logger.error(
+   848→                "Square-off failed for %s: %s",
+   849→                position.get("symbol"),
+   850→                reason,
+   851→            )
+   852→
+   853→    if failures:
+   854→        return {
+   855→            "status": "error",
+   856→            "message": (
+   857→                f"{len(failures)} position(s) could not be squared off and "
+   858→                f"are still open: {'; '.join(failures)}"
+   859→            ),
+   860→        }, 500
+   861→
+   862→    return {
+   863→        "status": "success",
+   864→        "message": "All Open Positions SquaredOff",
+   865→    }, 200
+   866→

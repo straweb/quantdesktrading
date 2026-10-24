@@ -117,6 +117,18 @@ class DhanStream:
         self.connected = False
 
     # ------------------------------------------------------------------ binary parse
+    # Round-26 wire layouts (hedging-repo verified, little-endian):
+    #   code 4 QUOTE (42B): ltp f32 | ltq u16 | ltt u32 | atp f32 | vol u32 |
+    #                       totSellQ u32 | totBuyQ u32 | open f32 | close f32 |
+    #                       high f32 | low f32
+    #   code 8 FULL (154B): ltp f32 | ltq u16 | ltt u32 | atp f32 | vol u32 |
+    #                       totSellQ u32 | totBuyQ u32 |           (26B prefix)
+    #                       oi u32 | oiHigh u32 | oiLow u32 |      (26-38)
+    #                       open f32 | close f32 | high f32 | low f32 (38-54)
+    #                       5 × 20B depth rows (bidQty u32, askQty u32,
+    #                       bidOrd u16, askOrd u16, bidPx f32, askPx f32)
+    #   (the old parser read bid/ask from the totSell/totBuy + OHLC fields —
+    #    every FULL tick carried garbage bid/ask/OHLC)
     def _parse(self, data: bytes) -> None:
         if len(data) < 8:
             return
@@ -124,7 +136,9 @@ class DhanStream:
         if code == 0:            # heartbeat/ack
             return
         if code == 50:           # disconnect notice
-            config.log("dhan-feed", "broker sent DISCONNECT packet", "WARN")
+            reason = struct.unpack("<H", data[8:10])[0] if len(data) >= 10 else 0
+            config.log("dhan-feed", f"broker sent DISCONNECT packet (reason={reason}"
+                                    f"{'; 805=max connections' if reason == 805 else ''})", "WARN")
             return
         seg = data[3]
         sid = str(_i(data[4:8]))
@@ -133,26 +147,27 @@ class DhanStream:
             if code == 2 and len(payload) >= 8:          # TICKER: ltp f32, ltt u32
                 ltp, ltt = _f(payload[0:4]), _i(payload[4:8])
                 self._emit(sid, seg, {"ltp": ltp, "ts": ltt * 1000})
-            elif code == 4 and len(payload) >= 30:       # QUOTE
-                ltp, ltq, ltt = _f(payload[0:4]), struct.unpack("<H", payload[4:6])[0], _i(payload[6:10])
+            elif code == 4 and len(payload) >= 42:       # QUOTE
+                ltp, ltt = _f(payload[0:4]), _i(payload[6:10])
                 atp, vol = _f(payload[10:14]), _i(payload[14:18])
-                o, h, l = _f(payload[26:30]), 0.0, 0.0
-                c = _f(payload[30:34]) if len(payload) >= 34 else ltp
+                o, c = _f(payload[26:30]), _f(payload[30:34])
+                h, l = _f(payload[34:38]), _f(payload[38:42])
                 self._emit(sid, seg, {"ltp": ltp, "vol": vol, "open": o, "high": h,
                                       "low": l, "close": c, "ts": ltt * 1000})
-            elif code == 8 and len(payload) >= 34:       # FULL
-                ltp, ltq, ltt = _f(payload[0:4]), struct.unpack("<H", payload[4:6])[0], _i(payload[6:10])
+            elif code == 8 and len(payload) >= 74:       # FULL
+                ltp, ltt = _f(payload[0:4]), _i(payload[6:10])
                 vol = _i(payload[14:18])
-                bid_q, bid_p = _i(payload[18:22]), _f(payload[22:26])
-                ask_q, ask_p = _i(payload[26:30]), _f(payload[30:34])
-                o = _f(payload[34:38]) if len(payload) >= 38 else 0.0
-                h = _f(payload[38:42]) if len(payload) >= 42 else 0.0
-                l = _f(payload[42:46]) if len(payload) >= 46 else 0.0
-                c = _f(payload[46:50]) if len(payload) >= 50 else 0.0
+                oi = _i(payload[26:30])
+                o, c = _f(payload[38:42]), _f(payload[42:46])
+                h, l = _f(payload[46:50]), _f(payload[50:54])
+                bid_q, ask_q = _i(payload[54:58]), _i(payload[58:62])
+                bid_p, ask_p = _f(payload[66:70]), _f(payload[70:74])
                 self._emit(sid, seg, {"ltp": ltp, "vol": vol, "bid": bid_p or None,
                                       "ask": ask_p or None, "bid_qty": bid_q, "ask_qty": ask_q,
                                       "open": o, "high": h, "low": l, "close": c,
-                                      "ts": ltt * 1000})
+                                      "oi": oi or None, "ts": ltt * 1000})
+            elif code == 5 and len(payload) >= 4:        # OI
+                self._emit(sid, seg, {"oi": _i(payload[0:4]) or None}, merge=True)
             elif code == 6 and len(payload) >= 4:        # PREV_CLOSE
                 self._emit(sid, seg, {"prev_close": _f(payload[0:4])}, merge=True)
         except Exception as e:

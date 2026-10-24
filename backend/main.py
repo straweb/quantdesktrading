@@ -46,11 +46,17 @@ async def startup() -> None:
 
     hub = Hub.instance()
     hub.ensure_sim_account()
-    # auto-connect sim so ticks flow before any user action
+    # Round-26: Live-Only (sim_disabled) must survive restarts — the sim feed
+    # stays DISCONNECTED so no synthetic tick can ever flow before the user
+    # picks a live broker source.
     row = db.core().one("SELECT * FROM accounts WHERE broker='sim'")
     import json as _json
     creds = _json.loads(row["credentials"] or "{}")
-    await hub.connect_account(dict(row), creds)
+    if hub.sim_disabled():
+        config.log("boot", "LIVE-ONLY mode active (sim_disabled=1) — sim feed NOT connected; "
+                           "pick a live broker source in the FEED chip")
+    else:
+        await hub.connect_account(dict(row), creds)
 
     # seed sim master so search/subscribe works out of the box
     sim = db.broker_db("sim")

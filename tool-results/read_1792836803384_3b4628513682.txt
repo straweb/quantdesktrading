@@ -1,0 +1,1042 @@
+     1→"""
+     2→Shoonya WebSocket Client Implementation
+     3→Handles connection to Shoonya's market data streaming API
+     4→"""
+     5→
+     6→import json
+     7→import threading
+     8→import time
+     9→import weakref
+    10→from collections import deque
+    11→from collections.abc import Callable
+    12→from typing import Any
+    13→
+    14→import websocket
+    15→
+    16→from utils.logging import get_logger
+    17→
+    18→
+    19→class _WeakCallback:
+    20→    """Holds an external callback without keeping its owner alive.
+    21→
+    22→    Bound methods are stored via ``weakref.WeakMethod``. The adapter passes
+    23→    ``self._on_message`` and friends, so a strong reference here would pin the
+    24→    adapter to this client — and this client is pinned by its own running
+    25→    threads, so neither object's ``__del__`` could ever run and the adapter's
+    26→    ZMQ socket and bound port would leak with it. Plain functions have no owner
+    27→    to leak, so they are held strongly.
+    28→    """
+    29→
+    30→    __slots__ = ("_ref", "_strong")
+    31→
+    32→    def __init__(self, fn: Callable | None):
+    33→        self._ref: weakref.WeakMethod | None = None
+    34→        self._strong: Callable | None = None
+    35→        if fn is None:
+    36→            return
+    37→        try:
+    38→            self._ref = weakref.WeakMethod(fn)
+    39→        except TypeError:
+    40→            # Not a bound method (plain function, lambda, functools.partial)
+    41→            self._strong = fn
+    42→
+    43→    def __bool__(self) -> bool:
+    44→        return self._ref is not None or self._strong is not None
+    45→
+    46→    def resolve(self) -> Callable | None:
+    47→        """Return the live callable, or None if its owner has been collected."""
+    48→        if self._strong is not None:
+    49→            return self._strong
+    50→        if self._ref is not None:
+    51→            return self._ref()
+    52→        return None
+    53→
+    54→
+    55→def _make_ws_runner(client: "ShoonyaWebSocket", ws: Any) -> Callable:
+    56→    """Thread target that blocks in ``run_forever`` for the whole session.
+    57→
+    58→    ``_weak_dispatch`` is no good here: it would resolve the weakref and then
+    59→    hold the client strongly in its frame for the entire connection. This
+    60→    runner keeps only the ``WebSocketApp`` alive (it must, to run it) and
+    61→    touches the client through a weakref, so an abandoned client stays
+    62→    collectable while its socket is up.
+    63→    """
+    64→    ref = weakref.ref(client)
+    65→    ping_interval = client.PING_INTERVAL
+    66→    ping_timeout = client.PING_TIMEOUT
+    67→
+    68→    def runner() -> None:
+    69→        try:
+    70→            ws.run_forever(ping_interval=ping_interval, ping_timeout=ping_timeout)
+    71→        except Exception as e:
+    72→            target = ref()
+    73→            if target is not None:
+    74→                target.logger.error(f"WebSocket run error: {e}")
+    75→        finally:
+    76→            target = ref()
+    77→            if target is not None:
+    78→                target._cleanup_connection_state()
+    79→
+    80→    return runner
+    81→
+    82→
+    83→def _make_heartbeat_runner(client: "ShoonyaWebSocket") -> Callable:
+    84→    """Thread target for the heartbeat loop, holding the client weakly.
+    85→
+    86→    The loop resolves the weakref once per tick and drops it again before
+    87→    waiting, so a client abandoned mid-session becomes collectable within one
+    88→    HEARTBEAT_INTERVAL instead of being pinned forever.
+    89→    """
+    90→    ref = weakref.ref(client)
+    91→
+    92→    def runner() -> None:
+    93→        while True:
+    94→            target = ref()
+    95→            if target is None:
+    96→                return
+    97→            # Grab what the wait needs, then drop the strong reference: holding
+    98→            # it across a HEARTBEAT_INTERVAL sleep would keep an abandoned
+    99→            # client (and its socket) alive for a whole interval.
+   100→            interval = target.HEARTBEAT_INTERVAL
+   101→            shutdown = target._shutdown_event
+   102→            del target
+   103→
+   104→            if shutdown.wait(interval):
+   105→                return
+   106→            del shutdown
+   107→
+   108→            target = ref()
+   109→            if target is None:
+   110→                return
+   111→            keep_going = target._heartbeat_beat()
+   112→            del target
+   113→            if not keep_going:
+   114→                return
+   115→
+   116→    return runner
+   117→
+   118→
+   119→def _weak_dispatch(obj: "ShoonyaWebSocket", method_name: str) -> Callable:
+   120→    """Bind ``obj.method_name`` through a weak reference.
+   121→
+   122→    Used for the callbacks handed to ``websocket.WebSocketApp`` and for thread
+   123→    targets: a bound method would make the WebSocketApp (and the thread running
+   124→    it) keep this client alive forever, so dropping the last external reference
+   125→    to a *connected* client would strand its socket and threads for the life of
+   126→    the process. Going through a weakref lets the client become collectable,
+   127→    at which point ``__del__`` runs ``stop()`` and the socket is released.
+   128→    """
+   129→    ref = weakref.ref(obj)
+   130→
+   131→    def dispatch(*args: Any, **kwargs: Any) -> Any:
+   132→        target = ref()
+   133→        if target is None:
+   134→            return None
+   135→        return getattr(target, method_name)(*args, **kwargs)
+   136→
+   137→    return dispatch
+   138→
+   139→
+   140→class ShoonyaWebSocket:
+   141→    """Shoonya WebSocket client for real-time market data"""
+   142→
+   143→    # Connection constants
+   144→    WS_URL = "wss://api.shoonya.com/NorenWSAPI/"
+   145→    CONNECTION_TIMEOUT = 15
+   146→    THREAD_JOIN_TIMEOUT = 5
+   147→
+   148→    # Heartbeat constants. websocket-client requires PING_INTERVAL strictly
+   149→    # greater than PING_TIMEOUT, so they are pinned here rather than read
+   150→    # from the platform-wide WS_PING_* env vars (which the proxy server
+   151→    # tolerates being equal under the `websockets` library).
+   152→    HEARTBEAT_INTERVAL = 30
+   153→    HEARTBEAT_TIMEOUT = 120
+   154→    PING_INTERVAL = 30
+   155→    PING_TIMEOUT = 10
+   156→    HEARTBEAT_JOIN_TIMEOUT = 3
+   157→
+   158→    # Market-data silence watchdog (issue #2075, same defect as Flattrade).
+   159→    # A Noren session that keeps answering heartbeats while delivering no
+   160→    # ticks is indistinguishable from a healthy one on _last_message_time
+   161→    # alone, because every inbound frame stamps it - heartbeat acks included.
+   162→    # Tick flow therefore gets its own clock, and the watchdog only arms once
+   163→    # data has been arriving over time: frames in DATA_ARM_BUCKETS distinct
+   164→    # buckets of DATA_ARM_BUCKET seconds, all within DATA_ARM_WINDOW. See
+   165→    # _update_last_data_time for why spread matters and a frame count does not.
+   166→    DATA_SILENCE_TIMEOUT = 180
+   167→    DATA_ARM_BUCKET = 30
+   168→    DATA_ARM_BUCKETS = 3
+   169→    DATA_ARM_WINDOW = 300
+   170→
+   171→    # Subscription batching — Shoonya supports '#'-separated scrip lists in
+   172→    # a single message; chunk large lists so each WS send stays small and
+   173→    # add a small delay between chunks to avoid server-side rate limits.
+   174→    # Empirically Shoonya tolerates much faster pacing than the original
+   175→    # 0.5s/2.0s pair; 100ms / 500ms keeps headroom for very large bursts
+   176→    # and is invisible to single-symbol UI clicks (which skip the delay
+   177→    # entirely via the `if has_more` guard around the wait).
+   178→    MAX_SCRIPS_PER_BATCH = 100
+   179→    SUBSCRIPTION_DELAY = 0.1
+   180→    SUBSCRIPTION_RETRY_DELAY = 0.5
+   181→
+   182→    # Message types (OAuth WebSocket API)
+   183→    MSG_TYPE_CONNECT = "a"
+   184→    MSG_TYPE_HEARTBEAT = "h"
+   185→    # The doc's heartbeat ack is "hk"; "h" is kept because some Noren
+   186→    # deployments echo the request type back instead. Only "h" was matched
+   187→    # before, so an "hk" ack fell through to the market-data path - harmless
+   188→    # while nothing read it, but it would have counted as a tick and defeated
+   189→    # the silence watchdog below.
+   190→    MSG_TYPE_HEARTBEAT_ACK = "hk"
+   191→    MSG_TYPE_AUTH_ACK = "ak"
+   192→    MSG_TYPE_TOUCHLINE_SUB = "t"
+   193→    MSG_TYPE_TOUCHLINE_UNSUB = "u"
+   194→    MSG_TYPE_DEPTH_SUB = "d"
+   195→    MSG_TYPE_DEPTH_UNSUB = "ud"
+   196→
+   197→    # Authentication response
+   198→    AUTH_SUCCESS = "OK"
+   199→
+   200→    def __init__(
+   201→        self,
+   202→        user_id: str,
+   203→        actid: str,
+   204→        susertoken: str,
+   205→        on_message: Callable | None = None,
+   206→        on_error: Callable | None = None,
+   207→        on_close: Callable | None = None,
+   208→        on_open: Callable | None = None,
+   209→    ):
+   210→        """
+   211→        Initialize Shoonya WebSocket client
+   212→
+   213→        Args:
+   214→            user_id: User ID for authentication
+   215→            actid: Account ID for authentication
+   216→            susertoken: Session token for authentication
+   217→            on_message: Callback for incoming messages
+   218→            on_error: Callback for connection errors
+   219→            on_close: Callback for connection close
+   220→            on_open: Callback for connection open
+   221→        """
+   222→        # Authentication credentials
+   223→        self.user_id = user_id
+   224→        self.actid = actid
+   225→        self.susertoken = susertoken
+   226→
+   227→        # Connection state
+   228→        self.ws = None
+   229→        self.ws_thread = None
+   230→        self.running = False
+   231→        self.connected = False
+   232→
+   233→        # Phase 4a: distinguishes auth-failure from transient network drops so
+   234→        # the adapter can short-circuit the reconnect loop. Set True only when
+   235→        # the broker explicitly rejects auth (status != "OK" in the auth-ack
+   236→        # response). Persistent across the lifetime of this WS client.
+   237→        self.auth_failed = False
+   238→        self.auth_failure_reason: str | None = None
+   239→
+   240→        # Callbacks — held weakly when they are bound methods so the owner
+   241→        # (normally ShoonyaWebSocketAdapter) stays collectable. See _WeakCallback.
+   242→        self.on_message = _WeakCallback(on_message)
+   243→        self.on_error = _WeakCallback(on_error)
+   244→        self.on_close = _WeakCallback(on_close)
+   245→        self.on_open = _WeakCallback(on_open)
+   246→
+   247→        # Heartbeat management
+   248→        self._heartbeat_thread = None
+   249→        self._last_message_time = None
+   250→        self._heartbeat_lock = threading.Lock()
+   251→
+   252→        # Market-data liveness, kept apart from _last_message_time above so a
+   253→        # socket that only answers heartbeats cannot pass for a live feed.
+   254→        # Per connection: _reset_data_liveness() clears all three.
+   255→        self._last_data_message_time = None
+   256→        self._data_watchdog_armed = False
+   257→        self._data_bucket_starts = deque(maxlen=self.DATA_ARM_BUCKETS)
+   258→
+   259→        # Subscription batching — separate queues per (msg_type) since
+   260→        # touchline/depth use different message types but share one worker.
+   261→        self._pending_subscriptions: deque[tuple[str, str]] = deque()
+   262→        self._subscription_thread: threading.Thread | None = None
+   263→        self._subscription_lock = threading.Lock()
+   264→
+   265→        # Phase 8: shutdown event lets every wait/sleep loop bail immediately
+   266→        # when stop() is called, instead of blocking up to N seconds. Critical
+   267→        # under gunicorn+eventlet where systemd graceful_timeout (30s) would
+   268→        # otherwise SIGKILL the worker mid-sleep.
+   269→        self._shutdown_event = threading.Event()
+   270→
+   271→        # Logging
+   272→        self.logger = get_logger("shoonya_websocket")
+   273→
+   274→    def __del__(self):
+   275→        """Last-resort teardown for a client dropped without stop().
+   276→
+   277→        This only fires because the WebSocketApp, the run_forever thread and
+   278→        the heartbeat thread all hold this object weakly. Reinstating any of
+   279→        them as a bound method would silently make this dead code and strand
+   280→        one socket plus three threads per abandoned client.
+   281→        """
+   282→        try:
+   283→            self.stop()
+   284→        except Exception:
+   285→            pass
+   286→
+   287→    def connect(self) -> bool:
+   288→        """
+   289→        Establish WebSocket connection with authentication
+   290→
+   291→        Returns:
+   292→            bool: True if connection successful, False otherwise
+   293→        """
+   294→        if self.running:
+   295→            self.logger.warning("Already connected or connecting")
+   296→            return True
+   297→
+   298→        try:
+   299→            self._initialize_connection()
+   300→            return self._wait_for_connection()
+   301→        except Exception as e:
+   302→            self.logger.error(f"Connection error: {e}")
+   303→            self.stop()
+   304→            return False
+   305→
+   306→    def _initialize_connection(self) -> None:
+   307→        """Initialize WebSocket connection and start thread"""
+   308→        self.running = True
+   309→        # Phase 8: clear shutdown event so wait()s block normally on this
+   310→        # session even if the same client object was previously stopped.
+   311→        self._shutdown_event.clear()
+   312→        # Phase 4a: reset stale auth-failure state if this client object is
+   313→        # being reused for a fresh connection attempt.
+   314→        self.auth_failed = False
+   315→        self.auth_failure_reason = None
+   316→
+   317→        # Weak dispatch: a bound method here would let the WebSocketApp — and
+   318→        # the thread blocked in run_forever() — pin this client, so an
+   319→        # abandoned connected client could never be collected and its socket
+   320→        # would stay ESTABLISHED for the life of the process.
+   321→        self.ws = websocket.WebSocketApp(
+   322→            self.WS_URL,
+   323→            on_open=_weak_dispatch(self, "_on_open"),
+   324→            on_message=_weak_dispatch(self, "_on_message"),
+   325→            on_error=_weak_dispatch(self, "_on_error"),
+   326→            on_close=_weak_dispatch(self, "_on_close"),
+   327→        )
+   328→
+   329→        self.ws_thread = threading.Thread(target=_make_ws_runner(self, self.ws), daemon=True)
+   330→        self.ws_thread.start()
+   331→
+   332→    def _wait_for_connection(self) -> bool:
+   333→        """
+   334→        Wait for WebSocket connection to be established
+   335→
+   336→        Returns:
+   337→            bool: True if connected within timeout, False otherwise
+   338→        """
+   339→        # Phase 8: interruptible poll. Bail immediately if shutdown is signaled.
+   340→        start_time = time.time()
+   341→
+   342→        while self.running and time.time() - start_time < self.CONNECTION_TIMEOUT:
+   343→            if self.connected:
+   344→                self.logger.info("WebSocket connected successfully")
+   345→                return True
+   346→            if self._shutdown_event.wait(0.1):
+   347→                self.logger.debug("Connection wait interrupted by shutdown")
+   348→                return False
+   349→
+   350→        self.logger.error("Connection timeout")
+   351→        self.stop()
+   352→        return False
+   353→
+   354→    # The run_forever loop lives in _make_ws_runner() rather than a bound
+   355→    # method here, so the thread does not keep this client alive.
+   356→
+   357→    def _cleanup_connection_state(self) -> None:
+   358→        """Clean up connection state"""
+   359→        self.connected = False
+   360→        with self._heartbeat_lock:
+   361→            self._last_message_time = None
+   362→        self._reset_data_liveness()
+   363→        self._stop_heartbeat()
+   364→
+   365→    def stop(self) -> None:
+   366→        """Stop the WebSocket connection and cleanup resources"""
+   367→        self.logger.info("Stopping WebSocket connection")
+   368→
+   369→        self.running = False
+   370→        self.connected = False
+   371→
+   372→        # Phase 8: signal every wait/sleep loop (heartbeat, connection-poll,
+   373→        # subscription worker) to bail immediately instead of blocking up to
+   374→        # HEARTBEAT_INTERVAL seconds.
+   375→        self._shutdown_event.set()
+   376→
+   377→        # Drop any queued subscription batches; the worker exits when it
+   378→        # sees running=False on its next loop iteration.
+   379→        self.clear_pending_subscriptions()
+   380→
+   381→        self._close_websocket()
+   382→        self._wait_for_thread_completion()
+   383→        self._stop_heartbeat()
+   384→
+   385→    def _close_websocket(self) -> None:
+   386→        """Close WebSocket connection and null reference"""
+   387→        if self.ws:
+   388→            try:
+   389→                self.ws.close()
+   390→            except Exception as e:
+   391→                self.logger.error(f"Error closing WebSocket: {e}")
+   392→            finally:
+   393→                self.ws = None
+   394→
+   395→    # M3 fix: Null ws_thread after join to match _close_websocket pattern
+   396→    def _wait_for_thread_completion(self) -> None:
+   397→        """Wait for WebSocket thread to complete"""
+   398→        # Guard against self-join, mirroring _stop_heartbeat. Now that the
+   399→        # runner holds this client weakly, stop() can be reached from __del__
+   400→        # while GC runs on the ws thread itself; joining there would deadlock
+   401→        # until the timeout on every teardown.
+   402→        if self.ws_thread is threading.current_thread():
+   403→            self.ws_thread = None
+   404→            return
+   405→        if self.ws_thread and self.ws_thread.is_alive():
+   406→            self.ws_thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
+   407→            if self.ws_thread.is_alive():
+   408→                self.logger.warning("WebSocket thread did not terminate within timeout")
+   409→                return
+   410→        self.ws_thread = None
+   411→
+   412→    # WebSocket Event Handlers
+   413→
+   414→    def _on_open(self, ws) -> None:
+   415→        """Handle WebSocket connection open event — wait for auth before marking connected"""
+   416→        self._update_last_message_time()
+   417→        self._reset_data_liveness()
+   418→
+   419→        self.logger.info("WebSocket connection opened, sending authentication")
+   420→
+   421→        # SW-1 fix: Don't start heartbeat here — connected is still False so
+   422→        # the heartbeat worker loop exits immediately. Start it in
+   423→        # _handle_auth_response after connected=True instead.
+   424→        self._send_authentication()
+   425→
+   426→    # SW-4 fix: Snapshot self.ws to prevent race with _close_websocket nulling it
+   427→    def _send_authentication(self) -> bool:
+   428→        """
+   429→        Send authentication message to server
+   430→
+   431→        Returns:
+   432→            bool: True if authentication sent successfully, False otherwise
+   433→        """
+   434→        ws = self.ws
+   435→        if not ws:
+   436→            self.logger.error("Cannot send authentication: WebSocket not available")
+   437→            return False
+   438→
+   439→        auth_msg = {
+   440→            "t": self.MSG_TYPE_CONNECT,
+   441→            "uid": self.user_id,
+   442→            "actid": self.actid,
+   443→            "source": "API",
+   444→            "accesstoken": self.susertoken,
+   445→        }
+   446→
+   447→        try:
+   448→            ws.send(json.dumps(auth_msg))
+   449→            self.logger.info("Authentication message sent")
+   450→            return True
+   451→        except Exception as e:
+   452→            self.logger.error(f"Failed to send authentication: {e}")
+   453→            return False
+   454→
+   455→    def _on_message(self, ws, message: str) -> None:
+   456→        """Handle incoming WebSocket messages"""
+   457→        self._update_last_message_time()
+   458→
+   459→        if self._handle_internal_message(message):
+   460→            return
+   461→
+   462→        # Everything that is not an auth ack or a heartbeat ack is a market
+   463→        # data frame (tk/tf/dk/df), so this is the point where the feed - as
+   464→        # opposed to the socket - proves it is alive. Issue #2075.
+   465→        self._update_last_data_time()
+   466→
+   467→        self._call_external_callback(self.on_message, ws, message)
+   468→
+   469→    def _handle_internal_message(self, message: str) -> bool:
+   470→        """
+   471→        Handle internal messages (auth, heartbeat)
+   472→
+   473→        Args:
+   474→            message: Incoming message string
+   475→
+   476→        Returns:
+   477→            bool: True if message was handled internally, False otherwise
+   478→        """
+   479→        try:
+   480→            data = json.loads(message)
+   481→            msg_type = data.get("t")
+   482→
+   483→            if msg_type == self.MSG_TYPE_AUTH_ACK:
+   484→                return self._handle_auth_response(data)
+   485→            elif msg_type in (self.MSG_TYPE_HEARTBEAT_ACK, self.MSG_TYPE_HEARTBEAT):
+   486→                self.logger.debug("Received heartbeat response")
+   487→                return True
+   488→
+   489→        except (json.JSONDecodeError, KeyError):
+   490→            # Not a JSON message or doesn't have expected structure
+   491→            pass
+   492→
+   493→        return False
+   494→
+   495→    def _handle_auth_response(self, data: dict[str, Any]) -> bool:
+   496→        """
+   497→        Handle authentication response — set connected only after auth succeeds
+   498→
+   499→        Args:
+   500→            data: Authentication response data
+   501→
+   502→        Returns:
+   503→            bool: True (message handled)
+   504→        """
+   505→        if data.get("s") == self.AUTH_SUCCESS:
+   506→            self.connected = True
+   507→            self.logger.info("Authentication successful")
+   508→            # SW-1 fix: Start heartbeat AFTER connected=True so the worker loop runs
+   509→            self._start_heartbeat()
+   510→            # SA-R6-11 fix: Pass actual ws reference via snapshot to avoid race with _close_websocket
+   511→            ws = self.ws
+   512→            self._call_external_callback(self.on_open, ws)
+   513→        else:
+   514→            self.logger.error(f"Authentication failed: {data}")
+   515→            # SW-5 fix: Defensively set connected=False in case future changes
+   516→            # set it before auth completes
+   517→            self.connected = False
+   518→            self.running = False
+   519→            # Phase 4a: flag this as an auth failure so the adapter can
+   520→            # short-circuit its reconnect loop instead of hammering a dead
+   521→            # token (e.g., 3am IST daily token expiry, weekend gap).
+   522→            self.auth_failed = True
+   523→            self.auth_failure_reason = str(data)
+   524→            self._close_websocket()
+   525→
+   526→        return True
+   527→
+   528→    def _on_error(self, ws, error) -> None:
+   529→        """Handle WebSocket connection errors"""
+   530→        self.logger.error(f"WebSocket error: {error}")
+   531→        self._call_external_callback(self.on_error, ws, error)
+   532→
+   533→    def _on_close(self, ws, close_status_code: int | None, close_msg: str | None) -> None:
+   534→        """Handle WebSocket connection close event"""
+   535→        self.connected = False
+   536→        self.logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+   537→
+   538→        self._stop_heartbeat()
+   539→        self._call_external_callback(self.on_close, ws, close_status_code, close_msg)
+   540→
+   541→    def _call_external_callback(self, callback: Callable | None, *args) -> None:
+   542→        """
+   543→        Safely call external callback with error handling
+   544→
+   545→        Args:
+   546→            callback: Callback function to call
+   547→            *args: Arguments to pass to callback
+   548→        """
+   549→        if not callback:
+   550→            return
+   551→        # Callbacks are _WeakCallback wrappers; tolerate a raw callable in case
+   552→        # a caller reassigns one directly.
+   553→        fn = callback.resolve() if isinstance(callback, _WeakCallback) else callback
+   554→        if fn is None:
+   555→            # Owner was garbage collected — it can no longer want these events.
+   556→            self.logger.debug("Skipping callback: owner has been collected")
+   557→            return
+   558→        try:
+   559→            fn(*args)
+   560→        except Exception as e:
+   561→            self.logger.error(f"Error in external callback: {e}")
+   562→
+   563→    # Heartbeat Management
+   564→    def _update_last_data_time(self) -> None:
+   565→        """Record a market-data frame and arm the data-silence watchdog.
+   566→
+   567→        Arming asks that data arrived *spread over time*, not that a lot of it
+   568→        arrived. Noren answers every subscribe with a snapshot frame, so a
+   569→        session opened overnight receives one frame per subscribed scrip
+   570→        within a second of connecting - fifty symbols is fifty frames. Any
+   571→        rule counting frames would arm on that burst and then recycle the
+   572→        socket every DATA_SILENCE_TIMEOUT until the market opened.
+   573→
+   574→        Bucketing is what separates the two. A burst lands in one bucket (two
+   575→        if it straddles a boundary), while a live feed keeps producing frames
+   576→        bucket after bucket. Requiring DATA_ARM_BUCKETS distinct buckets means
+   577→        at least a couple of DATA_ARM_BUCKET-second spans of real flow before
+   578→        the watchdog can fire, and DATA_ARM_WINDOW stops stray after-hours
+   579→        ticks hours apart from accumulating into a false arm.
+   580→
+   581→        Arming lasts only for this connection, so a market that closes while
+   582→        the watchdog is armed costs one recycle and the replacement then sits
+   583→        quiet.
+   584→        """
+   585→        now = time.time()
+   586→        newly_armed = False
+   587→
+   588→        with self._heartbeat_lock:
+   589→            self._last_data_message_time = now
+   590→
+   591→            if not self._data_watchdog_armed:
+   592→                bucket_start = now - (now % self.DATA_ARM_BUCKET)
+   593→                if not self._data_bucket_starts or self._data_bucket_starts[-1] != bucket_start:
+   594→                    self._data_bucket_starts.append(bucket_start)
+   595→
+   596→                if (
+   597→                    len(self._data_bucket_starts) == self._data_bucket_starts.maxlen
+   598→                    and now - self._data_bucket_starts[0] <= self.DATA_ARM_WINDOW
+   599→                ):
+   600→                    self._data_watchdog_armed = True
+   601→                    newly_armed = True
+   602→
+   603→        if newly_armed:
+   604→            self.logger.info("Market data is flowing; watching for tick silence from here on")
+   605→
+   606→    def _reset_data_liveness(self) -> None:
+   607→        """Clear the per-connection market-data liveness state."""
+   608→        with self._heartbeat_lock:
+   609→            self._last_data_message_time = None
+   610→            self._data_watchdog_armed = False
+   611→            self._data_bucket_starts.clear()
+   612→
+   613→    def _update_last_message_time(self) -> None:
+   614→        """Update the timestamp of the last received message"""
+   615→        with self._heartbeat_lock:
+   616→            self._last_message_time = time.time()
+   617→
+   618→    # SW-3 fix: Read _last_message_time under lock
+   619→    def _get_last_message_time(self) -> float | None:
+   620→        """Get the timestamp of the last received message (thread-safe)"""
+   621→        with self._heartbeat_lock:
+   622→            return self._last_message_time
+   623→
+   624→    def _start_heartbeat(self) -> None:
+   625→        """Start heartbeat monitoring thread (serialized under lock to prevent duplicates)"""
+   626→        with self._heartbeat_lock:
+   627→            if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+   628→                # If the old heartbeat's loop conditions are no longer met,
+   629→                # clear stale reference so we start a fresh thread
+   630→                if not (self.running and self.connected):
+   631→                    self._heartbeat_thread = None
+   632→                else:
+   633→                    return
+   634→
+   635→            self._heartbeat_thread = threading.Thread(
+   636→                target=_make_heartbeat_runner(self), daemon=True
+   637→            )
+   638→            self._heartbeat_thread.start()
+   639→            self.logger.debug("Heartbeat thread started")
+   640→
+   641→    # SW-2 fix: Guard against self-join when heartbeat thread calls _stop_heartbeat
+   642→    # via _check_connection_health → _close_websocket → _on_close → _stop_heartbeat
+   643→    def _stop_heartbeat(self) -> None:
+   644→        """Stop heartbeat monitoring thread"""
+   645→        with self._heartbeat_lock:
+   646→            thread = self._heartbeat_thread
+   647→        if thread and thread.is_alive() and thread is not threading.current_thread():
+   648→            self.logger.debug("Waiting for heartbeat thread to stop")
+   649→            thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
+   650→            if thread.is_alive():
+   651→                self.logger.warning("Heartbeat thread did not terminate within timeout")
+   652→        with self._heartbeat_lock:
+   653→            # SW-R6-2 fix: Only null if still pointing to the thread we joined,
+   654→            # to avoid nulling a new thread started by a concurrent _start_heartbeat
+   655→            if self._heartbeat_thread is thread:
+   656→                self._heartbeat_thread = None
+   657→
+   658→    def _heartbeat_beat(self) -> bool:
+   659→        """One beat of the heartbeat loop, run after the interval has elapsed.
+   660→
+   661→        Split out of the old _heartbeat_worker so the waiting happens in
+   662→        _make_heartbeat_runner without a strong reference to this client — the
+   663→        loop used to pin it for the life of the connection, which kept an
+   664→        abandoned client's socket open indefinitely.
+   665→
+   666→        Returns:
+   667→            bool: True to keep looping, False to stop the heartbeat thread.
+   668→        """
+   669→        try:
+   670→            if not (self.running and self.connected):
+   671→                return False
+   672→
+   673→            if not self._send_heartbeat():
+   674→                return False
+   675→
+   676→            if not self._check_connection_health():
+   677→                return False
+   678→        except Exception as e:
+   679→            self.logger.error(f"Heartbeat worker error: {e}")
+   680→            return False
+   681→        return True
+   682→
+   683→    # L1 fix: Snapshot self.ws to prevent race with _close_websocket nulling it
+   684→    def _send_heartbeat(self) -> bool:
+   685→        """
+   686→        Send heartbeat message to server
+   687→
+   688→        Returns:
+   689→            bool: True if heartbeat sent successfully, False otherwise
+   690→        """
+   691→        ws = self.ws
+   692→        if not ws:
+   693→            return False
+   694→
+   695→        try:
+   696→            heartbeat_msg = {"t": self.MSG_TYPE_HEARTBEAT}
+   697→            ws.send(json.dumps(heartbeat_msg))
+   698→            self.logger.debug("Sent heartbeat")
+   699→            return True
+   700→        except Exception as e:
+   701→            self.logger.error(f"Heartbeat send error: {e}")
+   702→            return False
+   703→
+   704→    # M3 fix: Set flag under lock, close websocket OUTSIDE lock to avoid blocking
+   705→    def _check_connection_health(self) -> bool:
+   706→        """Recycle the socket when the session has stopped being useful.
+   707→
+   708→        Two independent timeouts, because a Noren session fails in two ways:
+   709→
+   710→        * HEARTBEAT_TIMEOUT catches a socket that has gone quiet altogether.
+   711→        * DATA_SILENCE_TIMEOUT catches one that still answers heartbeats while
+   712→          delivering no market data. That case used to be invisible here - the
+   713→          heartbeat ack itself refreshed _last_message_time - so the feed could
+   714→          stay dead for the rest of the session with the app still reporting a
+   715→          healthy connection, and nothing downstream that runs on ticks (stop
+   716→          losses, sandbox order triggers, Flow conditions) would fire. Checked
+   717→          only once the watchdog is armed; see _update_last_data_time.
+   718→          Issue #2075.
+   719→
+   720→        Returns:
+   721→            bool: True if connection is healthy, False if it was recycled
+   722→        """
+   723→        # M5 fix: Don't write self.running under _heartbeat_lock — it's not the
+   724→        # lock that protects running. Set it alongside should_close outside the lock.
+   725→        now = time.time()
+   726→        reason = None
+   727→
+   728→        with self._heartbeat_lock:
+   729→            if self._last_message_time and now - self._last_message_time > self.HEARTBEAT_TIMEOUT:
+   730→                reason = "no messages received"
+   731→            elif (
+   732→                self._data_watchdog_armed
+   733→                and self._last_data_message_time
+   734→                and now - self._last_data_message_time > self.DATA_SILENCE_TIMEOUT
+   735→            ):
+   736→                silent_for = now - self._last_data_message_time
+   737→                reason = (
+   738→                    f"no market data for {silent_for:.0f}s while the session kept "
+   739→                    "answering heartbeats"
+   740→                )
+   741→
+   742→        # SW-R6-3 fix: Merged redundant should_close checks
+   743→        if reason is not None:
+   744→            self.logger.error(f"Connection timeout - {reason}")
+   745→            self.running = False
+   746→            self._close_websocket()
+   747→            return False
+   748→
+   749→        return True
+   750→
+   751→    # Subscription Management
+   752→    def subscribe_touchline(self, scrip_list: str) -> bool:
+   753→        """
+   754→        Subscribe to touchline data for complete quote information
+   755→
+   756→        Args:
+   757→            scrip_list: Comma or hash-separated list of scrips
+   758→
+   759→        Returns:
+   760→            bool: True if subscription sent successfully, False otherwise
+   761→        """
+   762→        return self._send_subscription_message(
+   763→            self.MSG_TYPE_TOUCHLINE_SUB, scrip_list, "touchline subscription"
+   764→        )
+   765→
+   766→    def unsubscribe_touchline(self, scrip_list: str) -> bool:
+   767→        """
+   768→        Unsubscribe from touchline data
+   769→
+   770→        Args:
+   771→            scrip_list: Comma or hash-separated list of scrips
+   772→
+   773→        Returns:
+   774→            bool: True if unsubscription sent successfully, False otherwise
+   775→        """
+   776→        return self._send_subscription_message(
+   777→            self.MSG_TYPE_TOUCHLINE_UNSUB, scrip_list, "touchline unsubscription"
+   778→        )
+   779→
+   780→    def subscribe_depth(self, scrip_list: str) -> bool:
+   781→        """
+   782→        Subscribe to market depth data
+   783→
+   784→        Args:
+   785→            scrip_list: Comma or hash-separated list of scrips
+   786→
+   787→        Returns:
+   788→            bool: True if subscription sent successfully, False otherwise
+   789→        """
+   790→        return self._send_subscription_message(
+   791→            self.MSG_TYPE_DEPTH_SUB, scrip_list, "depth subscription"
+   792→        )
+   793→
+   794→    def unsubscribe_depth(self, scrip_list: str) -> bool:
+   795→        """
+   796→        Unsubscribe from market depth data
+   797→
+   798→        Args:
+   799→            scrip_list: Comma or hash-separated list of scrips
+   800→
+   801→        Returns:
+   802→            bool: True if unsubscription sent successfully, False otherwise
+   803→        """
+   804→        return self._send_subscription_message(
+   805→            self.MSG_TYPE_DEPTH_UNSUB, scrip_list, "depth unsubscription"
+   806→        )
+   807→
+   808→    # Batched subscription API — accepts a list of scrips, queues them, and
+   809→    # drains the queue from a single worker thread that chunks large lists
+   810→    # into MAX_SCRIPS_PER_BATCH-sized '#'-separated messages with a small
+   811→    # SUBSCRIPTION_DELAY between sends.
+   812→    def subscribe_touchline_scrips(self, scrips: list[str]) -> None:
+   813→        """Queue touchline subscriptions for batched sending"""
+   814→        self._enqueue_subscriptions(self.MSG_TYPE_TOUCHLINE_SUB, scrips)
+   815→
+   816→    def unsubscribe_touchline_scrips(self, scrips: list[str]) -> None:
+   817→        """Queue touchline unsubscriptions for batched sending"""
+   818→        self._enqueue_subscriptions(self.MSG_TYPE_TOUCHLINE_UNSUB, scrips)
+   819→
+   820→    def subscribe_depth_scrips(self, scrips: list[str]) -> None:
+   821→        """Queue depth subscriptions for batched sending"""
+   822→        self._enqueue_subscriptions(self.MSG_TYPE_DEPTH_SUB, scrips)
+   823→
+   824→    def unsubscribe_depth_scrips(self, scrips: list[str]) -> None:
+   825→        """Queue depth unsubscriptions for batched sending"""
+   826→        self._enqueue_subscriptions(self.MSG_TYPE_DEPTH_UNSUB, scrips)
+   827→
+   828→    def _enqueue_subscriptions(self, msg_type: str, scrips: list[str]) -> None:
+   829→        """Append (msg_type, scrip) entries to the pending queue and ensure
+   830→        the worker thread is running."""
+   831→        if not scrips:
+   832→            return
+   833→
+   834→        with self._subscription_lock:
+   835→            for scrip in scrips:
+   836→                if scrip:
+   837→                    self._pending_subscriptions.append((msg_type, scrip))
+   838→
+   839→            if self._subscription_thread and self._subscription_thread.is_alive():
+   840→                return
+   841→
+   842→            self._subscription_thread = threading.Thread(
+   843→                target=self._process_pending_subscriptions,
+   844→                daemon=True,
+   845→                name="ShoonyaWSSubWorker",
+   846→            )
+   847→            self._subscription_thread.start()
+   848→
+   849→    def _process_pending_subscriptions(self) -> None:
+   850→        """Drain the pending queue, grouping consecutive same-type entries
+   851→        into batches of up to MAX_SCRIPS_PER_BATCH scrips, '#'-joined into
+   852→        a single WS message. Sleeps SUBSCRIPTION_DELAY between batches."""
+   853→        consecutive_failures = 0
+   854→
+   855→        while self.running:
+   856→            # Wait until we have an authenticated, connected WS session
+   857→            if not self.connected:
+   858→                consecutive_failures += 1
+   859→                if consecutive_failures > 6:
+   860→                    self.logger.error(
+   861→                        "Subscription worker giving up — no connection after retries; "
+   862→                        "dropping pending subscription batch"
+   863→                    )
+   864→                    with self._subscription_lock:
+   865→                        self._pending_subscriptions.clear()
+   866→                    return
+   867→                # Phase 8: interruptible wait
+   868→                if self._shutdown_event.wait(
+   869→                    min(self.SUBSCRIPTION_RETRY_DELAY * consecutive_failures, 10)
+   870→                ):
+   871→                    return
+   872→                continue
+   873→
+   874→            consecutive_failures = 0
+   875→
+   876→            batch_msg_type: str | None = None
+   877→            batch_scrips: list[str] = []
+   878→
+   879→            with self._subscription_lock:
+   880→                if not self._pending_subscriptions:
+   881→                    self._subscription_thread = None
+   882→                    return
+   883→
+   884→                while (
+   885→                    self._pending_subscriptions
+   886→                    and len(batch_scrips) < self.MAX_SCRIPS_PER_BATCH
+   887→                ):
+   888→                    msg_type, scrip = self._pending_subscriptions[0]
+   889→                    if batch_msg_type is None:
+   890→                        batch_msg_type = msg_type
+   891→                    elif msg_type != batch_msg_type:
+   892→                        break
+   893→                    self._pending_subscriptions.popleft()
+   894→                    batch_scrips.append(scrip)
+   895→
+   896→            if not batch_scrips or batch_msg_type is None:
+   897→                continue
+   898→
+   899→            scrip_list = "#".join(batch_scrips)
+   900→            operation_name = self._operation_name_for_msg_type(batch_msg_type)
+   901→            success = self._send_subscription_message(
+   902→                batch_msg_type, scrip_list, operation_name
+   903→            )
+   904→
+   905→            if success:
+   906→                self.logger.info(
+   907→                    f"Sent batch {operation_name} for {len(batch_scrips)} scrips"
+   908→                )
+   909→                # Pace consecutive batches so we don't flood the server
+   910→                with self._subscription_lock:
+   911→                    has_more = bool(self._pending_subscriptions)
+   912→                # Phase 8: interruptible pacing
+   913→                if has_more and self._shutdown_event.wait(self.SUBSCRIPTION_DELAY):
+   914→                    return
+   915→            else:
+   916→                # Re-queue at the front and back off; preserve ordering for the
+   917→                # rest of the queue so different msg types stay grouped.
+   918→                # Skip re-queue if shutting down — clear_pending_subscriptions()
+   919→                # may have already drained, and re-adding here leaks stale
+   920→                # entries into a later reconnect/reuse of this WS client.
+   921→                with self._subscription_lock:
+   922→                    if self.running and not self._shutdown_event.is_set():
+   923→                        for scrip in reversed(batch_scrips):
+   924→                            self._pending_subscriptions.appendleft((batch_msg_type, scrip))
+   925→                self.logger.warning(
+   926→                    f"{operation_name} batch failed; retrying after backoff"
+   927→                )
+   928→                if self._shutdown_event.wait(self.SUBSCRIPTION_RETRY_DELAY):
+   929→                    return
+   930→
+   931→    def _operation_name_for_msg_type(self, msg_type: str) -> str:
+   932→        """Human-readable label for log messages."""
+   933→        return {
+   934→            self.MSG_TYPE_TOUCHLINE_SUB: "touchline subscription",
+   935→            self.MSG_TYPE_TOUCHLINE_UNSUB: "touchline unsubscription",
+   936→            self.MSG_TYPE_DEPTH_SUB: "depth subscription",
+   937→            self.MSG_TYPE_DEPTH_UNSUB: "depth unsubscription",
+   938→        }.get(msg_type, f"message {msg_type}")
+   939→
+   940→    def clear_pending_subscriptions(self) -> int:
+   941→        """Clear any queued subscription batches. Returns the number cleared."""
+   942→        with self._subscription_lock:
+   943→            count = len(self._pending_subscriptions)
+   944→            self._pending_subscriptions.clear()
+   945→        return count
+   946→
+   947→    def _send_subscription_message(
+   948→        self, msg_type: str, scrip_list: str, operation_name: str
+   949→    ) -> bool:
+   950→        """
+   951→        Send subscription/unsubscription message
+   952→
+   953→        Args:
+   954→            msg_type: Message type for the operation
+   955→            scrip_list: List of scrips to subscribe/unsubscribe
+   956→            operation_name: Human-readable operation name for logging
+   957→
+   958→        Returns:
+   959→            bool: True if message sent successfully, False otherwise
+   960→        """
+   961→        message_dict = {"t": msg_type, "k": scrip_list}
+   962→        return self._send_message(message_dict, operation_name)
+   963→
+   964→    # L2 fix: Snapshot self.ws to prevent race with _close_websocket nulling it
+   965→    def _send_message(self, message_dict: dict[str, Any], operation_name: str) -> bool:
+   966→        """
+   967→        Send message with comprehensive error handling and validation
+   968→
+   969→        Args:
+   970→            message_dict: Message data to send
+   971→            operation_name: Human-readable operation name for logging
+   972→
+   973→        Returns:
+   974→            bool: True if message sent successfully, False otherwise
+   975→        """
+   976→        ws = self.ws
+   977→        if not self._validate_connection_state(ws, operation_name):
+   978→            return False
+   979→
+   980→        try:
+   981→            message_json = json.dumps(message_dict)
+   982→            ws.send(message_json)
+   983→            self.logger.debug(f"Sent {operation_name}: {message_dict}")
+   984→            return True
+   985→        except Exception as e:
+   986→            self.logger.error(f"Failed to send {operation_name}: {e}")
+   987→            return False
+   988→
+   989→    def _validate_connection_state(self, ws, operation_name: str) -> bool:
+   990→        """
+   991→        Validate that connection is ready for sending messages
+   992→
+   993→        Args:
+   994→            ws: WebSocket reference snapshot
+   995→            operation_name: Operation name for logging
+   996→
+   997→        Returns:
+   998→            bool: True if connection is ready, False otherwise
+   999→        """
+  1000→        if not ws:
+  1001→            self.logger.warning(f"Cannot send {operation_name}: WebSocket not initialized")
+  1002→            return False
+  1003→
+  1004→        if not self.connected:
+  1005→            self.logger.warning(f"Cannot send {operation_name}: not connected")
+  1006→            return False
+  1007→
+  1008→        return True
+  1009→
+  1010→    # Utility Methods
+  1011→    def is_connected(self) -> bool:
+  1012→        """
+  1013→        Check if WebSocket is currently connected
+  1014→
+  1015→        Returns:
+  1016→            bool: True if connected, False otherwise
+  1017→        """
+  1018→        return self.connected and self.running
+  1019→
+  1020→    # L5 fix: Snapshot thread references to prevent race with null assignments
+  1021→    def get_connection_info(self) -> dict[str, Any]:
+  1022→        """
+  1023→        Get connection information for debugging
+  1024→
+  1025→        Returns:
+  1026→            Dict: Connection state information
+  1027→        """
+  1028→        heartbeat_thread = self._heartbeat_thread
+  1029→        ws_thread = self.ws_thread
+  1030→        return {
+  1031→            "connected": self.connected,
+  1032→            "running": self.running,
+  1033→            "user_id": self.user_id,
+  1034→            "actid": self.actid,
+  1035→            "ws_url": self.WS_URL,
+  1036→            "last_message_time": self._get_last_message_time(),
+  1037→            "heartbeat_thread_alive": heartbeat_thread.is_alive()
+  1038→            if heartbeat_thread
+  1039→            else False,
+  1040→            "ws_thread_alive": ws_thread.is_alive() if ws_thread else False,
+  1041→        }
+  1042→
